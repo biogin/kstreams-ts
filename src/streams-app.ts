@@ -1,6 +1,7 @@
 import { ProcessorGraph, type ProcessorSupplier } from './processor-graph.js'
 import type { StreamRecord } from './record.js'
 import type { Serde, Serdes } from './serde.js'
+import { type Sync, type SyncKeyValue, synchronous } from './sync-dsl.js'
 
 export interface StreamsAppConfig {
   /**
@@ -38,18 +39,29 @@ export interface NamedProcessor<KIn, VIn, KOut, VOut> {
   }
 }
 
-/** An unbounded sequence of keyed records where each record is an independent event. */
+/**
+ * An unbounded sequence of keyed records where each record is an independent event.
+ *
+ * Functions passed to its operators must be synchronous (ADR-0012): an async function fails to
+ * compile and is rejected when the app is built, and one that returns a Promise throws
+ * `AsyncNotAllowedError` on the first record. Async work belongs in a Processor.
+ */
 export interface Stream<K, V> {
   /** Keeps only the records for which `predicate` returns true. */
   filter<VOut extends V>(predicate: (key: K, value: V) => value is VOut): Stream<K, VOut>
-  filter(predicate: (key: K, value: V) => boolean): Stream<K, V>
+  filter<R extends boolean | PromiseLike<unknown>>(
+    predicate: (key: K, value: V) => Sync<R>,
+  ): Stream<K, V>
   /**
    * Turns each record into a new key and value, which may have other types. The record keeps its
    * timestamp. The resulting Stream has no Serdes of its own, so `.to()` must be given both.
    */
-  map<KOut, VOut>(mapper: (key: K, value: V) => { key: KOut; value: VOut }): Stream<KOut, VOut>
-  /** Calls `action` with each record (for logging, metrics, ...) and passes the record on unchanged. */
-  peek(action: (key: K, value: V) => void): Stream<K, V>
+  map<R>(mapper: (key: K, value: V) => SyncKeyValue<R>): Stream<KeyOf<R>, ValueOf<R>>
+  /**
+   * Calls `action` with each record (for logging, metrics, ...) and passes the record on unchanged.
+   * Whatever `action` returns is ignored.
+   */
+  peek<R>(action: (key: K, value: V) => Sync<R>): Stream<K, V>
   /**
    * Writes every record to `topic`. Serdes not given here default to the ones this Stream was
    * read with.
@@ -62,6 +74,9 @@ export interface Stream<K, V> {
    */
   process<KOut, VOut>(processor: NamedProcessor<K, V, KOut, VOut>): Stream<KOut, VOut>
 }
+
+type KeyOf<R> = R extends { key: infer KOut } ? KOut : never
+type ValueOf<R> = R extends { value: infer VOut } ? VOut : never
 
 const APPLICATION_ID = /^[A-Za-z0-9._-]+$/
 
@@ -120,22 +135,28 @@ class StreamNode<K, V> implements Stream<K, V> {
   }
 
   filter(predicate: (key: K, value: V) => boolean): Stream<K, V> {
+    const test = synchronous('filter', predicate)
     return this.#then<K, V>(
       ({ forward }) => ({
         process(record) {
-          if (predicate(record.key, record.value)) forward(record)
+          if (test(record.key, record.value)) forward(record)
         },
       }),
       this.#serdes,
     )
   }
 
-  map<KOut, VOut>(mapper: (key: K, value: V) => { key: KOut; value: VOut }): Stream<KOut, VOut> {
+  map<R>(mapper: (key: K, value: V) => SyncKeyValue<R>): Stream<KeyOf<R>, ValueOf<R>> {
+    // Once Promises are ruled out (at runtime by `synchronous`), the mapper returns a key and a value.
+    const toKeyValue = synchronous('map', mapper) as (
+      key: K,
+      value: V,
+    ) => { key: KeyOf<R>; value: ValueOf<R> }
     // The new key and value types may differ, so the inherited Serdes no longer apply.
-    return this.#then<KOut, VOut>(
+    return this.#then<KeyOf<R>, ValueOf<R>>(
       ({ forward }) => ({
         process(record) {
-          const { key, value } = mapper(record.key, record.value)
+          const { key, value } = toKeyValue(record.key, record.value)
           forward({ key, value, timestamp: record.timestamp })
         },
       }),
@@ -143,11 +164,12 @@ class StreamNode<K, V> implements Stream<K, V> {
     )
   }
 
-  peek(action: (key: K, value: V) => void): Stream<K, V> {
+  peek(action: (key: K, value: V) => unknown): Stream<K, V> {
+    const see = synchronous('peek', action)
     return this.#then<K, V>(
       ({ forward }) => ({
         process(record) {
-          action(record.key, record.value)
+          see(record.key, record.value)
           forward(record)
         },
       }),

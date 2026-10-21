@@ -20,6 +20,7 @@ export {
   type StreamsApp,
   type StreamsAppConfig,
 } from './streams-app.js'
+export { AsyncNotAllowedError } from './sync-dsl.js'
 export {
   createTestDriver,
   type PipeOptions,
