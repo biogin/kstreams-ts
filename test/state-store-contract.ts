@@ -91,6 +91,72 @@ export function describeStateStoreContract(implementation: string, open: () => S
       })
     })
 
+    describe('range', () => {
+      const filled = (): StateStore => {
+        const s = store()
+        for (const key of [bytes(2), bytes(1, 0), bytes(), bytes(1), bytes(0, 255), bytes(255)]) {
+          s.put(key, bytes(key.length))
+        }
+        return s
+      }
+
+      it('returns the entries from `from` (inclusive) to `to` (exclusive) in key byte order', () => {
+        expect([...filled().range(bytes(0, 255), bytes(2))]).toEqual([
+          [bytes(0, 255), bytes(2)],
+          [bytes(1), bytes(1)],
+          [bytes(1, 0), bytes(2)],
+        ])
+      })
+
+      it('compares bounds by bytes, so a bound need not be a key of the store', () => {
+        expect([...filled().range(bytes(1, 0, 0), bytes(254))]).toEqual([[bytes(2), bytes(1)]])
+      })
+
+      it('scans from the first key when `from` is undefined, to the last when `to` is', () => {
+        const s = filled()
+        expect([...s.range(undefined, bytes(1))]).toEqual([
+          [bytes(), bytes(0)],
+          [bytes(0, 255), bytes(2)],
+        ])
+        expect([...s.range(bytes(2), undefined)]).toEqual([
+          [bytes(2), bytes(1)],
+          [bytes(255), bytes(1)],
+        ])
+        expect([...s.range(undefined, undefined)]).toEqual([...s.all()])
+      })
+
+      it('is empty when `from` is not before `to`', () => {
+        const s = filled()
+        expect([...s.range(bytes(1), bytes(1))]).toEqual([])
+        expect([...s.range(bytes(2), bytes(1))]).toEqual([])
+      })
+
+      it('sees the writes of an open transaction, and not after rollback', () => {
+        const s = filled()
+        s.begin()
+        s.put(bytes(1, 5), bytes(9))
+        s.delete(bytes(1))
+        expect([...s.range(bytes(1), bytes(2))]).toEqual([
+          [bytes(1, 0), bytes(2)],
+          [bytes(1, 5), bytes(9)],
+        ])
+        s.rollback()
+        expect([...s.range(bytes(1), bytes(2))]).toEqual([
+          [bytes(1), bytes(1)],
+          [bytes(1, 0), bytes(2)],
+        ])
+      })
+
+      it('returns bytes the caller may change', () => {
+        const s = filled()
+        for (const [key, value] of s.range(bytes(1), bytes(2))) {
+          key[0] = 9
+          value[0] = 9
+        }
+        expect(s.get(bytes(1))).toEqual(bytes(1))
+      })
+    })
+
     describe('transactions', () => {
       it('applies writes outside a transaction immediately', () => {
         const s = store()
