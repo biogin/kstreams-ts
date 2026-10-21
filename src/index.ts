@@ -24,8 +24,10 @@ export {
   stores,
 } from './state-store.js'
 export {
+  type ApplicationState,
   type CountOptions,
   createStreamsApp,
+  type DeliveryGuarantee,
   type GroupedStream,
   type NamedProcessor,
   type StoreOptions,

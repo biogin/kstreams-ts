@@ -3,6 +3,7 @@ import type { StreamRecord } from './record.js'
 import { serdes as builtInSerdes, type Serde, type Serdes } from './serde.js'
 import { type NamedStore, type StateStoreSupplier, stores } from './state-store.js'
 import { type Sync, type SyncKeyValue, synchronous } from './sync-dsl.js'
+import { startWorker, type Worker } from './worker.js'
 
 export interface StreamsAppConfig {
   /**
@@ -11,11 +12,72 @@ export interface StreamsAppConfig {
    * digits, `.`, `_` and `-`.
    */
   applicationId: string
+  /**
+   * Bootstrap brokers (`host:port`) to connect to. Needed to `start` the app; the Test Driver
+   * doesn't use them.
+   */
+  brokers?: string[]
+  /**
+   * The Delivery Guarantee. Defaults to `'at-least-once'`. `'exactly-once'` is not implemented
+   * yet and is rejected.
+   */
+  guarantee?: DeliveryGuarantee
+  /**
+   * Number of Workers (worker threads) per process, each its own consumer-group member. `0` (the
+   * default) runs everything in the main thread. Values above 0 are not implemented yet and are
+   * rejected.
+   */
+  workers?: number
+  /**
+   * How long a Worker collects records into a batch before it produces the outputs and commits
+   * the batch, in milliseconds. Defaults to 100.
+   */
+  commitIntervalMs?: number
+  /** A batch is committed early once it has this many input records. Defaults to 1000. */
+  commitMaxRecords?: number
+  /**
+   * How long the consumer group waits for a member that stopped sending heartbeats before moving
+   * its Tasks to other members, in milliseconds. Defaults to 45000.
+   */
+  sessionTimeoutMs?: number
 }
+
+/** The processing contract an application runs under. */
+export type DeliveryGuarantee = 'at-least-once' | 'exactly-once'
+
+/**
+ * The lifecycle phase a Streams App reports: created → rebalancing ⇄ restoring ⇄ running →
+ * stopping → stopped, or error from any state.
+ */
+export type ApplicationState =
+  | 'created'
+  | 'rebalancing'
+  | 'restoring'
+  | 'running'
+  | 'stopping'
+  | 'stopped'
+  | 'error'
 
 /** The in-process object that defines and runs an application. */
 export interface StreamsApp {
   readonly applicationId: string
+  /** The Application State. */
+  readonly state: ApplicationState
+  /**
+   * Connects to Kafka and starts processing: joins the consumer group (named after the
+   * Application ID) and resumes from its committed offsets, or reads input topics from the
+   * beginning the first time. Resolves once the app is running. Rejects if the app has no brokers
+   * or reads no topic, was started before, or can't connect (the app then goes to `error`).
+   *
+   * Define the whole app before starting it.
+   */
+  start(): Promise<void>
+  /**
+   * Stops gracefully: finishes and commits the current batch, then leaves the consumer group, so
+   * its Tasks move to other processes right away. Resolves once the app is `stopped`. If the app
+   * stopped on its own because of an error (state `error`), rejects with that error.
+   */
+  stop(): Promise<void>
   /** Declares a Stream read from `topic`, decoded with the given key and value Serdes. */
   stream<K, V>(topic: string, serdes: Serdes<K, V>): Stream<K, V>
   /**
@@ -135,9 +197,16 @@ export function createStreamsApp(config: StreamsAppConfig): StreamsApp {
       `Invalid Application ID ${JSON.stringify(applicationId)}: use one or more ASCII letters, digits, ".", "_" or "-"`,
     )
   }
+  const settings = runtimeSettings(config)
   const graph = new ProcessorGraph(applicationId)
+  const runtime = new Runtime(graph, settings)
   const app: StreamsApp = {
     applicationId,
+    get state() {
+      return runtime.state
+    },
+    start: () => runtime.start(),
+    stop: () => runtime.stop(),
     stream(topic, serdes) {
       return new StreamNode(graph, graph.addSource(topic, serdes), serdes)
     },
@@ -156,6 +225,120 @@ export function createStreamsApp(config: StreamsAppConfig): StreamsApp {
   }
   graphs.set(app, graph)
   return app
+}
+
+interface RuntimeSettings {
+  applicationId: string
+  brokers: string[] | undefined
+  commitIntervalMs: number
+  commitMaxRecords: number
+  sessionTimeoutMs: number
+}
+
+function runtimeSettings(config: StreamsAppConfig): RuntimeSettings {
+  const { guarantee = 'at-least-once', workers = 0, brokers } = config
+  if (guarantee === 'exactly-once') {
+    throw new Error('guarantee: exactly-once is not implemented yet; use at-least-once')
+  }
+  if (guarantee !== 'at-least-once') {
+    throw new Error(`Unknown Delivery Guarantee ${JSON.stringify(guarantee)}`)
+  }
+  if (!(Number.isInteger(workers) && workers >= 0)) {
+    throw new Error(`workers must be a whole number (0 or more), got ${workers}`)
+  }
+  if (workers > 0) throw new Error('workers > 0 is not implemented yet; use workers: 0')
+  if (brokers !== undefined && brokers.length === 0) {
+    throw new Error('brokers must list at least one broker (host:port)')
+  }
+  return {
+    applicationId: config.applicationId,
+    brokers,
+    commitIntervalMs: positive('commitIntervalMs', config.commitIntervalMs ?? 100),
+    commitMaxRecords: positive('commitMaxRecords', config.commitMaxRecords ?? 1000, true),
+    sessionTimeoutMs: positive('sessionTimeoutMs', config.sessionTimeoutMs ?? 45_000),
+  }
+}
+
+function positive(option: string, value: number, whole = false): number {
+  if (!(value > 0 && Number.isFinite(value) && (!whole || Number.isInteger(value)))) {
+    throw new Error(`${option} must be a positive ${whole ? 'whole ' : ''}number, got ${value}`)
+  }
+  return value
+}
+
+/** Runs a Streams App on Kafka and tracks its Application State. */
+class Runtime {
+  readonly #graph: ProcessorGraph
+  readonly #settings: RuntimeSettings
+  #state: ApplicationState = 'created'
+  #worker: Promise<Worker | undefined> | undefined
+  #stopped: Promise<void> | undefined
+  /** The error that put the app in the `error` state. */
+  #failure: { error: unknown } | undefined
+
+  constructor(graph: ProcessorGraph, settings: RuntimeSettings) {
+    this.#graph = graph
+    this.#settings = settings
+  }
+
+  get state(): ApplicationState {
+    return this.#state
+  }
+
+  async start(): Promise<void> {
+    const { applicationId, brokers } = this.#settings
+    if (this.#state !== 'created' || this.#worker !== undefined) {
+      throw new Error(`Streams App "${applicationId}" cannot start: it is ${this.#state}`)
+    }
+    if (brokers === undefined) {
+      throw new Error(`Streams App "${applicationId}" has no brokers to connect to`)
+    }
+    if (this.#graph.sources.size === 0) {
+      throw new Error(`Streams App "${applicationId}" reads no topic: declare a Stream first`)
+    }
+    const worker = startWorker(this.#graph, {
+      ...this.#settings,
+      brokers,
+      clientId: `${applicationId}-worker-0`,
+      onError: (error) => this.#fail(error),
+    })
+    this.#worker = worker.catch(() => undefined)
+    try {
+      await worker
+    } catch (error) {
+      this.#fail(error)
+      throw error
+    }
+    if (this.#state === 'created') this.#state = 'running'
+  }
+
+  stop(): Promise<void> {
+    this.#stopped ??= this.#stop()
+    return this.#stopped
+  }
+
+  async #stop(): Promise<void> {
+    if (this.#state === 'created' && this.#worker === undefined) {
+      this.#state = 'stopped'
+      return
+    }
+    if (this.#state !== 'error') this.#state = 'stopping'
+    const worker = await this.#worker
+    try {
+      await worker?.stop()
+    } catch (error) {
+      this.#fail(error)
+    }
+    if (this.#failure !== undefined) {
+      throw this.#failure.error
+    }
+    this.#state = 'stopped'
+  }
+
+  #fail(error: unknown): void {
+    this.#failure ??= { error }
+    this.#state = 'error'
+  }
 }
 
 function addStore(
