@@ -68,19 +68,19 @@ describe('pass-through Streams App in the Test Driver', () => {
   it('sends records through the real Serdes on the way in and out', () => {
     const calls: string[] = []
     const tracing = (name: string): Serde<string> => ({
-      serialize(value) {
+      serialize(value, context) {
         calls.push(`${name}.serialize(${value})`)
-        return serdes.string.serialize(value)
+        return serdes.string.serialize(value, context)
       },
-      deserialize(bytes) {
-        const value = serdes.string.deserialize(bytes)
+      deserialize(bytes, context) {
+        const value = serdes.string.deserialize(bytes, context)
         calls.push(`${name}.deserialize(${value})`)
         return value
       },
     })
     const shouting: Serde<string> = {
-      serialize: (value) => serdes.string.serialize(value.toUpperCase()),
-      deserialize: (bytes) => serdes.string.deserialize(bytes),
+      serialize: (value, context) => serdes.string.serialize(value.toUpperCase(), context),
+      deserialize: (bytes, context) => serdes.string.deserialize(bytes, context),
     }
 
     const app = createStreamsApp({ applicationId: 'serdes' })

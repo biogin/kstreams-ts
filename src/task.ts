@@ -2,6 +2,12 @@
 
 import type { ProcessorGraph, SerializedRecord } from './processor-graph.js'
 import type { StreamRecord } from './record.js'
+import {
+  DeserializationError,
+  deserializeNullable,
+  type Serde,
+  serializeNullable,
+} from './serde.js'
 
 /** Receives every record a sink writes, already serialized with the sink's Serdes. */
 export type RecordCollector = (topic: string, record: SerializedRecord) => void
@@ -10,7 +16,10 @@ export type RecordCollector = (topic: string, record: SerializedRecord) => void
 type Deliver = (record: StreamRecord<unknown, unknown>) => void
 
 export interface Task {
-  /** Processes one record read from an input topic, synchronously, to completion. */
+  /**
+   * Processes one record read from an input topic, synchronously, to completion. Throws a
+   * {@link DeserializationError} if the topic's Serdes can't read it.
+   */
   process(topic: string, record: SerializedRecord): void
 }
 
@@ -32,15 +41,17 @@ export function createTask(graph: ProcessorGraph, collect: RecordCollector): Tas
         deliverTo.set(node.name, (record) => processor.process(record))
         break
       }
-      case 'sink':
+      case 'sink': {
+        const context = { topic: node.topic }
         deliverTo.set(node.name, (record) =>
           collect(node.topic, {
-            key: node.serdes.key.serialize(record.key),
-            value: node.serdes.value.serialize(record.value),
+            key: serializeNullable(node.serdes.key, record.key, context),
+            value: serializeNullable(node.serdes.value, record.value, context),
             timestamp: record.timestamp,
           }),
         )
         break
+      }
     }
   }
 
@@ -48,9 +59,16 @@ export function createTask(graph: ProcessorGraph, collect: RecordCollector): Tas
     process(topic, record) {
       const source = graph.sources.get(topic)
       if (source === undefined) throw new Error(`Topic "${topic}" is not an input of this Task`)
+      const read = <T>(serde: Serde<T>, part: 'key' | 'value') => {
+        try {
+          return deserializeNullable(serde, record[part], { topic })
+        } catch (cause) {
+          throw new DeserializationError(topic, part, record.timestamp, { cause })
+        }
+      }
       deliverTo.get(source.name)?.({
-        key: source.serdes.key.deserialize(record.key),
-        value: source.serdes.value.deserialize(record.value),
+        key: read(source.serdes.key, 'key'),
+        value: read(source.serdes.value, 'value'),
         timestamp: record.timestamp,
       })
     },

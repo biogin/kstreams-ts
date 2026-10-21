@@ -1,6 +1,12 @@
 // Public entry point.
 export type { StreamRecord } from './record.js'
-export { type Serde, type Serdes, serdes } from './serde.js'
+export {
+  DeserializationError,
+  type Serde,
+  type SerdeContext,
+  type Serdes,
+  serdes,
+} from './serde.js'
 export {
   createStreamsApp,
   type Stream,
