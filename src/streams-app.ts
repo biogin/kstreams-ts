@@ -1,6 +1,7 @@
 import { ProcessorGraph, type ProcessorSupplier } from './processor-graph.js'
 import type { StreamRecord } from './record.js'
-import type { Serde, Serdes } from './serde.js'
+import { serdes as builtInSerdes, type Serde, type Serdes } from './serde.js'
+import { type NamedStore, type StateStoreSupplier, stores } from './state-store.js'
 import { type Sync, type SyncKeyValue, synchronous } from './sync-dsl.js'
 
 export interface StreamsAppConfig {
@@ -25,6 +26,17 @@ export interface StreamsApp {
     name: string,
     supplier: ProcessorSupplier<KIn, VIn, KOut, VOut>,
   ): NamedProcessor<KIn, VIn, KOut, VOut>
+  /**
+   * Registers a key-value State Store under a unique `name`, for Processors to use with
+   * `ctx.store`. Each Task gets its own store. The name is part of the store's Changelog topic,
+   * so it allows the same characters as the Application ID.
+   */
+  store<K, V>(name: string, serdes: Serdes<K, V>, options?: StoreOptions): NamedStore<K, V>
+}
+
+export interface StoreOptions {
+  /** Opens the State Store. Defaults to the in-memory store. */
+  supplier?: StateStoreSupplier
 }
 
 declare const recordTypes: unique symbol
@@ -73,21 +85,57 @@ export interface Stream<K, V> {
    * output Stream has no Serdes, so `.to()` after it needs both.
    */
   process<KOut, VOut>(processor: NamedProcessor<K, V, KOut, VOut>): Stream<KOut, VOut>
+  /**
+   * Groups the records by their current key, to aggregate them per key. Needs a key Serde for the
+   * aggregation's State Store: pass one if this Stream has none (e.g. after `map`).
+   */
+  groupByKey(serdes?: Partial<Serdes<K, V>>): GroupedStream<K, V>
 }
 
 type KeyOf<R> = R extends { key: infer KOut } ? KOut : never
 type ValueOf<R> = R extends { value: infer VOut } ? VOut : never
 
-const APPLICATION_ID = /^[A-Za-z0-9._-]+$/
+/** A Stream grouped by key, ready to be aggregated per key. */
+export interface GroupedStream<K, V> {
+  /**
+   * Counts the records of each key into a Table. Records with a null key or a null value
+   * (tombstone) are skipped and not counted.
+   */
+  count(options?: CountOptions): Table<K, number>
+  /** Type-only: the key and value types of the grouped records. */
+  readonly [recordTypes]?: { key: K; value: V }
+}
+
+export interface CountOptions {
+  /**
+   * The name of the State Store holding the counts, which is part of its Changelog topic. Name it
+   * so that the name stays stable as the app changes; without a name one is generated.
+   */
+  store?: string
+  /** Opens the State Store. Defaults to the in-memory store. */
+  storeSupplier?: StateStoreSupplier
+}
+
+/** A keyed view where each record is an upsert of the latest value for its key. */
+export interface Table<K, V> {
+  /** The name of the State Store the Table is kept in. */
+  readonly store: string
+  /** Type-only: the key and value types of the Table. */
+  readonly [tableTypes]?: { key: K; value: V }
+}
+
+declare const tableTypes: unique symbol
+
+const NAME = /^[A-Za-z0-9._-]+$/
 
 export function createStreamsApp(config: StreamsAppConfig): StreamsApp {
   const { applicationId } = config
-  if (typeof applicationId !== 'string' || !APPLICATION_ID.test(applicationId)) {
+  if (typeof applicationId !== 'string' || !NAME.test(applicationId)) {
     throw new Error(
       `Invalid Application ID ${JSON.stringify(applicationId)}: use one or more ASCII letters, digits, ".", "_" or "-"`,
     )
   }
-  const graph = new ProcessorGraph()
+  const graph = new ProcessorGraph(applicationId)
   const app: StreamsApp = {
     applicationId,
     stream(topic, serdes) {
@@ -101,9 +149,32 @@ export function createStreamsApp(config: StreamsAppConfig): StreamsApp {
       registered.set(processor, { graph, output: new StreamNode(graph, name, {}) })
       return processor
     },
+    store(name, serdes, options = {}) {
+      addStore(graph, name, serdes, options.supplier)
+      return { name }
+    },
   }
   graphs.set(app, graph)
   return app
+}
+
+function addStore(
+  graph: ProcessorGraph,
+  name: string,
+  serdes: Serdes<unknown, unknown>,
+  supplier: StateStoreSupplier = stores.inMemory(),
+): void {
+  if (typeof name !== 'string' || !NAME.test(name)) {
+    throw new Error(
+      `Invalid State Store name ${JSON.stringify(name)}: use one or more ASCII letters, digits, ".", "_" or "-"`,
+    )
+  }
+  graph.addStore({
+    name,
+    serdes,
+    supplier,
+    changelogTopic: `${graph.applicationId}-${name}-changelog`,
+  })
 }
 
 const graphs = new WeakMap<StreamsApp, ProcessorGraph>()
@@ -195,6 +266,14 @@ class StreamNode<K, V> implements Stream<K, V> {
     )
   }
 
+  groupByKey(serdes: Partial<Serdes<K, V>> = {}): GroupedStream<K, V> {
+    const key = serdes.key ?? this.#serdes.key
+    if (key === undefined) {
+      throw new Error('No key Serde for groupByKey: pass one to .groupByKey({ key })')
+    }
+    return new GroupedStreamNode(this.#graph, this.#node, key)
+  }
+
   process<KOut, VOut>(processor: NamedProcessor<K, V, KOut, VOut>): Stream<KOut, VOut> {
     const entry = registered.get(processor)
     if (entry?.graph !== this.#graph) {
@@ -202,6 +281,42 @@ class StreamNode<K, V> implements Stream<K, V> {
     }
     this.#graph.connect(this.#node, processor.name)
     return entry.output
+  }
+}
+
+class GroupedStreamNode<K, V> implements GroupedStream<K, V> {
+  readonly #graph: ProcessorGraph
+  readonly #node: string
+  readonly #key: Serde<K>
+
+  constructor(graph: ProcessorGraph, node: string, key: Serde<K>) {
+    this.#graph = graph
+    this.#node = node
+    this.#key = key
+  }
+
+  count(options: CountOptions = {}): Table<K, number> {
+    const store = options.store ?? this.#graph.storeName('count')
+    addStore(
+      this.#graph,
+      store,
+      { key: this.#key, value: builtInSerdes.number },
+      options.storeSupplier,
+    )
+    // Like Kafka Streams, aggregations skip records without a key or with a tombstone value.
+    const supplier: ProcessorSupplier<K | null, V | null, K, number> = (ctx) => {
+      const counts = ctx.store<K, number>(store)
+      return {
+        process({ key, value, timestamp }) {
+          if (key === null || value === null) return
+          const count = (counts.get(key) ?? 0) + 1
+          counts.put(key, count)
+          ctx.forward({ key, value: count, timestamp })
+        },
+      }
+    }
+    this.#graph.addProcessor(supplier, [this.#node])
+    return { store }
   }
 }
 

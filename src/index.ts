@@ -16,11 +16,23 @@ export {
   serdes,
 } from './serde.js'
 export {
+  type KeyValueStore,
+  type NamedStore,
+  type StateStore,
+  type StateStoreContext,
+  type StateStoreSupplier,
+  stores,
+} from './state-store.js'
+export {
+  type CountOptions,
   createStreamsApp,
+  type GroupedStream,
   type NamedProcessor,
+  type StoreOptions,
   type Stream,
   type StreamsApp,
   type StreamsAppConfig,
+  type Table,
 } from './streams-app.js'
 export { AsyncNotAllowedError } from './sync-dsl.js'
 export {
@@ -29,4 +41,5 @@ export {
   type TestDriver,
   type TestInputTopic,
   type TestOutputTopic,
+  type TestStore,
 } from './test-driver.js'

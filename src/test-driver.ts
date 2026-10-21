@@ -1,6 +1,7 @@
 import type { SerializedRecord } from './processor-graph.js'
 import type { StreamRecord } from './record.js'
 import { deserializeNullable, type Serdes, serializeNullable } from './serde.js'
+import type { KeyValueStore, NamedStore } from './state-store.js'
 import { processorGraphOf, type StreamsApp } from './streams-app.js'
 import { createTask } from './task.js'
 
@@ -37,7 +38,16 @@ export interface TestDriver {
    * with the error a timer raised, which stops the Streams App like a failed record.
    */
   advanceWallClockTime(ms: number): Promise<void>
+  /**
+   * Reads a State Store of the Streams App: pass the store `app.store` returned, or its name (e.g.
+   * the `store` of a `count`). Throws if the app has no such store.
+   */
+  store<K, V>(store: NamedStore<K, V>): TestStore<K, V>
+  store<K = unknown, V = unknown>(name: string): TestStore<K, V>
 }
+
+/** Read access to a State Store in the Test Driver, decoded with the store's Serdes. */
+export type TestStore<K, V> = Pick<KeyValueStore<K, V>, 'get' | 'all'>
 
 export interface PipeOptions {
   /** Event Time of the record. Defaults to the Test Driver's wall-clock time, which starts at 0. */
@@ -94,7 +104,18 @@ export function createTestDriver(app: StreamsApp): TestDriver {
     }
   }
 
+  const store = (ref: string | NamedStore<unknown, unknown>): TestStore<unknown, unknown> => {
+    const name = typeof ref === 'string' ? ref : ref.name
+    if (!graph.stores.has(name)) {
+      throw new Error(`Streams App "${app.applicationId}" has no State Store "${name}"`)
+    }
+    const { get, all } = task.store(name)
+    return { get, all }
+  }
+
   return {
+    store: store as TestDriver['store'],
+
     input<K, V>(topic: string, serdes: Partial<Serdes<K, V>> = {}): TestInputTopic<K, V> {
       const source = graph.sources.get(topic)
       if (source === undefined) {

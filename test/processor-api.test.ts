@@ -240,21 +240,6 @@ describe('async Processors', () => {
   })
 })
 
-describe('ProcessorContext features that arrive later', () => {
-  it('ctx.store throws "not implemented"', async () => {
-    const app = createStreamsApp({ applicationId: 'later' })
-    const processor = app.processor('later', (ctx: ProcessorContext<string, string>) => ({
-      process() {
-        ctx.store('counts')
-      },
-    }))
-    app.stream('input', strings).process(processor)
-
-    const driver = createTestDriver(app)
-    await expect(driver.input('input').pipe('k', 'v')).rejects.toThrow(/not implemented/i)
-  })
-})
-
 describe('Processor definition errors', () => {
   const noop = () => ({ process() {} })
 

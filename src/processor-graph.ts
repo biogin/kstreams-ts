@@ -3,6 +3,7 @@
 
 import type { StreamRecord } from './record.js'
 import type { Serdes } from './serde.js'
+import type { KeyValueStore, NamedStore, StateStoreSupplier } from './state-store.js'
 
 /**
  * Per-record logic. Receives records from its parents and sends results on with
@@ -38,8 +39,12 @@ export interface ProcessorContext<KOut, VOut> {
    * Task, so there is no need to await `forward`.
    */
   forward(record: StreamRecord<KOut, VOut>): void
-  /** A State Store by name. Not implemented yet: always throws. */
-  store(name: string): never
+  /**
+   * A State Store of the Streams App, for this Task. Pass the store `app.store` returned for typed
+   * access, or its name. Throws if the Streams App has no such store.
+   */
+  store<K, V>(store: NamedStore<K, V>): KeyValueStore<K, V>
+  store<K = unknown, V = unknown>(name: string): KeyValueStore<K, V>
   /**
    * Schedules a recurring timer that fires every `intervalMs` (a positive number) after it is
    * scheduled, measured in Stream Time or in wall-clock time. If the time jumps over several
@@ -91,12 +96,29 @@ export interface SinkNode {
 
 export type GraphNode = SourceNode | ProcessorNode | SinkNode
 
+/** A State Store definition. Each Task opens its own store from it. */
+export interface StoreNode {
+  name: string
+  serdes: AnySerdes
+  supplier: StateStoreSupplier
+  /** The topic the store's Serdes are told about: its Changelog. */
+  changelogTopic: string
+}
+
 /** A directed graph of source, Processor and sink nodes. Built by the DSL, run by a Task. */
 export class ProcessorGraph {
   readonly #nodes = new Map<string, GraphNode>()
   readonly #sourcesByTopic = new Map<string, SourceNode>()
   readonly #sinksByTopic = new Map<string, SinkNode[]>()
+  readonly #stores = new Map<string, StoreNode>()
   #nextId = 0
+
+  /** The Application ID of the Streams App the graph belongs to. */
+  readonly applicationId: string
+
+  constructor(applicationId: string) {
+    this.applicationId = applicationId
+  }
 
   get nodes(): ReadonlyMap<string, GraphNode> {
     return this.#nodes
@@ -110,6 +132,26 @@ export class ProcessorGraph {
   /** Output topics, each with the sinks that write to it. */
   get sinks(): ReadonlyMap<string, readonly SinkNode[]> {
     return this.#sinksByTopic
+  }
+
+  /** State Store definitions by name. */
+  get stores(): ReadonlyMap<string, StoreNode> {
+    return this.#stores
+  }
+
+  addStore(store: StoreNode): void {
+    if (this.#stores.has(store.name)) {
+      throw new Error(`A State Store named "${store.name}" already exists in this Streams App`)
+    }
+    this.#stores.set(store.name, store)
+  }
+
+  /** A State Store name not used yet. */
+  storeName(prefix: string): string {
+    let name: string
+    do name = `${prefix}-store-${String(this.#nextId++).padStart(4, '0')}`
+    while (this.#stores.has(name))
+    return name
   }
 
   addSource(topic: string, serdes: AnySerdes): string {
