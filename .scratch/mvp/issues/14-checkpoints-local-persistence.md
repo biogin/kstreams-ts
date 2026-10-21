@@ -2,7 +2,7 @@
 
 **What to build:** SQLite files persist in `<stateDir>/<applicationId>/<task>/` across restarts. Restore replays only the part of the Changelog after the Checkpoint, and a store with a missing or unclean Checkpoint is wiped and rebuilt (ADR-0009).
 
-**Blocked by:** 13
+**Blocked by:** 27
 
 **Status:** ready-for-agent
 

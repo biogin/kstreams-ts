@@ -1,0 +1,15 @@
+# 28: Abort on revoke, commit on graceful shutdown
+
+**What to build:** When a rebalance revokes a Task mid-batch under exactly-once, the Worker aborts the Kafka transaction and rolls back SQLite (ADR-0006). A graceful shutdown commits the current batch, writes Checkpoints, closes stores and leaves the group, falling back to abort when the timeout runs out.
+
+**Blocked by:** 16
+
+**Status:** ready-for-agent
+
+- [ ] Revoke mid-batch → Kafka abort + SQLite rollback, verified by a test that forces a rebalance
+- [ ] Graceful shutdown commits within a configurable timeout
+- [ ] Timeout expiry falls back to abort and still leaves the group
+
+Split from the original ticket 16.
+
+Spec: [../spec.md](../spec.md). Glossary: [CONTEXT.md](../../../CONTEXT.md). ADRs: [docs/adr/](../../../docs/adr/)

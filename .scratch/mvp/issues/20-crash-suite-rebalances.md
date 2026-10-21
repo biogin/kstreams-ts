@@ -2,7 +2,7 @@
 
 **What to build:** The crash test suite also scales Workers and processes up and down mid-run and kills during rebalances, still checking for exact results.
 
-**Blocked by:** 17, 19
+**Blocked by:** 17, 19, 29
 
 **Status:** ready-for-agent
 
