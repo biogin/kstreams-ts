@@ -20,6 +20,13 @@
 // stopped before the next one was written, e.g. a crash mid-batch), unreadable, of another
 // version, doesn't list the store, or has an offset outside the Changelog partition (before its
 // start or past its end, e.g. a recreated topic).
+//
+// Under exactly-once a store transaction commits only after the Kafka transaction holding its
+// Changelog records (ADR-0002), so its commit doesn't make the store unclean: the store is then
+// its Changelog up to some offset at or after the Checkpoint, and replaying the Changelog records
+// after the Checkpoint again is harmless (each one sets a key's value). A crash between the Kafka
+// commit and the Checkpoint then only replays that batch; an aborted batch's store transaction is
+// rolled back, and its Changelog records are skipped by `read_committed` readers.
 
 import {
   closeSync,
@@ -123,15 +130,24 @@ export class TaskCheckpoint {
   /** The persistent stores, by name. */
   readonly #stores = new Map<string, StateStore>()
   readonly #offsets = new Map<string, bigint>()
-  /** Whether the Checkpoint file exists and matches the stores. */
+  /** Whether a store transaction's commit leaves the stores clean (see the top of the file). */
+  readonly #changelogFirst: boolean
+  /** Whether the Checkpoint file exists and the stores are clean. */
   #clean: boolean
+  /** The offsets the Checkpoint file has, while it exists. */
+  #written: Map<string, bigint> | undefined
 
-  /** Reads the Checkpoint in `directory`, if there is one. */
-  constructor(directory: string) {
+  /**
+   * Reads the Checkpoint in `directory`, if there is one. With `changelogFirst`, store
+   * transactions commit only once their writes' Changelog records are committed (exactly-once).
+   */
+  constructor(directory: string, { changelogFirst = false }: { changelogFirst?: boolean } = {}) {
     this.#directory = directory
+    this.#changelogFirst = changelogFirst
     const found = readCheckpoint(directory)
     this.#clean = found !== undefined
     for (const [name, offset] of found ?? []) this.#offsets.set(name, offset)
+    this.#written = found === undefined ? undefined : new Map(found)
   }
 
   /**
@@ -140,7 +156,7 @@ export class TaskCheckpoint {
    */
   track(name: string, store: StateStore): StateStore {
     this.#stores.set(name, store)
-    return guarded(store, () => this.#dirty())
+    return guarded(store, () => this.#dirty(), this.#changelogFirst)
   }
 
   /** The offset to restore store `name` from, or undefined to wipe and fully restore it. */
@@ -157,32 +173,43 @@ export class TaskCheckpoint {
   }
 
   /**
-   * Writes the Checkpoint if a store was written since the last one: flushes the stores, then
-   * writes their offsets. Only call it once the Changelog records of every store write so far are
-   * acknowledged, and with each store's offset advanced past them.
+   * Writes the Checkpoint if a store was written or an offset advanced since the last one:
+   * flushes the stores, then writes their offsets. Only call it once the Changelog records of
+   * every store write so far are acknowledged, and with each store's offset advanced past them.
    */
   write(): void {
-    if (this.#clean) return
     const offsets = new Map<string, bigint>()
-    for (const [name, store] of this.#stores) {
+    for (const name of this.#stores.keys()) {
       const offset = this.#offsets.get(name)
       // A store with no offset yet stays unclean; it is left out of the Checkpoint.
       if (offset !== undefined) offsets.set(name, offset)
-      store.flush?.()
     }
+    if (this.#clean && sameOffsets(offsets, this.#written)) return
+    for (const store of this.#stores.values()) store.flush?.()
     writeCheckpoint(this.#directory, offsets)
     this.#clean = true
+    this.#written = offsets
   }
 
   #dirty(): void {
     if (!this.#clean) return
     removeCheckpoint(this.#directory)
     this.#clean = false
+    this.#written = undefined
   }
 }
 
-/** `store`, calling `dirty` before each write that could make it differ from its Checkpoint. */
-function guarded(store: StateStore, dirty: () => void): StateStore {
+function sameOffsets(a: CheckpointOffsets, b: CheckpointOffsets | undefined): boolean {
+  return (
+    b !== undefined && a.size === b.size && [...a].every(([name, offset]) => b.get(name) === offset)
+  )
+}
+
+/**
+ * `store`, calling `dirty` before each write that could make it differ from its Checkpoint: a
+ * write outside a store transaction, or a store transaction's commit unless `changelogFirst`.
+ */
+function guarded(store: StateStore, dirty: () => void, changelogFirst: boolean): StateStore {
   let inTransaction = false
   return {
     get: (key) => store.get(key),
@@ -201,7 +228,7 @@ function guarded(store: StateStore, dirty: () => void): StateStore {
       inTransaction = true
     },
     commit() {
-      dirty()
+      if (!changelogFirst) dirty()
       store.commit()
       inTransaction = false
     },

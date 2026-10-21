@@ -42,8 +42,8 @@ export interface StreamsAppConfig {
   /**
    * The Delivery Guarantee. Defaults to `'at-least-once'`. Under `'exactly-once'` each batch's
    * outputs and consumed offsets commit together in one Kafka transaction, so `read_committed`
-   * readers never see the outputs of a failed batch. Exactly-once with State Stores is not
-   * implemented yet: such an app refuses to start.
+   * readers never see the outputs of a failed batch. State Store writes stay in a store
+   * transaction until that Kafka transaction has committed, and are rolled back if it aborts.
    */
   guarantee?: DeliveryGuarantee
   /**
@@ -438,11 +438,6 @@ class Runtime {
     }
     if (this.#graph.sources.size === 0) {
       throw new Error(`Streams App "${applicationId}" reads no topic: declare a Stream first`)
-    }
-    if (guarantee === 'exactly-once' && this.#graph.stores.size > 0) {
-      throw new Error(
-        `Streams App "${applicationId}": exactly-once with State Stores is not implemented yet; use at-least-once`,
-      )
     }
     const workerId = `${applicationId}-worker-0`
     const worker = startWorker(this.#graph, {

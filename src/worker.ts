@@ -2,18 +2,23 @@
 // consumer (ADR-0007). With `workers: 0` the Streams App runs one Worker in the main thread.
 //
 // A Task is created when its first record arrives. Its State Stores are restored from their
-// Changelogs first (from their Checkpoints, or in full; see restore.ts and checkpoint.ts); its
-// records wait in the Task meanwhile, and the batch commits once they are processed.
+// Changelogs first (from their Checkpoints, or in full; see restore.ts and checkpoint.ts), between
+// batches: a record for a new Task ends the batch it arrives in, and the next batch starts with
+// that Task's Restore, before anything else is processed or produced. So no Kafka transaction or
+// store transaction is open during a Restore.
 //
 // The commit cycle: read records into a batch until the commit interval runs out or the batch is
 // full, and process each record in its Task.
 // - At-least-once: then produce the batch's outputs and Changelog records, wait for the broker to
-//   acknowledge them, and only then commit the consumed offsets.
-// - Then each Task writes the Checkpoint of its persistent State Stores, with the Changelog
-//   offsets the broker acknowledged.
-// - Exactly-once: outputs go into the Worker's open Kafka transaction as they are produced; at the
-//   end of the batch the consumed offsets (the last record per partition) join the transaction
-//   and it commits. A failure aborts it, so `read_committed` readers never see the batch.
+//   acknowledge them, and only then commit the consumed offsets. Then each Task writes the
+//   Checkpoint of its persistent State Stores, with the Changelog offsets the broker acknowledged.
+// - Exactly-once (ADR-0002): each Task's store writes go into a store transaction (for SQLite, an
+//   open SQLite transaction) that lasts as long as the Kafka transaction. Outputs and Changelog
+//   records go into the Worker's open Kafka transaction as they are produced; at the end of the
+//   batch the consumed offsets (the last record per partition) join it and it commits. Only then
+//   do the Tasks commit their store transactions and write their Checkpoints, with the Changelog
+//   offsets of the transaction's sends. A failure aborts the Kafka transaction and rolls back the
+//   store transactions, so neither `read_committed` readers nor the stores keep the batch.
 
 import {
   Consumer,
@@ -127,6 +132,10 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
       clientId,
       replicationFactor: options.changelogReplicationFactor,
     })
+    // Fences the Worker's previous producer before the group's offsets are read and any
+    // Changelog is restored: the broker aborts (or completes) a transaction it left open, e.g.
+    // after a crash, so neither waits for that transaction's timeout.
+    if (transactionalId !== undefined) await (await producer.beginTransaction()).cancel()
     stream = await consumer.consume({
       topics,
       // Resume from the committed offsets; a new application starts at the beginning.
@@ -201,6 +210,8 @@ class CommitCycle {
   #work: Promise<void>[] = []
   /** The last record read from each partition, by `topic:partition`. */
   #lastRead = new Map<string, ConsumedMessage>()
+  /** A record for a new Task, which ended the batch it arrived in; the next batch starts with it. */
+  #held: ConsumedMessage | undefined
 
   constructor(
     graph: ProcessorGraph,
@@ -239,8 +250,10 @@ class CommitCycle {
         await this.#commit()
       }
     } catch (error) {
-      // The error is what the Worker reports, not a failure to abort.
+      // The error is what the Worker reports, not a failure to abort. A Kafka abort rolls back
+      // the store transactions too; their writes' Changelog records are aborted with it.
       await this.#committer.abort().catch(() => {})
+      this.#rollbackTasks()
       throw error
     } finally {
       next.catch(() => {})
@@ -248,7 +261,20 @@ class CommitCycle {
     }
   }
 
-  /** Closes every Task's State Stores. After a failure they are left without a Checkpoint. */
+  #rollbackTasks(): void {
+    for (const task of this.#tasks.values()) {
+      try {
+        task.rollback()
+      } catch {
+        // Rolling back the others matters more; closing an uncommitted store rolls it back too.
+      }
+    }
+  }
+
+  /**
+   * Closes every Task's State Stores. After a failure they are left without a new Checkpoint
+   * (under at-least-once, without any).
+   */
   #closeTasks(): void {
     for (const task of this.#tasks.values()) {
       try {
@@ -268,24 +294,50 @@ class CommitCycle {
     pending: Promise<IteratorResult<ConsumedMessage>>,
   ): Promise<{ next: Promise<IteratorResult<ConsumedMessage>> }> {
     const { commitIntervalMs, commitMaxRecords } = this.#options
+    let count = 0
+    const held = this.#held
+    this.#held = undefined
+    if (held !== undefined) {
+      await this.#restored(held.partition)
+      this.#process(held)
+      count++
+    }
     let timer: NodeJS.Timeout | undefined
     const timeUp = new Promise<typeof TIME_UP>((resolve) => {
       timer = setTimeout(() => resolve(TIME_UP), commitIntervalMs)
     })
     let next = pending
     try {
-      for (let count = 0; count < commitMaxRecords; count++) {
+      for (; count < commitMaxRecords && this.#failure === undefined; count++) {
         const result = await Promise.race([next, timeUp, this.#interrupted])
         if (result === TIME_UP || result === INTERRUPTED) break
         if (result.done) throw new Error('The consumer stopped delivering records')
         next = this.#messages.next()
-        this.#process(result.value)
-        if (this.#failure !== undefined) break
+        const message = result.value
+        if (this.#needsRestore(message.partition)) {
+          // Restore only between batches: nothing of this batch may be produced or written yet.
+          if (count > 0) {
+            this.#held = message
+            break
+          }
+          await this.#restored(message.partition)
+        }
+        this.#process(message)
       }
     } finally {
       clearTimeout(timer)
     }
     return { next }
+  }
+
+  /** Whether a record for `partition` creates a Task whose State Stores must be restored. */
+  #needsRestore(partition: number): boolean {
+    return this.#restorer !== undefined && !this.#tasks.has(partition)
+  }
+
+  /** Creates the Task of `partition` if needed, and waits for its Restore. */
+  async #restored(partition: number): Promise<void> {
+    await this.#task(partition).restored()
   }
 
   #process(message: ConsumedMessage): void {
@@ -313,10 +365,12 @@ class CommitCycle {
         {
           task: partition,
           stateDir: this.#options.stateDir,
+          // Exactly-once: store transactions as long as the Kafka transaction.
+          storeTransactions: this.#options.transactionalId !== undefined,
           // A Task's State Stores are logged to the Changelog partition of the same number.
           changelog: (topic, record) =>
             this.#committer.produce({ ...toMessage(topic, record), partition }),
-          // Every Task starts with a Restore; its records queue behind it.
+          // Every Task starts with a Restore, which the cycle waits for between batches.
           restore: (stores) => {
             const restorer = this.#restorer
             if (restorer === undefined) throw new Error('No restore consumer for State Stores')
@@ -331,7 +385,7 @@ class CommitCycle {
 
   /**
    * Finishes the batch: waits for its processing, then commits its outputs, Changelog records and
-   * offsets.
+   * offsets, then the Tasks' store transactions, then their Checkpoints.
    */
   async #commit(): Promise<void> {
     if (this.#failure === undefined) {
@@ -344,7 +398,9 @@ class CommitCycle {
     const lastRead = [...this.#lastRead.values()]
     this.#lastRead = new Map()
     const produced = await this.#committer.commit(lastRead)
-    // Only once the batch is committed: a Checkpoint must not get ahead of the Changelog.
+    // Only once the batch is committed: a store must not get ahead of its Changelog (ADR-0002),
+    // nor a Checkpoint ahead of its store.
+    for (const task of this.#tasks.values()) task.commit()
     for (const [partition, task] of this.#tasks) {
       task.checkpoint(produced.get(partition) ?? new Map())
     }
@@ -432,6 +488,8 @@ class TransactionalCommitter implements BatchCommitter {
   #sendFailure: { error: unknown } | undefined
   /** Reports a send error right away, so the batch ends early. */
   readonly #fail: (error: unknown) => void
+  /** The offsets after the Changelog records sent into the open transaction. */
+  #produced = new Map<number, Map<string, bigint>>()
 
   constructor(
     consumer: Consumer<Bytes, Bytes, Bytes, Bytes>,
@@ -458,7 +516,8 @@ class TransactionalCommitter implements BatchCommitter {
     if (messages.length === 0 || this.#sendFailure !== undefined) return
     try {
       const transaction = await this.#begin()
-      await transaction.send({ messages })
+      const result = await transaction.send({ messages })
+      mergeProduced(this.#produced, producedOffsets(messages, result.offsets ?? []))
     } catch (error) {
       this.#sendFailure = { error }
       this.#fail(error)
@@ -470,7 +529,6 @@ class TransactionalCommitter implements BatchCommitter {
     return this.#transaction
   }
 
-  // Exactly-once with State Stores (and so Checkpoints) is ticket 16: no offsets are reported yet.
   async commit(lastRead: ConsumedMessage[]): Promise<ProducedOffsets> {
     await this.#sending
     if (this.#sendFailure !== undefined) throw this.#sendFailure.error
@@ -481,9 +539,11 @@ class TransactionalCommitter implements BatchCommitter {
       for (const message of lastRead) await transaction.addOffset(this.#withCurrentGroup(message))
     }
     const transaction = this.#transaction
+    const produced = this.#produced
     this.#transaction = undefined
+    this.#produced = new Map()
     await transaction?.commit()
-    return new Map()
+    return produced
   }
 
   /**
@@ -519,6 +579,7 @@ class TransactionalCommitter implements BatchCommitter {
   async abort(): Promise<void> {
     await this.#sending
     this.#pending = []
+    this.#produced = new Map()
     const transaction = this.#transaction
     this.#transaction = undefined
     await transaction?.abort()
@@ -561,6 +622,21 @@ function producedOffsets(
     byTopic.set(topic, next)
   }
   return produced
+}
+
+/** Adds `more` to `produced`, keeping the higher offset: later sends write later offsets. */
+function mergeProduced(produced: Map<number, Map<string, bigint>>, more: ProducedOffsets): void {
+  for (const [partition, offsets] of more) {
+    let byTopic = produced.get(partition)
+    if (byTopic === undefined) {
+      byTopic = new Map()
+      produced.set(partition, byTopic)
+    }
+    for (const [topic, offset] of offsets) {
+      const known = byTopic.get(topic)
+      if (known === undefined || offset > known) byTopic.set(topic, offset)
+    }
+  }
 }
 
 function toMessage(
