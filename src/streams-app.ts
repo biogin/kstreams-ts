@@ -1,4 +1,4 @@
-import { ProcessorGraph } from './processor-graph.js'
+import { ProcessorGraph, type ProcessorSupplier } from './processor-graph.js'
 import type { Serde, Serdes } from './serde.js'
 
 export interface StreamsAppConfig {
@@ -19,6 +19,16 @@ export interface StreamsApp {
 
 /** An unbounded sequence of keyed records where each record is an independent event. */
 export interface Stream<K, V> {
+  /** Keeps only the records for which `predicate` returns true. */
+  filter<VOut extends V>(predicate: (key: K, value: V) => value is VOut): Stream<K, VOut>
+  filter(predicate: (key: K, value: V) => boolean): Stream<K, V>
+  /**
+   * Turns each record into a new key and value, which may have other types. The record keeps its
+   * timestamp. The resulting Stream has no Serdes of its own, so `.to()` must be given both.
+   */
+  map<KOut, VOut>(mapper: (key: K, value: V) => { key: KOut; value: VOut }): Stream<KOut, VOut>
+  /** Calls `action` with each record (for logging, metrics, ...) and passes the record on unchanged. */
+  peek(action: (key: K, value: V) => void): Stream<K, V>
   /**
    * Writes every record to `topic`. Serdes not given here default to the ones this Stream was
    * read with.
@@ -65,6 +75,50 @@ class StreamNode<K, V> implements Stream<K, V> {
     this.#graph = graph
     this.#node = node
     this.#serdes = serdes
+  }
+
+  filter(predicate: (key: K, value: V) => boolean): Stream<K, V> {
+    return this.#then<K, V>(
+      ({ forward }) => ({
+        process(record) {
+          if (predicate(record.key, record.value)) forward(record)
+        },
+      }),
+      this.#serdes,
+    )
+  }
+
+  map<KOut, VOut>(mapper: (key: K, value: V) => { key: KOut; value: VOut }): Stream<KOut, VOut> {
+    // The new key and value types may differ, so the inherited Serdes no longer apply.
+    return this.#then<KOut, VOut>(
+      ({ forward }) => ({
+        process(record) {
+          const { key, value } = mapper(record.key, record.value)
+          forward({ key, value, timestamp: record.timestamp })
+        },
+      }),
+      {},
+    )
+  }
+
+  peek(action: (key: K, value: V) => void): Stream<K, V> {
+    return this.#then<K, V>(
+      ({ forward }) => ({
+        process(record) {
+          action(record.key, record.value)
+          forward(record)
+        },
+      }),
+      this.#serdes,
+    )
+  }
+
+  /** Adds a Processor downstream of this Stream and returns the Stream of what it forwards. */
+  #then<KOut, VOut>(
+    supplier: ProcessorSupplier<K, V, KOut, VOut>,
+    serdes: Partial<Serdes<KOut, VOut>>,
+  ): Stream<KOut, VOut> {
+    return new StreamNode(this.#graph, this.#graph.addProcessor(supplier, [this.#node]), serdes)
   }
 
   to(topic: string, serdes: Partial<Serdes<K, V>> = {}): void {
