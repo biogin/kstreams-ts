@@ -149,6 +149,26 @@ export function createKafka() {
       return groups.get(groupId)?.members.size ?? 0
     },
 
+    /**
+     * The state of consumer group `groupId` (e.g. `STABLE`), and the partitions of `topic`
+     * assigned to each member, by the member's client ID.
+     */
+    async groupAssignments(
+      groupId: string,
+      topic: string,
+    ): Promise<{ state: string; assigned: Map<string, number[]> }> {
+      const group = (await admin.describeGroups({ groups: [groupId] })).get(groupId)
+      const assigned = new Map<string, number[]>()
+      for (const member of group?.members.values() ?? []) {
+        const partitions = member.assignments?.get(topic)?.partitions ?? []
+        assigned.set(
+          member.clientId,
+          [...partitions].sort((a, b) => a - b),
+        )
+      }
+      return { state: String(group?.state ?? '').toUpperCase(), assigned }
+    },
+
     /** Deletes the topics this helper created and closes its clients. */
     async close(): Promise<void> {
       try {
