@@ -1,4 +1,5 @@
-import { ProcessorGraph } from './processor-graph.js'
+import { ProcessorGraph, type ProcessorSupplier } from './processor-graph.js'
+import type { StreamRecord } from './record.js'
 import type { Serde, Serdes } from './serde.js'
 
 export interface StreamsAppConfig {
@@ -15,6 +16,26 @@ export interface StreamsApp {
   readonly applicationId: string
   /** Declares a Stream read from `topic`, decoded with the given key and value Serdes. */
   stream<K, V>(topic: string, serdes: Serdes<K, V>): Stream<K, V>
+  /**
+   * Registers a Processor under a unique `name`. The supplier is called once per Task with that
+   * Task's context. Connect it to a Stream with `stream.process(...)`.
+   */
+  processor<KIn, VIn, KOut, VOut>(
+    name: string,
+    supplier: ProcessorSupplier<KIn, VIn, KOut, VOut>,
+  ): NamedProcessor<KIn, VIn, KOut, VOut>
+}
+
+declare const recordTypes: unique symbol
+
+/** A Processor registered with `app.processor`, ready to be connected to Streams. */
+export interface NamedProcessor<KIn, VIn, KOut, VOut> {
+  readonly name: string
+  /** Type-only: the records it reads and forwards, so Streams are checked against them. */
+  readonly [recordTypes]?: {
+    reads: (record: StreamRecord<KIn, VIn>) => void
+    forwards: StreamRecord<KOut, VOut>
+  }
 }
 
 /** An unbounded sequence of keyed records where each record is an independent event. */
@@ -24,6 +45,12 @@ export interface Stream<K, V> {
    * read with.
    */
   to(topic: string, serdes?: Partial<Serdes<K, V>>): void
+  /**
+   * Sends every record to a Processor and returns the Stream of records it forwards. Connecting
+   * several Streams to one Processor merges them; each call returns that same output Stream. The
+   * output Stream has no Serdes, so `.to()` after it needs both.
+   */
+  process<KOut, VOut>(processor: NamedProcessor<K, V, KOut, VOut>): Stream<KOut, VOut>
 }
 
 const APPLICATION_ID = /^[A-Za-z0-9._-]+$/
@@ -41,12 +68,27 @@ export function createStreamsApp(config: StreamsAppConfig): StreamsApp {
     stream(topic, serdes) {
       return new StreamNode(graph, graph.addSource(topic, serdes), serdes)
     },
+    processor(name, supplier) {
+      if (typeof name !== 'string' || name === '') {
+        throw new Error('A Processor needs a non-empty name')
+      }
+      const processor = { name: graph.addProcessor(supplier, [], name) }
+      registered.set(processor, { graph, output: new StreamNode(graph, name, {}) })
+      return processor
+    },
   }
   graphs.set(app, graph)
   return app
 }
 
 const graphs = new WeakMap<StreamsApp, ProcessorGraph>()
+
+// Record types are erased once a Processor is registered; `Stream.process` restores them.
+// biome-ignore lint/suspicious/noExplicitAny: type erasure, see above
+type AnyNamedProcessor = NamedProcessor<any, any, any, any>
+// biome-ignore lint/suspicious/noExplicitAny: type erasure, see above
+type AnyStream = Stream<any, any>
+const registered = new WeakMap<AnyNamedProcessor, { graph: ProcessorGraph; output: AnyStream }>()
 
 /** Internal: the Processor graph a Streams App's DSL has compiled to so far. */
 export function processorGraphOf(app: StreamsApp): ProcessorGraph {
@@ -75,6 +117,15 @@ class StreamNode<K, V> implements Stream<K, V> {
       { key: required(key, 'key', topic), value: required(value, 'value', topic) },
       [this.#node],
     )
+  }
+
+  process<KOut, VOut>(processor: NamedProcessor<K, V, KOut, VOut>): Stream<KOut, VOut> {
+    const entry = registered.get(processor)
+    if (entry?.graph !== this.#graph) {
+      throw new Error(`Processor "${processor.name}" was not registered with this Streams App`)
+    }
+    this.#graph.connect(this.#node, processor.name)
+    return entry.output
   }
 }
 

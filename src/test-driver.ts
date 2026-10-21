@@ -20,8 +20,14 @@ export interface PipeOptions {
 }
 
 export interface TestInputTopic<K, V> {
-  /** Serializes the record with the topic's Serdes and processes it to completion. */
-  pipe(key: K, value: V, options?: PipeOptions): void
+  /**
+   * Serializes the record with the topic's Serdes and processes it. When every Processor is
+   * synchronous, the record is fully processed before `pipe` returns. Await the returned Promise
+   * when the Streams App has async Processors: it resolves once the record is fully processed and
+   * rejects if processing failed. Records piped without awaiting are queued and processed one
+   * after another, never overlapping. After a failure, every later `pipe` rejects too.
+   */
+  pipe(key: K, value: V, options?: PipeOptions): Promise<void>
 }
 
 export interface TestOutputTopic<K, V> {
@@ -49,7 +55,7 @@ export function createTestDriver(app: StreamsApp): TestDriver {
       }
       return {
         pipe(key, value, options = {}) {
-          task.process(topic, {
+          return task.process(topic, {
             key: source.serdes.key.serialize(key),
             value: source.serdes.value.serialize(value),
             timestamp: options.timestamp ?? wallClockTime,
