@@ -92,7 +92,7 @@ function counterTask(
 
 async function pipe(task: Task, ...keys: string[]): Promise<void> {
   for (const key of keys) {
-    await task.process('input', { key: text(key), value: text('x'), timestamp: 1 })
+    await task.process('input', { key: text(key), value: text('x'), timestamp: 1 }, 0n)
   }
 }
 
@@ -244,7 +244,7 @@ describe('Checkpoints of persistent State Stores', () => {
     const task = counterTask(log)
     await pipe(task, 'a')
     await expect(
-      task.process('nowhere', { key: null, value: null, timestamp: 1 }),
+      task.process('nowhere', { key: null, value: null, timestamp: 1 }, 0n),
     ).rejects.toThrow()
 
     commit(task, log)

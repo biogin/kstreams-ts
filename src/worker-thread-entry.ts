@@ -3,28 +3,22 @@
 
 import { parentPort, workerData } from 'node:worker_threads'
 import { startWorkerOf } from './streams-app.js'
-import type { FromWorkerThread, ToWorkerThread, WorkerThreadData } from './worker-thread.js'
+import {
+  type FromWorkerThread,
+  type ToWorkerThread,
+  transferableError,
+  type WorkerThreadData,
+} from './worker-thread.js'
 
 const port = parentPort
 if (port === null) throw new Error('worker-thread-entry runs in a worker thread only')
 const { appModule, applicationId, workerNumber } = workerData as WorkerThreadData
 
 function send(message: FromWorkerThread): void {
-  try {
-    port?.postMessage(message)
-  } catch {
-    // The error can't be copied to the main thread (e.g. it holds functions): send what can be.
-    if (message.type === 'failed') port?.postMessage({ ...message, error: copyable(message.error) })
-  }
-}
-
-function copyable(error: unknown): Error {
-  const copy = new Error(error instanceof Error ? error.message : String(error))
-  if (error instanceof Error) {
-    copy.name = error.name
-    if (error.stack !== undefined) copy.stack = error.stack
-  }
-  return copy
+  // The error keeps its class and properties across the boundary (see worker-thread.ts).
+  port?.postMessage(
+    message.type === 'failed' ? { ...message, error: transferableError(message.error) } : message,
+  )
 }
 
 try {

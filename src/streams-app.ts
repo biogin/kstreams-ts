@@ -1,3 +1,4 @@
+import { checkErrorHandlers, type ErrorHandlers } from './error-handlers.js'
 import { type ProcessorContext, ProcessorGraph, type ProcessorSupplier } from './processor-graph.js'
 import type { StreamRecord } from './record.js'
 import { serdes as builtInSerdes, type Serde, type Serdes } from './serde.js'
@@ -93,6 +94,14 @@ export interface StreamsAppConfig {
    * Topic with the wrong partition count is a fatal error. Defaults to true.
    */
   autoCreateInternalTopics?: boolean
+  /**
+   * Where records whose deserialization or processing fails go (ADR-0010). Without a handler, the
+   * first such error stops the app (fail-fast), which is the default. `deadLetter(topic)` writes
+   * failed records to a dead-letter topic instead, in the same transaction under exactly-once.
+   * Errors writing to Kafka (produce errors) and `AsyncNotAllowedError` always stop the app.
+   * With worker threads, handlers run in each worker thread.
+   */
+  errorHandlers?: ErrorHandlers
 }
 
 /** Worker threads, and the App Module each of them rebuilds the Streams App from. */
@@ -372,7 +381,8 @@ export function createStreamsApp(config: StreamsAppConfig): StreamsApp {
     )
   }
   const settings = runtimeSettings(config)
-  const graph = new ProcessorGraph(applicationId)
+  checkErrorHandlers(config.errorHandlers)
+  const graph = new ProcessorGraph(applicationId, config.errorHandlers)
   const runtime = new Runtime(graph, settings)
   const app: StreamsApp = {
     applicationId,

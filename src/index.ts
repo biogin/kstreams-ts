@@ -1,4 +1,14 @@
 // Public entry point.
+export {
+  deadLetter,
+  type ErrorHandler,
+  type ErrorHandlerContext,
+  type ErrorHandlerKind,
+  type ErrorHandlerResponse,
+  type ErrorHandlers,
+  type FailedRecord,
+  type HandlerOutputRecord,
+} from './error-handlers.js'
 export type {
   Processor,
   ProcessorContext,
@@ -46,6 +56,7 @@ export {
   type TestDriverMetrics,
   type TestDriverOptions,
   type TestInputTopic,
+  type TestOutputRecord,
   type TestOutputTopic,
   type TestStore,
 } from './test-driver.js'

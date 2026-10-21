@@ -45,10 +45,22 @@ export function createKafka() {
   return {
     admin,
 
-    /** Creates a topic with a unique name and waits until every partition has a leader. */
-    async createTopic(prefix: string, partitions = 1): Promise<string> {
+    /**
+     * Creates a topic with a unique name and waits until every partition has a leader. `configs`
+     * are topic configs, e.g. `{ 'max.message.bytes': '200' }`.
+     */
+    async createTopic(
+      prefix: string,
+      partitions = 1,
+      configs: Record<string, string> = {},
+    ): Promise<string> {
       const topic = uniqueName(prefix)
-      await admin.createTopics({ topics: [topic], partitions, replicas: 1 })
+      await admin.createTopics({
+        topics: [topic],
+        partitions,
+        replicas: 1,
+        configs: Object.entries(configs).map(([name, value]) => ({ name, value })),
+      })
       topics.push(topic)
       for (let attempt = 0; ; attempt++) {
         const metadata = await admin.metadata({ topics: [topic], forceUpdate: true })
@@ -124,6 +136,19 @@ export function createKafka() {
       return readMessages(topic, toBytesRecord, () => ++seen === count, { timeoutMs, settleMs })
     },
 
+    /**
+     * Reads `topic` from the beginning as string records with their headers (as strings), until
+     * `count` records arrived, then for `settleMs` more.
+     */
+    async consumeWithHeaders(
+      topic: string,
+      count: number,
+      { timeoutMs = 20_000, settleMs = 500 } = {},
+    ): Promise<HeadersRecord[]> {
+      let seen = 0
+      return readMessages(topic, toHeadersRecord, () => ++seen === count, { timeoutMs, settleMs })
+    },
+
     /** Deletes `topic` on `close`, e.g. an Internal Topic the app under test created. */
     deleteOnClose(topic: string): void {
       topics.push(topic)
@@ -175,6 +200,20 @@ function toBytesRecord(message: Message): BytesRecord {
     value: message.value ?? null,
     timestamp: Number(message.timestamp),
     partition: message.partition,
+  }
+}
+
+/** A string record with its headers. */
+export interface HeadersRecord extends TestRecord {
+  headers: Record<string, string>
+}
+
+function toHeadersRecord(message: Message): HeadersRecord {
+  return {
+    ...toTestRecord(message),
+    headers: Object.fromEntries(
+      [...message.headers].map(([name, value]) => [name.toString(), value.toString()]),
+    ),
   }
 }
 

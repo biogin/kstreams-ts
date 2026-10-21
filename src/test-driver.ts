@@ -1,6 +1,13 @@
-import type { SerializedRecord } from './processor-graph.js'
+import { deadLetterTopicsOf } from './error-handlers.js'
+import type { OutputRecord } from './processor-graph.js'
 import type { StreamRecord } from './record.js'
-import { deserializeNullable, type Serdes, serializeNullable } from './serde.js'
+import {
+  serdes as builtInSerdes,
+  deserializeNullable,
+  type Serde,
+  type Serdes,
+  serializeNullable,
+} from './serde.js'
 import type { KeyValueStore, NamedStore } from './state-store.js'
 import { processorGraphOf, type StreamsApp } from './streams-app.js'
 import { createTask } from './task.js'
@@ -9,9 +16,9 @@ import { createTask } from './task.js'
  * Runs a Streams App in memory, without Kafka. Records go through the app's real Serdes on the way
  * in and on the way out.
  *
- * Like a real Streams App with no error handlers, the Test Driver stops at the first error a
- * record raises (e.g. a `DeserializationError`): `pipe` rejects with it, and every later `pipe`
- * rejects.
+ * Records that fail go to the Streams App's error handlers, as in a real Streams App. Without one,
+ * the Test Driver stops at the first error a record raises (e.g. a `DeserializationError`): `pipe`
+ * rejects with it, and every later `pipe` rejects.
  */
 export interface TestDriver {
   /**
@@ -24,8 +31,10 @@ export interface TestDriver {
     serdes?: Partial<Serdes<K, V>>,
   ): TestInputTopic<K, V>
   /**
-   * An output topic the Streams App writes. Throws if the app doesn't write `topic`. Records are
-   * read with the topic's Serdes; pass `serdes` to read with your own instead.
+   * An output topic the Streams App writes, or a topic its error handlers wrote to or will write
+   * to (a `deadLetter` topic). Throws if the app doesn't write `topic`. Records are read with the
+   * topic's Serdes; pass `serdes` to read with your own instead. A topic only error handlers write
+   * has no Serdes: its records are read as bytes unless you pass some.
    */
   output<K = unknown, V = unknown>(
     topic: string,
@@ -86,25 +95,39 @@ export interface TestInputTopic<K, V> {
   pipe(key: K | null, value: V | null, options?: PipeOptions): Promise<void>
 }
 
+/** A record read from an output topic. `headers` are there only if the record has any. */
+export type TestOutputRecord<K, V> = StreamRecord<K | null, V | null> & {
+  headers?: Readonly<Record<string, Uint8Array>>
+}
+
 export interface TestOutputTopic<K, V> {
   /** Removes and returns the oldest unread record. Throws if there is none. */
-  read(): StreamRecord<K | null, V | null>
+  read(): TestOutputRecord<K, V>
   /** Removes and returns every unread record, oldest first. */
-  readAll(): StreamRecord<K | null, V | null>[]
+  readAll(): TestOutputRecord<K, V>[]
 }
 
 export function createTestDriver(app: StreamsApp, options: TestDriverOptions = {}): TestDriver {
   const graph = processorGraphOf(app)
   let wallClockTime = 0
-  const written = new Map<string, SerializedRecord[]>()
+  const written = new Map<string, OutputRecord[]>()
   for (const topic of graph.sinks.keys()) written.set(topic, [])
+  for (const topic of deadLetterTopicsOf(graph.errorHandlers)) written.set(topic, [])
+  /** The offset of the next record piped, by input topic. */
+  const offsets = new Map<string, bigint>()
   /** The error that stopped the Streams App, if any. */
   let stoppedBy: { error: unknown } | undefined
 
   const task = createTask(
     graph,
     (topic, record) => {
-      written.get(topic)?.push(record)
+      let records = written.get(topic)
+      if (records === undefined) {
+        // A topic only a custom error handler writes to.
+        records = []
+        written.set(topic, records)
+      }
+      records.push(record)
     },
     () => wallClockTime,
     { stateDir: options.stateDir },
@@ -151,13 +174,19 @@ export function createTestDriver(app: StreamsApp, options: TestDriverOptions = {
       const context = { topic }
       return {
         pipe(k, v, options = {}) {
-          return runOnTask(() =>
-            task.process(topic, {
-              key: serializeNullable(key, k, context),
-              value: serializeNullable(value, v, context),
-              timestamp: options.timestamp ?? wallClockTime,
-            }),
-          )
+          return runOnTask(() => {
+            const offset = offsets.get(topic) ?? 0n
+            offsets.set(topic, offset + 1n)
+            return task.process(
+              topic,
+              {
+                key: serializeNullable(key, k, context),
+                value: serializeNullable(value, v, context),
+                timestamp: options.timestamp ?? wallClockTime,
+              },
+              offset,
+            )
+          })
         },
       }
     },
@@ -170,17 +199,22 @@ export function createTestDriver(app: StreamsApp, options: TestDriverOptions = {
 
     output<K, V>(topic: string, serdes: Partial<Serdes<K, V>> = {}): TestOutputTopic<K, V> {
       const records = written.get(topic)
-      const sink = graph.sinks.get(topic)?.[0]
-      if (records === undefined || sink === undefined) {
+      if (records === undefined) {
         throw new Error(`Streams App "${app.applicationId}" does not write topic "${topic}"`)
       }
-      const key = serdes.key ?? sink.serdes.key
-      const value = serdes.value ?? sink.serdes.value
+      // Without a sink, only error handlers write the topic: bytes, unless told otherwise.
+      const topicSerdes = (graph.sinks.get(topic)?.[0]?.serdes ?? {
+        key: builtInSerdes.bytes,
+        value: builtInSerdes.bytes,
+      }) as Serdes<unknown, unknown>
+      const key = (serdes.key ?? topicSerdes.key) as Serde<K>
+      const value = (serdes.value ?? topicSerdes.value) as Serde<V>
       const context = { topic }
-      const deserialize = (record: SerializedRecord): StreamRecord<K | null, V | null> => ({
+      const deserialize = ({ headers, ...record }: OutputRecord): TestOutputRecord<K, V> => ({
         key: deserializeNullable(key, record.key, context),
         value: deserializeNullable(value, record.value, context),
         timestamp: record.timestamp,
+        ...(headers === undefined ? {} : { headers }),
       })
       return {
         read() {

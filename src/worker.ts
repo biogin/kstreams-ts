@@ -53,7 +53,7 @@ import {
 import { checkCoPartitioned } from './co-partitioning.js'
 import { ensureChangelogs } from './internal-topics.js'
 import { Ownership } from './ownership.js'
-import type { ProcessorGraph, SerializedRecord } from './processor-graph.js'
+import type { OutputRecord, ProcessorGraph, SerializedRecord } from './processor-graph.js'
 import { ReadCommittedConsumer } from './read-committed.js'
 import { createChangelogReader, type KafkaChangelogReader, restoreStores } from './restore.js'
 import { type ChangelogOffsets, createTask, type Task } from './task.js'
@@ -470,7 +470,7 @@ class CommitCycle {
       value: message.value ?? null,
       timestamp: Number(message.timestamp),
     }
-    this.#track(this.#task(message.partition).process(message.topic, record))
+    this.#track(this.#task(message.partition).process(message.topic, record, message.offset))
     const key = partitionKey(message.topic, message.partition)
     this.#lastRead.set(key, message)
     this.#position.set(key, message.offset + 1n)
@@ -871,7 +871,7 @@ function mergeProduced(produced: Map<number, Map<string, bigint>>, more: Produce
 
 function toMessage(
   topic: string,
-  record: SerializedRecord,
+  record: OutputRecord,
 ): MessageToProduce<Bytes, Bytes, Bytes, Bytes> {
   return {
     topic,
@@ -879,6 +879,16 @@ function toMessage(
     // The client writes a null value as a tombstone.
     value: (record.value === null ? null : toBuffer(record.value)) as Bytes,
     timestamp: BigInt(record.timestamp),
+    ...(record.headers === undefined
+      ? {}
+      : {
+          headers: new Map(
+            Object.entries(record.headers).map(([name, value]) => [
+              Buffer.from(name),
+              toBuffer(value),
+            ]),
+          ),
+        }),
   }
 }
 
