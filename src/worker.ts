@@ -15,6 +15,7 @@ import {
   ProduceAcks,
   Producer,
 } from '@platformatic/kafka'
+import { checkCoPartitioned } from './co-partitioning.js'
 import type { ProcessorGraph, SerializedRecord } from './processor-graph.js'
 import { createTask, type Task } from './task.js'
 
@@ -73,10 +74,13 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
       key === undefined ? roundRobin++ : compatibilityPartitioner(message, key),
   })
 
+  const topics = [...graph.sources.keys()]
   let stream: MessagesStream<Bytes, Bytes, Bytes, Bytes>
   try {
+    // Checked before joining the group, so a misconfigured app never takes any Task.
+    await checkCoPartitioned(consumer, applicationId, topics)
     stream = await consumer.consume({
-      topics: [...graph.sources.keys()],
+      topics,
       // Resume from the committed offsets; a new application starts at the beginning.
       mode: 'committed',
       fallbackMode: 'earliest',
@@ -125,7 +129,7 @@ class CommitCycle {
   readonly #consumer: Consumer<Bytes, Bytes, Bytes, Bytes>
   readonly #producer: Producer<Bytes, Bytes, Bytes, Bytes>
   readonly #messages: AsyncIterator<ConsumedMessage>
-  /** One Task per partition number. */
+  /** One Task per partition number, shared by all the Co-partitioned input topics. */
   readonly #tasks = new Map<number, Task>()
 
   #stopRequested = false
