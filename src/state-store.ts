@@ -164,6 +164,27 @@ export function singleKeyEncoding<K>(serde: Serde<K>): KeyEncoding<K> {
  */
 export type ChangelogWriter = (key: Uint8Array, value: Uint8Array | null) => void
 
+/** Internal: the entries of a typed store view whose store keys are in `[from, to)`, by view. */
+const storeKeyRanges = new WeakMap<
+  KeyValueStore<unknown, unknown>,
+  (from: Uint8Array | undefined, to: Uint8Array | undefined) => [unknown, unknown][]
+>()
+
+/**
+ * Internal: the entries of a typed store view whose store keys (ADR-0015) are at least `from` and
+ * less than `to`, decoded. An undefined bound leaves that end open. For the DSL's own Processors,
+ * e.g. to find expired windows with one range scan.
+ */
+export function rangeByStoreKey<K, V>(
+  view: KeyValueStore<K, V>,
+  from: Uint8Array | undefined,
+  to: Uint8Array | undefined,
+): [K, V][] {
+  const range = storeKeyRanges.get(view as KeyValueStore<unknown, unknown>)
+  if (range === undefined) throw new TypeError('Not a State Store view created by keyValueStore')
+  return range(from, to) as [K, V][]
+}
+
 /**
  * Internal: wraps a byte-level store with the store's Serdes. Keys are encoded with `encoding`,
  * by default as a single part encoded with the key Serde as fallback. With a `changelog`, every
@@ -191,7 +212,7 @@ export function keyValueStore<K, V>(
   }
   const entries = (found: Iterable<[Uint8Array, Uint8Array]>): [K, V][] =>
     Array.from(found, ([k, v]) => [encoding.decode(k, context), value(v)])
-  return {
+  const view: KeyValueStore<K, V> = {
     get(k) {
       const bytes = store.get(key(k))
       return bytes === undefined ? undefined : value(bytes)
@@ -214,6 +235,10 @@ export function keyValueStore<K, V>(
       return entries(store.range(key(from), after))
     },
   }
+  storeKeyRanges.set(view as KeyValueStore<unknown, unknown>, (from, to) =>
+    entries(store.range(from, to)),
+  )
+  return view
 }
 
 interface Entry {

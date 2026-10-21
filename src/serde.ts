@@ -1,3 +1,11 @@
+import {
+  type Duration,
+  type TumblingWindows,
+  tumbling,
+  type Windowed,
+  windowedSerde,
+} from './windows.js'
+
 /** What a Serde is told about the bytes it is converting. */
 export interface SerdeContext {
   /** The topic the bytes are read from or written to (e.g. to pick a Schema Registry subject). */
@@ -103,6 +111,19 @@ export const serdes = {
     serialize: (value: Uint8Array) => value,
     deserialize: (bytes: Uint8Array) => bytes,
   } satisfies Serde<Uint8Array> as Serde<Uint8Array>,
+
+  /**
+   * The keys of a windowed aggregation's Table on its topic: the bytes of `key` followed by the
+   * window start as an 8-byte big-endian signed integer. The window end is the start plus the
+   * window size, so pass the size of the windows (or the windows themselves). Use it to read a
+   * windowed Table's topic outside the Streams App.
+   *
+   * @example
+   * consumerKey = serdes.windowed(serdes.string, '1m')
+   */
+  windowed<K>(key: Serde<K>, size: Duration | TumblingWindows): Serde<Windowed<K>> {
+    return windowedSerde(key, typeof size === 'object' ? size : tumbling(size))
+  },
 }
 
 // Internal (not exported from the package entry point): null-aware wrappers the runtime calls, so
