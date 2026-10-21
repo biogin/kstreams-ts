@@ -20,8 +20,8 @@ export type ProcessorSupplier<KIn, VIn, KOut, VOut> = (
   context: ProcessorContext<KOut, VOut>,
 ) => Processor<KIn, VIn>
 
-/** A record as it is on a topic: serialized key and value. */
-export type SerializedRecord = StreamRecord<Uint8Array, Uint8Array>
+/** A record as it is on a topic: serialized key and value. A null value is a tombstone. */
+export type SerializedRecord = StreamRecord<Uint8Array | null, Uint8Array | null>
 
 // Inside the graph, record types are erased; the DSL keeps them typed at its surface.
 // biome-ignore lint/suspicious/noExplicitAny: type erasure at the graph boundary

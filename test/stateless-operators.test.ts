@@ -8,8 +8,8 @@ import {
 } from '../src/index.js'
 
 const json = <T>(): Serde<T> => ({
-  serialize: (value) => serdes.string.serialize(JSON.stringify(value)),
-  deserialize: (bytes) => JSON.parse(serdes.string.deserialize(bytes)) as T,
+  serialize: (value, ctx) => serdes.string.serialize(JSON.stringify(value), ctx),
+  deserialize: (bytes, ctx) => JSON.parse(serdes.string.deserialize(bytes, ctx)) as T,
 })
 
 function stringStream(applicationId = 'stateless') {
