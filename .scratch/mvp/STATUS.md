@@ -1,37 +1,40 @@
 # MVP implementation status
 
-Integration branch: `mvp`. Plan (changed 2026-10-21): finish ALL remaining tickets before any release, then one code review over everything and a fix pass, then release prep (ticket 26) as 0.1 beta. The earlier M3 stop is dropped. Order: 24 → (after the aborted-transaction fix merges) 18, 30, 23 → 29 → 19 → 20 → 25 → 26 → code review.
+Integration branch: `mvp`. Plan (2026-10-21): finish ALL remaining tickets before any release, then one code review over everything and a fix pass, then release prep (ticket 26) as 0.1 beta. No rush; the earlier M3 stop is dropped.
 
-Since the pause: tickets 28 and 17 merged; the crash suite found Changelog reads dropping committed records (client filter keyed by producer ID); a fix agent is replacing the client's READ_COMMITTED filter with our own Java-style per-response filter (branch `fix/aborted-txn-filter`).
+## Merged (22 of 30)
 
-## Merged (19 of 30)
+01–17, 21, 22, 27, 28, plus the aborted-transaction filter fix (`fix/aborted-txn-filter`). `mvp` passes typecheck, lint, 277 unit tests, the integration suite (36 tests) and the crash suite (`npm run test:crash`, at defaults and on the two seeds that once failed).
 
-01–16, 21, 22, 27. `mvp` passes typecheck, lint, 267 unit tests and the integration suite (with occasional flaky timeouts, see below).
+## Remaining, in order
 
-## Remaining for M3
-
-1. **28** Abort on revoke, commit on graceful shutdown: not started (the agent was stopped before saving work).
-2. **17** Crash suite v1: started, stopped before committing. Its worktree `.claude/worktrees/agent-af7f0d92b0962fd7d` (branch `ticket/17`) may hold uncommitted partial work; check it or restart fresh from `mvp`.
-3. Then: code review of `mvp`, one fix agent, worktree cleanup.
+1. **24** Internal Topic checks (in progress)
+2. **18** Worker threads (App Module, ADR-0013); in parallel later **30** window retention on Kafka and **23** error handlers
+3. **29** Scale out across processes (see its notes: per-process transactional ID, stable committed offsets for new owners, ownership logic under cooperative-sticky)
+4. **19** Restore without blocking other Tasks
+5. **20** Crash suite covers rebalances
+6. **25** Observability
+7. **26** 0.1 release prep (no publishing without the user)
+8. Code review of `mvp` (`/code-review`), one fix agent, worktree cleanup
 
 ## Open items for the code review / fix pass
 
 - **Flaky integration tests** under broker load: `at-least-once-crash.test.ts` (once read 0 records), `passthrough.test.ts` "leaves the group on stop and resumes from the committed offsets on restart" (timeout), plus unnamed one-off timeouts. Make waits condition-based and robust.
-- ~~**Input consumer and platformatic/kafka#467**~~ and ~~**`src/restore.ts` filter**~~: fixed on `fix/aborted-txn-filter`. `src/read-committed.ts` (`ReadCommittedConsumer`) sends Fetch as read_committed at the protocol level but bypasses the client's filter, and filters each response with Java's stateless `CompletedFetch` algorithm. Both Restore and the Worker's input `consume()` use it.
-- Ticket 29 later: transactional IDs are per Worker number, not per process (needs a stable instance identity).
+- **Client internals:** `src/read-committed.ts` (`ReadCommittedConsumer`) hooks `kGetApi` and relies on the Fetch API's argument order (isolationLevel is argument 4). Re-check on every `@platformatic/kafka` upgrade.
+- Leftover `crash-input-*` topics from diagnosis runs may still be on the local broker (`npm run kafka -- reset` clears everything).
 
-## Not in this run (later session)
+## Fixed
 
-18, 19, 20, 23, 24, 25, 26, 29, 30. Ticket files contain notes from earlier tickets.
+- READ_COMMITTED filtering (platformatic/kafka#467): `src/read-committed.ts` sends Fetch as read_committed at the protocol level but bypasses the client's filter, and filters each response with Java's stateless `CompletedFetch` algorithm. Both Restore and the Worker's input path use it. Root cause of the crash-suite failures: the client keys aborted ranges by producer ID, and a later abort marker from a restarted producer stretched an old range over 630 committed records.
 
 ## Upstream
 
-- platformatic/kafka#467 filed by the user. Its body was corrected before anyone responded: Java's handling is stateless per response, the suggested fix follows that, and two extra defects are listed. The local copy is `.scratch/upstream/platformatic-kafka-read-committed-aborted/issue.md`.
+- platformatic/kafka#467 filed by the user; body corrected in place before anyone responded. Local copy: `.scratch/upstream/platformatic-kafka-read-committed-aborted/issue.md`. A follow-up comment about the committed-records symptom is drafted, pending the user's approval.
 
 ## Resuming
 
-- Research notes the implementers relied on are in `.scratch/mvp/research/`. Point agents there.
-- Local broker: `npm run kafka -- start`, tests with `KSTREAMS_KAFKA_BROKERS=localhost:9092 npm run test:integration`, then `npm run kafka -- stop`.
+- Research notes are in `.scratch/mvp/research/` (note: `kafka-client.md` predates the read_committed findings; see its warning at the top).
+- Local broker: `npm run kafka -- start`, tests with `KSTREAMS_KAFKA_BROKERS=localhost:9092 npm run test:integration`, crash suite with `npm run test:crash`, then `npm run kafka -- stop`.
 - Shared-broker rule for parallel agents: start if needed, never stop or reset.
 - Usage rules: Sonnet for merges and mechanical tickets, Opus for hard ones, at most 2 implementers at a time.
-- Old agent worktrees under `.claude/worktrees/agent-*` and `.claude/worktrees/ticket-22` (an empty leftover branch `ticket/22`) are all merged or empty and can be removed during cleanup.
+- Old agent worktrees under `.claude/worktrees/agent-*` and `.claude/worktrees/ticket-22`, plus leftover branches `ticket/22` and `ticket/17`, can be removed during cleanup.

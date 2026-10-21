@@ -1,3 +1,5 @@
+> **Warning (added later):** the claims below that read_committed hides aborted records are WRONG for 2.14.0. The client's filter misses aborted transactions whose marker is in a later fetch response, and can drop committed records when a restarted producer reuses its producer ID (platformatic/kafka#467). kstreams-ts uses its own filter in `src/read-committed.ts`; don't rely on the client's.
+
 # @platformatic/kafka 2.14.0 — notes for kstreams-ts
 
 Version checked: **2.14.0** (npm latest, released 2026-10-07). Pure ESM (`"type": "module"`). Pure JS
