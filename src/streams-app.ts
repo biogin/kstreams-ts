@@ -1,8 +1,21 @@
-import { ProcessorGraph, type ProcessorSupplier } from './processor-graph.js'
+import { type ProcessorContext, ProcessorGraph, type ProcessorSupplier } from './processor-graph.js'
 import type { StreamRecord } from './record.js'
 import { serdes as builtInSerdes, type Serde, type Serdes } from './serde.js'
-import { defaultStoreSupplier, type NamedStore, type StateStoreSupplier } from './state-store.js'
+import {
+  defaultStoreSupplier,
+  type KeyEncoding,
+  type NamedStore,
+  type StateStoreSupplier,
+} from './state-store.js'
 import { type Sync, type SyncKeyValue, synchronous } from './sync-dsl.js'
+import { taskInternals } from './task.js'
+import {
+  type TumblingWindows,
+  type Windowed,
+  windowedSerde,
+  windowKeyEncoding,
+  windowOf,
+} from './windows.js'
 import { startWorker, type Worker } from './worker.js'
 
 export interface StreamsAppConfig {
@@ -209,6 +222,52 @@ export interface GroupedStream<K, V> {
     reducer: (aggregate: V, value: V, key: K) => Sync<R>,
     options?: ReduceOptions<V>,
   ): Table<K, V>
+  /**
+   * Aggregates the records of each key per window instead of over all time: each record goes into
+   * the window its Event Time falls into. Pass windows made with `tumbling`.
+   */
+  window(windows: TumblingWindows): WindowedStream<K, V>
+  /** Type-only: the key and value types of the grouped records. */
+  readonly [recordTypes]?: { key: K; value: V }
+}
+
+/**
+ * A grouped Stream split into time windows, ready to be aggregated per key and window into a
+ * Table keyed by {@link Windowed} keys. Aggregations skip null keys and tombstones as on a
+ * `GroupedStream`.
+ *
+ * Windows are driven by Stream Time: a window closes once Stream Time reaches its end plus the
+ * Grace Period. A record for a closed window is dropped and counted as late (the Test Driver's
+ * `metrics().lateRecordsDropped`). Each update of the Table is forwarded with the window end as
+ * its timestamp. In the Table's Stream, windowed keys are written as the key Serde's bytes followed
+ * by the window start as an 8-byte big-endian integer.
+ */
+export interface WindowedStream<K, V> {
+  /** Counts the records of each key per window. */
+  count(options?: CountOptions): Table<Windowed<K>, number>
+  /**
+   * Folds the records of each key and window into a Table, starting each window from
+   * `initializer`. Returning null deletes the window's entry and forwards a tombstone.
+   * `options.serde` stores the aggregates.
+   */
+  aggregate<
+    VA,
+    RI extends VA | PromiseLike<unknown> = VA,
+    RA extends VA | null | PromiseLike<unknown> = VA | null,
+  >(
+    initializer: () => Sync<RI>,
+    aggregator: (key: K, value: V, aggregate: VA) => Sync<RA>,
+    options: AggregateOptions<VA>,
+  ): Table<Windowed<K>, VA>
+  /**
+   * Combines the values of each key and window: the first value of a window is stored as is, and
+   * each later one is combined with it by `reducer`. Returning null deletes the window's entry and
+   * forwards a tombstone. Stores with `options.serde`, else the value Serde of the grouped Stream.
+   */
+  reduce<R extends V | null | PromiseLike<unknown> = V | null>(
+    reducer: (aggregate: V, value: V, key: K) => Sync<R>,
+    options?: ReduceOptions<V>,
+  ): Table<Windowed<K>, V>
   /** Type-only: the key and value types of the grouped records. */
   readonly [recordTypes]?: { key: K; value: V }
 }
@@ -415,6 +474,7 @@ function addStore(
   name: string,
   serdes: Serdes<unknown, unknown>,
   supplier: StateStoreSupplier = defaultStoreSupplier,
+  keyEncoding?: KeyEncoding<unknown>,
 ): void {
   if (typeof name !== 'string' || !NAME.test(name)) {
     throw new Error(
@@ -426,6 +486,7 @@ function addStore(
     serdes,
     supplier,
     changelogTopic: `${graph.applicationId}-${name}-changelog`,
+    ...(keyEncoding === undefined ? {} : { keyEncoding }),
   })
 }
 
@@ -537,22 +598,73 @@ class StreamNode<K, V> implements Stream<K, V> {
   }
 }
 
-class GroupedStreamNode<K, V> implements GroupedStream<K, V> {
-  readonly #graph: ProcessorGraph
-  readonly #node: string
-  readonly #serdes: { key: Serde<K>; value: Serde<V> | undefined }
+/**
+ * How an aggregation keys its Table: by the grouped key, or by the grouped key and a window.
+ * `KT` is the Table's key type.
+ */
+interface Keying<K, KT> {
+  /** The Serde of the Table's keys, for its State Store and its Stream. */
+  serde: Serde<KT>
+  /** How the State Store encodes the Table's keys. Undefined for the default single part. */
+  encoding: KeyEncoding<KT> | undefined
+  /**
+   * Called once per Task: returns the Table key a record updates and the timestamp to forward the
+   * update with, or undefined to drop the record.
+   */
+  forTask(
+    ctx: ProcessorContext<unknown, unknown>,
+  ): (key: K, timestamp: number) => { key: KT; timestamp: number } | undefined
+}
+
+/** Keys the Table by the grouped key; updates keep the record's Event Time. */
+function byKey<K>(serde: Serde<K>): Keying<K, K> {
+  return { serde, encoding: undefined, forTask: () => (key, timestamp) => ({ key, timestamp }) }
+}
+
+/**
+ * Keys the Table by the grouped key and the window of the record. Updates are timestamped with
+ * the window end; records for windows that Stream Time has closed are dropped and counted as late.
+ */
+function byWindow<K>(serde: Serde<K>, windows: TumblingWindows): Keying<K, Windowed<K>> {
+  return {
+    serde: windowedSerde(serde, windows),
+    encoding: windowKeyEncoding(serde, windows),
+    forTask(ctx) {
+      const task = taskInternals(ctx)
+      return (key, timestamp) => {
+        const window = windowOf(windows, timestamp)
+        // The Task advances Stream Time before processing a record, so it is known here.
+        const streamTime = task.streamTime() ?? timestamp
+        if (window.end + windows.graceMs <= streamTime) {
+          task.recordLateDropped()
+          return undefined
+        }
+        return { key: { key, window }, timestamp: window.end }
+      }
+    },
+  }
+}
+
+/** The aggregations of a grouped Stream, into a Table keyed as its {@link Keying} says. */
+class AggregationNode<K, V, KT> {
+  protected readonly graph: ProcessorGraph
+  protected readonly node: string
+  protected readonly serdes: { key: Serde<K>; value: Serde<V> | undefined }
+  readonly #keying: Keying<K, KT>
 
   constructor(
     graph: ProcessorGraph,
     node: string,
     serdes: { key: Serde<K>; value: Serde<V> | undefined },
+    keying: Keying<K, KT>,
   ) {
-    this.#graph = graph
-    this.#node = node
-    this.#serdes = serdes
+    this.graph = graph
+    this.node = node
+    this.serdes = serdes
+    this.#keying = keying
   }
 
-  count(options: CountOptions = {}): Table<K, number> {
+  count(options: CountOptions = {}): Table<KT, number> {
     return this.#aggregation('count', builtInSerdes.number, options, (_key, _value, count) => {
       return (count ?? 0) + 1
     })
@@ -562,7 +674,7 @@ class GroupedStreamNode<K, V> implements GroupedStream<K, V> {
     initializer: () => unknown,
     aggregator: (key: K, value: V, aggregate: VA) => unknown,
     options: AggregateOptions<VA>,
-  ): Table<K, VA> {
+  ): Table<KT, VA> {
     // Once Promises are ruled out (at runtime by `synchronous`), these return aggregates.
     const initial = synchronous('aggregate', initializer) as () => VA
     const next = synchronous('aggregate', aggregator) as (key: K, value: V, aggregate: VA) => VA
@@ -574,9 +686,9 @@ class GroupedStreamNode<K, V> implements GroupedStream<K, V> {
   reduce(
     reducer: (aggregate: V, value: V, key: K) => unknown,
     options: ReduceOptions<V> = {},
-  ): Table<K, V> {
+  ): Table<KT, V> {
     const combine = synchronous('reduce', reducer) as (aggregate: V, value: V, key: K) => V
-    const serde = options.serde ?? this.#serdes.value
+    const serde = options.serde ?? this.serdes.value
     if (serde === undefined) {
       throw new Error(
         'No value Serde for reduce: pass one to .reduce(reducer, { serde }) or to .groupByKey({ value })',
@@ -588,7 +700,7 @@ class GroupedStreamNode<K, V> implements GroupedStream<K, V> {
   }
 
   /**
-   * Adds a State Store and a Processor that keeps, per key, the result of `update` on the key's
+   * Adds a State Store and a Processor that keeps, per Table key, the result of `update` on the
    * current value (undefined if none). A null result deletes the key and forwards a tombstone.
    */
   #aggregation<VA>(
@@ -596,25 +708,50 @@ class GroupedStreamNode<K, V> implements GroupedStream<K, V> {
     serde: Serde<VA>,
     options: CountOptions,
     update: (key: K, value: V, aggregate: VA | undefined) => VA | null,
-  ): Table<K, VA> {
-    const store = options.store ?? this.#graph.storeName(operator)
-    const serdes = { key: this.#serdes.key, value: serde }
-    addStore(this.#graph, store, serdes, options.storeSupplier)
+  ): Table<KT, VA> {
+    const store = options.store ?? this.graph.storeName(operator)
+    const keying = this.#keying
+    const serdes = { key: keying.serde, value: serde }
+    addStore(
+      this.graph,
+      store,
+      serdes,
+      options.storeSupplier,
+      keying.encoding as KeyEncoding<unknown> | undefined,
+    )
     // Like Kafka Streams, aggregations skip records without a key or with a tombstone value.
-    const supplier: ProcessorSupplier<K | null, V | null, K, VA | null> = (ctx) => {
-      const aggregates = ctx.store<K, VA>(store)
+    const supplier: ProcessorSupplier<K | null, V | null, KT, VA | null> = (ctx) => {
+      const aggregates = ctx.store<KT, VA>(store)
+      const place = keying.forTask(ctx as ProcessorContext<unknown, unknown>)
       return {
         process({ key, value, timestamp }) {
           if (key === null || value === null) return
-          const aggregate = update(key, value, aggregates.get(key))
-          if (aggregate === null) aggregates.delete(key)
-          else aggregates.put(key, aggregate)
-          ctx.forward({ key, value: aggregate, timestamp })
+          const target = place(key, timestamp)
+          if (target === undefined) return
+          const aggregate = update(key, value, aggregates.get(target.key))
+          if (aggregate === null) aggregates.delete(target.key)
+          else aggregates.put(target.key, aggregate)
+          ctx.forward({ key: target.key, value: aggregate, timestamp: target.timestamp })
         },
       }
     }
-    const node = this.#graph.addProcessor(supplier, [this.#node])
-    return new TableNode(this.#graph, node, store, serdes)
+    const node = this.graph.addProcessor(supplier, [this.node])
+    return new TableNode(this.graph, node, store, serdes)
+  }
+}
+
+class GroupedStreamNode<K, V> extends AggregationNode<K, V, K> implements GroupedStream<K, V> {
+  constructor(
+    graph: ProcessorGraph,
+    node: string,
+    serdes: { key: Serde<K>; value: Serde<V> | undefined },
+  ) {
+    super(graph, node, serdes, byKey(serdes.key))
+  }
+
+  window(windows: TumblingWindows): WindowedStream<K, V> {
+    const keying = byWindow(this.serdes.key, windows)
+    return new AggregationNode(this.graph, this.node, this.serdes, keying)
   }
 }
 

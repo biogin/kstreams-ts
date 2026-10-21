@@ -1,0 +1,253 @@
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, expectTypeOf, it } from 'vitest'
+import {
+  createStreamsApp,
+  createTestDriver,
+  type Duration,
+  type Serde,
+  serdes,
+  type Table,
+  tumbling,
+  type Windowed,
+} from '../src/index.js'
+
+const strings = { key: serdes.string, value: serdes.string }
+
+const json = <T>(): Serde<T> => ({
+  serialize: (value, ctx) => serdes.string.serialize(JSON.stringify(value), ctx),
+  deserialize: (bytes, ctx) => JSON.parse(serdes.string.deserialize(bytes, ctx)) as T,
+})
+
+const MINUTE = 60_000
+
+/** The window of `key` that starts at `start`, for tumbling windows of one minute. */
+const inMinute = <K>(key: K, start: number): Windowed<K> => ({
+  key,
+  window: { start, end: start + MINUTE },
+})
+
+/** A Streams App counting clicks per user per minute, writing the counts to `counts`. */
+function clickCounts(applicationId: string, grace?: Duration) {
+  const app = createStreamsApp({ applicationId })
+  app
+    .stream('clicks', strings)
+    .groupByKey()
+    .window(tumbling('1m', grace === undefined ? undefined : { grace }))
+    .count({ store: 'counts' })
+    .toStream()
+    .to('counts')
+  return app
+}
+
+describe('tumbling windows', () => {
+  it('counts the records of each key per window, in a store ordered by window start', async () => {
+    const driver = createTestDriver(clickCounts('window-count'))
+    const clicks = driver.input<string, string>('clicks')
+    await clicks.pipe('alice', 'home', { timestamp: 1_000 })
+    await clicks.pipe('bob', 'home', { timestamp: 2_000 })
+    await clicks.pipe('alice', 'cart', { timestamp: 59_999 })
+    await clicks.pipe('alice', 'pay', { timestamp: MINUTE })
+
+    const counts = driver.store<Windowed<string>, number>('counts')
+    expect(counts.all()).toEqual([
+      [inMinute('alice', 0), 2],
+      [inMinute('bob', 0), 1],
+      [inMinute('alice', MINUTE), 1],
+    ])
+    expect(counts.get(inMinute('alice', 0))).toBe(2)
+    expect(counts.range(inMinute('', MINUTE), inMinute('\u{10FFFF}', MINUTE))).toEqual([
+      [inMinute('alice', MINUTE), 1],
+    ])
+  })
+
+  it('forwards each update with the window end as its timestamp and a windowed key', async () => {
+    const driver = createTestDriver(clickCounts('window-output'))
+    const clicks = driver.input<string, string>('clicks')
+    await clicks.pipe('alice', 'home', { timestamp: 1_000 })
+    await clicks.pipe('alice', 'cart', { timestamp: 30_000 })
+    await clicks.pipe('alice', 'pay', { timestamp: 61_000 })
+
+    expect(driver.output<Windowed<string>, number>('counts').readAll()).toEqual([
+      { key: inMinute('alice', 0), value: 1, timestamp: MINUTE },
+      { key: inMinute('alice', 0), value: 2, timestamp: MINUTE },
+      { key: inMinute('alice', MINUTE), value: 1, timestamp: 2 * MINUTE },
+    ])
+  })
+
+  it('writes windowed keys as the key Serde bytes followed by the 8-byte window start', async () => {
+    const driver = createTestDriver(clickCounts('window-key-bytes'))
+    await driver.input<string, string>('clicks').pipe('ab', 'home', { timestamp: MINUTE + 5 })
+
+    const [record] = driver.output('counts', { key: serdes.bytes }).readAll()
+    const expected = new Uint8Array(10)
+    expected.set([0x61, 0x62])
+    new DataView(expected.buffer).setBigInt64(2, BigInt(MINUTE))
+    expect(record?.key).toEqual(expected)
+  })
+
+  it('includes records that arrive late but within the Grace Period', async () => {
+    const driver = createTestDriver(clickCounts('window-grace', '10s'))
+    const clicks = driver.input<string, string>('clicks')
+    await clicks.pipe('alice', 'home', { timestamp: 50_000 })
+    await clicks.pipe('alice', 'cart', { timestamp: 69_999 }) // Stream Time 69_999
+    await clicks.pipe('alice', 'late', { timestamp: 55_000 }) // window [0, 60s) still open
+
+    expect(driver.store('counts').all()).toEqual([
+      [inMinute('alice', 0), 2],
+      [inMinute('alice', MINUTE), 1],
+    ])
+    expect(driver.metrics().lateRecordsDropped).toBe(0)
+  })
+
+  it('drops and counts records later than the Grace Period', async () => {
+    const driver = createTestDriver(clickCounts('window-late', '10s'))
+    const clicks = driver.input<string, string>('clicks')
+    await clicks.pipe('alice', 'home', { timestamp: 50_000 })
+    await clicks.pipe('alice', 'cart', { timestamp: 70_000 }) // Stream Time 70s: [0, 60s) closes
+    await clicks.pipe('alice', 'late', { timestamp: 59_999 })
+    await clicks.pipe('bob', 'late', { timestamp: 1_000 })
+    // An out-of-order record doesn't move Stream Time back, so the window stays closed.
+    await clicks.pipe('alice', 'late again', { timestamp: 30_000 })
+
+    expect(driver.store('counts').all()).toEqual([
+      [inMinute('alice', 0), 1],
+      [inMinute('alice', MINUTE), 1],
+    ])
+    expect(driver.output('counts').readAll()).toHaveLength(2)
+    expect(driver.metrics().lateRecordsDropped).toBe(3)
+  })
+
+  it('has no Grace Period by default: a window closes once Stream Time reaches its end', async () => {
+    const driver = createTestDriver(clickCounts('window-no-grace'))
+    const clicks = driver.input<string, string>('clicks')
+    await clicks.pipe('alice', 'home', { timestamp: 59_000 })
+    await clicks.pipe('alice', 'next', { timestamp: MINUTE })
+    await clicks.pipe('alice', 'late', { timestamp: 59_999 })
+
+    expect(driver.store('counts').all()).toEqual([
+      [inMinute('alice', 0), 1],
+      [inMinute('alice', MINUTE), 1],
+    ])
+    expect(driver.metrics().lateRecordsDropped).toBe(1)
+  })
+
+  it('skips records with a null key or a null value, without counting them as late', async () => {
+    const driver = createTestDriver(clickCounts('window-nulls'))
+    const clicks = driver.input<string, string>('clicks')
+    await clicks.pipe('alice', 'home', { timestamp: MINUTE })
+    await clicks.pipe(null, 'home', { timestamp: 0 })
+    await clicks.pipe('alice', null, { timestamp: 0 })
+
+    expect(driver.store('counts').all()).toEqual([[inMinute('alice', MINUTE), 1]])
+    expect(driver.metrics().lateRecordsDropped).toBe(0)
+  })
+
+  it('aggregates and reduces per window', async () => {
+    const app = createStreamsApp({ applicationId: 'window-aggregate' })
+    const grouped = app
+      .stream('amounts', { key: serdes.string, value: serdes.number })
+      .groupByKey()
+      .window(tumbling('1h'))
+    const totals = grouped.aggregate(
+      () => ({ n: 0, sum: 0 }),
+      (_k, v, a) => ({ n: a.n + 1, sum: a.sum + v }),
+      {
+        store: 'totals',
+        serde: json<{ n: number; sum: number }>(),
+      },
+    )
+    const maxima = grouped.reduce((a, b) => Math.max(a, b), { store: 'maxima' })
+    expectTypeOf(totals).toEqualTypeOf<Table<Windowed<string>, { n: number; sum: number }>>()
+    expectTypeOf(maxima).toEqualTypeOf<Table<Windowed<string>, number>>()
+
+    const driver = createTestDriver(app)
+    const amounts = driver.input<string, number>('amounts')
+    await amounts.pipe('alice', 3, { timestamp: 0 })
+    await amounts.pipe('alice', 5, { timestamp: 10 * MINUTE })
+    await amounts.pipe('alice', 1, { timestamp: 61 * MINUTE })
+
+    const hour = 60 * MINUTE
+    expect(driver.store('totals').all()).toEqual([
+      [
+        { key: 'alice', window: { start: 0, end: hour } },
+        { n: 2, sum: 8 },
+      ],
+      [
+        { key: 'alice', window: { start: hour, end: 2 * hour } },
+        { n: 1, sum: 1 },
+      ],
+    ])
+    expect(driver.store('maxima').all()).toEqual([
+      [{ key: 'alice', window: { start: 0, end: hour } }, 5],
+      [{ key: 'alice', window: { start: hour, end: 2 * hour } }, 1],
+    ])
+  })
+
+  it('types the windowed Table by the grouped key', () => {
+    const app = createStreamsApp({ applicationId: 'window-types' })
+    const table = app.stream('clicks', strings).groupByKey().window(tumbling(MINUTE)).count()
+    expectTypeOf(table).toEqualTypeOf<Table<Windowed<string>, number>>()
+  })
+})
+
+describe('tumbling()', () => {
+  it('takes sizes and Grace Periods in milliseconds or as durations like "1m"', () => {
+    expect(tumbling('1m', { grace: '10s' })).toEqual({ sizeMs: MINUTE, graceMs: 10_000 })
+    expect(tumbling(500)).toEqual({ sizeMs: 500, graceMs: 0 })
+    expect(tumbling('250ms', { grace: 0 })).toEqual({ sizeMs: 250, graceMs: 0 })
+    expect(tumbling('2h')).toEqual({ sizeMs: 2 * 60 * MINUTE, graceMs: 0 })
+    expect(tumbling('1d')).toEqual({ sizeMs: 24 * 60 * MINUTE, graceMs: 0 })
+  })
+
+  it('rejects sizes that are not positive and Grace Periods that are negative', () => {
+    expect(() => tumbling(0)).toThrow(/window size/i)
+    expect(() => tumbling(-1)).toThrow(/window size/i)
+    expect(() => tumbling(1.5)).toThrow(/window size/i)
+    expect(() => tumbling('1m', { grace: -1 })).toThrow(/grace period/i)
+    // @ts-expect-error not a duration
+    expect(() => tumbling('one minute')).toThrow(/duration/i)
+  })
+})
+
+describe('tumbling windows in SQLite', () => {
+  const tempDirs: string[] = []
+  afterEach(() => {
+    for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('keeps windowed counts, aggregates and reductions in SQLite stores', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'kstreams-windows-'))
+    tempDirs.push(stateDir)
+    const app = createStreamsApp({ applicationId: 'window-sqlite' })
+    const grouped = app.stream('clicks', strings).groupByKey().window(tumbling('1m'))
+    grouped.count({ store: 'counts' })
+    grouped.aggregate(
+      () => '',
+      (_k, v, a) => a + v,
+      { store: 'joined', serde: serdes.string },
+    )
+    grouped.reduce((a, b) => (a > b ? a : b), { store: 'last' })
+
+    const driver = createTestDriver(app, { stateDir })
+    const clicks = driver.input<string, string>('clicks')
+    await clicks.pipe('bob', 'a', { timestamp: 0 })
+    await clicks.pipe('alice', 'b', { timestamp: 1 })
+    await clicks.pipe('alice', 'c', { timestamp: MINUTE })
+    await clicks.pipe('alice', 'd', { timestamp: 2 })
+
+    expect(driver.store('counts').all()).toEqual([
+      [inMinute('alice', 0), 1],
+      [inMinute('bob', 0), 1],
+      [inMinute('alice', MINUTE), 1],
+    ])
+    expect(driver.store('joined').all()).toEqual([
+      [inMinute('alice', 0), 'b'],
+      [inMinute('bob', 0), 'a'],
+      [inMinute('alice', MINUTE), 'c'],
+    ])
+    expect(driver.store('last').get(inMinute('alice', MINUTE))).toBe('c')
+    expect(driver.metrics().lateRecordsDropped).toBe(3)
+  })
+})

@@ -2,7 +2,7 @@
 // the typed key-value view Processors and the Test Driver use on top of it.
 
 import { join } from 'node:path'
-import type { SerdeContext, Serdes } from './serde.js'
+import type { Serde, SerdeContext, Serdes } from './serde.js'
 import { openSqliteStore } from './sqlite-store.js'
 import { keyOf, storeKey } from './store-key.js'
 
@@ -128,16 +128,34 @@ export interface NamedStore<K, V> {
   readonly [storeTypes]?: { key: K; value: V }
 }
 
-/** Internal: wraps a byte-level store with the store's Serdes. */
+/** Internal: how the typed view of a State Store turns its keys into store keys and back. */
+export interface KeyEncoding<K> {
+  encode(key: K, context: SerdeContext): Uint8Array
+  decode(bytes: Uint8Array, context: SerdeContext): K
+}
+
+/** Internal: the store key encoding of a key-value store, a single part (ADR-0015). */
+export function singleKeyEncoding<K>(serde: Serde<K>): KeyEncoding<K> {
+  return {
+    encode: (key, context) => storeKey(key, serde, context),
+    decode: (bytes, context) => keyOf(bytes, serde, context),
+  }
+}
+
+/**
+ * Internal: wraps a byte-level store with the store's Serdes. Keys are encoded with `encoding`,
+ * by default as a single part encoded with the key Serde as fallback.
+ */
 export function keyValueStore<K, V>(
   store: StateStore,
   serdes: Serdes<K, V>,
   context: SerdeContext,
+  encoding: KeyEncoding<K> = singleKeyEncoding(serdes.key),
 ): KeyValueStore<K, V> {
-  const key = (k: K) => storeKey(k, serdes.key, context)
+  const key = (k: K) => encoding.encode(k, context)
   const value = (bytes: Uint8Array) => serdes.value.deserialize(bytes, context)
   const entries = (found: Iterable<[Uint8Array, Uint8Array]>): [K, V][] =>
-    Array.from(found, ([k, v]) => [keyOf(k, serdes.key, context), value(v)])
+    Array.from(found, ([k, v]) => [encoding.decode(k, context), value(v)])
   return {
     get(k) {
       const bytes = store.get(key(k))
@@ -154,8 +172,8 @@ export function keyValueStore<K, V>(
       return entries(store.all())
     },
     range(from, to) {
-      // A store key is a single self-delimiting part, so `to` followed by a 0 byte is the first
-      // byte string after it: the exclusive end that includes `to`.
+      // Store keys are made of self-delimiting parts whose tags are never 0, so `to` followed by
+      // a 0 byte is the first byte string after it: the exclusive end that includes `to`.
       const end = key(to)
       const after = new Uint8Array(end.length + 1)
       after.set(end)

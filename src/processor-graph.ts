@@ -3,7 +3,7 @@
 
 import type { StreamRecord } from './record.js'
 import type { Serdes } from './serde.js'
-import type { KeyValueStore, NamedStore, StateStoreSupplier } from './state-store.js'
+import type { KeyEncoding, KeyValueStore, NamedStore, StateStoreSupplier } from './state-store.js'
 
 /**
  * Per-record logic. Receives records from its parents and sends results on with
@@ -103,6 +103,9 @@ export interface StoreNode {
   supplier: StateStoreSupplier
   /** The topic the store's Serdes are told about: its Changelog. */
   changelogTopic: string
+  /** How its keys are encoded as store keys. Defaults to a single part (ADR-0015). */
+  // biome-ignore lint/suspicious/noExplicitAny: type erasure at the graph boundary
+  keyEncoding?: KeyEncoding<any>
 }
 
 /** A directed graph of source, Processor and sink nodes. Built by the DSL, run by a Task. */

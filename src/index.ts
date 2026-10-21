@@ -35,14 +35,24 @@ export {
   type StreamsApp,
   type StreamsAppConfig,
   type Table,
+  type WindowedStream,
 } from './streams-app.js'
 export { AsyncNotAllowedError } from './sync-dsl.js'
 export {
   createTestDriver,
   type PipeOptions,
   type TestDriver,
+  type TestDriverMetrics,
   type TestDriverOptions,
   type TestInputTopic,
   type TestOutputTopic,
   type TestStore,
 } from './test-driver.js'
+export {
+  type Duration,
+  type TumblingOptions,
+  type TumblingWindows,
+  tumbling,
+  type Window,
+  type Windowed,
+} from './windows.js'
