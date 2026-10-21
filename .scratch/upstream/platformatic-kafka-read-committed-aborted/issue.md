@@ -4,7 +4,7 @@
 
 With `isolationLevel: READ_COMMITTED`, records of an **aborted** transaction are delivered to the application when the transaction's abort marker is not in the same fetch response as its records. This affects both `consumer.consume()` and the low-level `consumer.fetch()`, since both go through `#filterUncommittedMessages`.
 
-This happens when an aborted transaction's records and its abort marker end up in different fetch responses: for example when the transaction is larger than one response (`maxBytes` / `maxBytesPerPartition`), or when the broker rolls a segment between the records and the marker. The Java consumer returns only the committed records for the same topic.
+This happens when an aborted transaction's records and its abort marker end up in different fetch responses, for example when the transaction is larger than one response (`maxBytes` / `maxBytesPerPartition`). The Java consumer returns only the committed records for the same topic.
 
 Related but different: #391 / #393 fixed a crash when a response contains an abort marker with no matching `abortedTransactions` entry. This issue is the opposite case: the response has the `abortedTransactions` entry but not the marker.
 
@@ -94,26 +94,31 @@ The filter looks at each fetch response on its own. An aborted range is closed o
 > For last offsets we set -1n as special value. It allows us to detect open ranges, whichs means
 > that Kafka has not sent the control marker. In that case we ignore the range for safety.
 
-For READ_COMMITTED, though, ignoring the range means *delivering* records that the broker has already reported as part of an aborted transaction, which is the unsafe direction. Nothing carries over to the next response. When the marker arrives later, the records it should have hidden have already been delivered.
+For READ_COMMITTED, though, ignoring the range means *delivering* records that the broker has already reported as part of an aborted transaction, which is the unsafe direction. By the time the marker arrives in a later response, those records have already been delivered.
 
 In the repro, the first response holds only offset 0. Its `abortedTransactions` is `[{ producerId, firstOffset: 0 }]`, but the marker at offset 3 is not in it, so `aborted-1` is delivered. The same happens to offsets 1 and 2.
 
-The broker's `abortedTransactions` list only says that a transaction from `producerId` that overlaps the fetched range was aborted, and where it starts. It is up to the client to skip that producer's transactional batches until it reads the matching abort marker, even when the marker comes in a later response. The Java client does this in `CompletedFetch` (`abortedProducerIds` / `abortedTransactions` priority queue, `isBatchAborted`, `consumeAbortedTransactionsUpTo`). A transaction whose `firstOffset` is at or below the current batch is treated as aborted. Its producer ID stays in the aborted set until that producer's abort marker is read, and once the marker is read the following batches are delivered.
+An open range doesn't need to be ignored. In every response, the broker lists each aborted transaction that overlaps the fetched range, including transactions whose `firstOffset` is below the fetch offset (in the repro, the second response, at fetch offset 1, lists `{ producerId, firstOffset: 0 }` again). An entry without its marker in the same response therefore still means "this producer's transactional batches from `firstOffset` on are aborted". The Java client relies on exactly this and keeps no state across responses: [`CompletedFetch`](https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/clients/consumer/internals/CompletedFetch.java) builds `abortedTransactions` (a priority queue by `firstOffset`) and `abortedProducerIds` from each response. Before each batch, `consumeAbortedTransactionsUpTo(batch.lastOffset())` adds the producer IDs of entries with `firstOffset <= lastOffset`; an abort marker removes its producer ID; and `isBatchAborted` drops a batch when it `isTransactional()` and its producer ID is in the set.
+
+Two smaller problems in the same function, which the approach below also fixes:
+
+- `abortedRanges` is keyed by `producerId`, so two aborted transactions from the same producer in one response overwrite each other, and the second marker closes the wrong range.
+- There is no transactional-flag check, so a non-transactional batch from a producer ID that also has an aborted transaction would be dropped.
 
 ## Impact
 
-READ_COMMITTED does not guarantee that aborted data stays hidden. Any consumer that reads transactional topics can get records that were never committed: exactly-once pipelines, state restored from changelog topics, and so on. It depends only on how fetch responses happen to be split (batch sizes, `maxBytes`, segment boundaries), so it shows up rarely and can corrupt data downstream without any error.
+READ_COMMITTED does not guarantee that aborted data stays hidden. Any consumer that reads transactional topics can get records that were never committed: exactly-once pipelines, state restored from changelog topics, and so on. It depends only on how fetch responses happen to be split (transaction size, `maxBytes`), so it shows up rarely and can corrupt data downstream without any error.
 
 ## Suggested fix
 
-Keep per-partition state across fetch responses, the way the Java client does:
+Do what the Java client does, per response, with no state kept between responses:
 
-1. For each assigned partition, keep the set of producer IDs whose aborted transaction has started but whose abort marker has not been read yet.
-2. For each response, walk the batches in offset order. Before each batch, add the producer IDs of `abortedTransactions` entries with `firstOffset <= batch.lastOffset`. Entries with a `firstOffset` below the fetch offset belong to a transaction that is already in progress, so add them as well.
-3. Drop a transactional data batch if its `producerId` is in the set. An abort marker removes its `producerId` from the set. Control batches are still passed through, so offset tracking keeps working as it does now.
-4. Clear the partition's state when the fetch position is reset (seek, rebalance, offset out of range).
+1. Sort the response's `abortedTransactions` by `firstOffset`, and start with an empty set of aborted producer IDs.
+2. Walk the batches in offset order, before anything is filtered out. Before each batch, move every entry with `firstOffset <= batch.lastOffset` into the set.
+3. An abort marker (control batch) removes its `producerId` from the set. Control batches stay in the output, since offset tracking relies on them.
+4. Drop a data batch only if it is transactional (attributes bit `0x10`) and its `producerId` is in the set.
 
-This also makes the open-range special case and the #391 guard unnecessary. I'm building a stream-processing library on top of `@platformatic/kafka` and already use a filter built this way around `consumer.fetch()`. It passes the scenario above (an aborted transaction spread over several 1 KB fetches, with committed and non-transactional records around it). I'm happy to open a PR based on it, with a test.
+Since nothing is kept between responses, there is nothing to reset on seek, rebalance or offset reset. This also replaces the open-range special case and the #391 guard. I'm building a stream-processing library on top of `@platformatic/kafka` and currently work around this with my own filter around `consumer.fetch()`. I'm happy to open a PR with this fix and a test based on the repro.
 
 <details>
 <summary><code>repro.mjs</code> and <code>package.json</code></summary>

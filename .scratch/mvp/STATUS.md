@@ -16,7 +16,7 @@ Integration branch: `mvp`. Plan for this run: stop at milestone M3, then code re
 
 - **Flaky integration tests** under broker load: `at-least-once-crash.test.ts` (once read 0 records), `passthrough.test.ts` "leaves the group on stop and resumes from the committed offsets on restart" (timeout), plus unnamed one-off timeouts. Make waits condition-based and robust.
 - **Input consumer and platformatic/kafka#467:** `consume()` with read_committed can deliver aborted records. Apply an aborted-transaction filter to the main input path, as Restore does.
-- **`src/restore.ts` filter** carries state across fetch responses. Java's `CompletedFetch` is stateless per response (see `.scratch/upstream/.../correction-comment.md`); re-check and simplify to match.
+- **`src/restore.ts` filter** carries state across fetch responses. Java's `CompletedFetch` is stateless per response (see the Root cause and Suggested fix sections of `.scratch/upstream/platformatic-kafka-read-committed-aborted/issue.md`); re-check and simplify to match.
 - Ticket 29 later: transactional IDs are per Worker number, not per process (needs a stable instance identity).
 
 ## Not in this run (later session)
@@ -25,8 +25,7 @@ Integration branch: `mvp`. Plan for this run: stop at milestone M3, then code re
 
 ## Upstream
 
-- platformatic/kafka#467 filed by the user. A correction comment (Java's handling is stateless per response; extra defects) is drafted in `.scratch/upstream/platformatic-kafka-read-committed-aborted/correction-comment.md` and **not yet posted**:
-  `gh issue comment 467 --repo platformatic/kafka --body-file .scratch/upstream/platformatic-kafka-read-committed-aborted/correction-comment.md`
+- platformatic/kafka#467 filed by the user. Its body was corrected before anyone responded: Java's handling is stateless per response, the suggested fix follows that, and two extra defects are listed. The local copy is `.scratch/upstream/platformatic-kafka-read-committed-aborted/issue.md`.
 
 ## Resuming
 
