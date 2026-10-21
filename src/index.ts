@@ -3,6 +3,8 @@ export type {
   Processor,
   ProcessorContext,
   ProcessorSupplier,
+  Timer,
+  TimerCallback,
   TimerType,
 } from './processor-graph.js'
 export type { StreamRecord } from './record.js'

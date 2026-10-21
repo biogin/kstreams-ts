@@ -1,6 +1,13 @@
 // Internal: runs a Processor graph for one Task. Shared by the Test Driver and the Kafka runtime.
 
-import type { ProcessorContext, ProcessorGraph, SerializedRecord } from './processor-graph.js'
+import type {
+  ProcessorContext,
+  ProcessorGraph,
+  SerializedRecord,
+  Timer,
+  TimerCallback,
+  TimerType,
+} from './processor-graph.js'
 import type { StreamRecord } from './record.js'
 import {
   DeserializationError,
@@ -23,17 +30,108 @@ export interface Task {
    * record is fully processed, and rejects if processing failed (e.g. with a
    * {@link DeserializationError} if the topic's Serdes can't read it). A failed Task rejects every
    * later record with the same error (fail-fast).
+   *
+   * The record's Event Time advances the Task's Stream Time (which never moves back). Once the
+   * record is fully processed, the Stream Time timers that are due fire.
    */
   process(topic: string, record: SerializedRecord): Promise<void>
+  /**
+   * Fires the wall-clock timers that are due at the current wall-clock time. The runtime calls
+   * this from its loop; the Test Driver calls it when wall-clock time is advanced. It is queued
+   * behind the records already given to `process` and runs like one, with the same fail-fast
+   * behavior.
+   */
+  fireWallClockTimers(): Promise<void>
 }
 
-export function createTask(graph: ProcessorGraph, collect: RecordCollector): Task {
+/** A timer scheduled by a Processor. */
+interface ScheduledTimer {
+  type: TimerType
+  intervalMs: number
+  callback: TimerCallback
+  /** When it fires next. Unknown for a Stream Time timer until the Task has seen a record. */
+  due: number | undefined
+}
+
+/**
+ * @param wallClockTime the current wall-clock time in milliseconds since the epoch, read when a
+ * wall-clock timer is scheduled and when wall-clock timers are fired.
+ */
+export function createTask(
+  graph: ProcessorGraph,
+  collect: RecordCollector,
+  wallClockTime: () => number = Date.now,
+): Task {
   // Async Processor calls of the current record that have not settled yet.
   const inFlight = new Set<Promise<void>>()
   const track = (work: Promise<void>): void => {
     inFlight.add(work)
     const settled = () => inFlight.delete(work)
     work.then(settled, settled)
+  }
+
+  const settleInFlight = (): Promise<void> | undefined =>
+    inFlight.size === 0 ? undefined : drain()
+
+  /** The highest Event Time seen so far. Unknown until the first record. */
+  let streamTime: number | undefined
+  const timers: ScheduledTimer[] = []
+
+  const schedule = (intervalMs: number, type: TimerType, callback: TimerCallback): Timer => {
+    if (!(intervalMs > 0 && Number.isFinite(intervalMs))) {
+      throw new Error(`Timer interval must be a positive number of milliseconds, got ${intervalMs}`)
+    }
+    if (type !== 'stream-time' && type !== 'wall-clock-time') {
+      throw new Error(`Unknown timer type ${JSON.stringify(type)}`)
+    }
+    const now = type === 'stream-time' ? streamTime : wallClockTime()
+    const timer: ScheduledTimer = {
+      type,
+      intervalMs,
+      callback,
+      due: now === undefined ? undefined : now + intervalMs,
+    }
+    timers.push(timer)
+    return {
+      cancel() {
+        const index = timers.indexOf(timer)
+        if (index !== -1) timers.splice(index, 1)
+      },
+    }
+  }
+
+  const advanceStreamTime = (timestamp: number): void => {
+    if (streamTime === undefined) {
+      for (const timer of timers) {
+        if (timer.type === 'stream-time') timer.due ??= timestamp + timer.intervalMs
+      }
+    }
+    if (streamTime === undefined || timestamp > streamTime) streamTime = timestamp
+  }
+
+  /**
+   * Fires the timers of `type` that are due at `now`, earliest first, one after another (async
+   * callbacks and the work they forward included). Each fires once, however many intervals have
+   * passed. Returns a Promise only if async work is still going on.
+   */
+  const fireDue = (type: TimerType, now: number): Promise<void> | undefined => {
+    const due = timers
+      .filter((timer) => timer.type === type && timer.due !== undefined && timer.due <= now)
+      .sort((a, b) => (a.due ?? now) - (b.due ?? now))
+    const fireFrom = (first: number): Promise<void> | undefined => {
+      for (let i = first; i < due.length; i++) {
+        const timer = due[i] as ScheduledTimer
+        if (!timers.includes(timer)) continue // cancelled by a timer that fired before it
+        const missed = Math.floor((now - (timer.due ?? now)) / timer.intervalMs)
+        timer.due = (timer.due ?? now) + (missed + 1) * timer.intervalMs
+        const result = timer.callback(now)
+        if (isThenable(result)) track(Promise.resolve(result))
+        const work = settleInFlight()
+        if (work !== undefined) return work.then(() => fireFrom(i + 1))
+      }
+      return undefined
+    }
+    return fireFrom(0)
   }
 
   const deliverTo = new Map<string, Deliver>()
@@ -49,7 +147,7 @@ export function createTask(graph: ProcessorGraph, collect: RecordCollector): Tas
         deliverTo.set(node.name, forwardTo(node.children))
         break
       case 'processor': {
-        const processor = node.supplier(createContext(forwardTo(node.children)))
+        const processor = node.supplier(createContext(forwardTo(node.children), schedule))
         // While this Processor is busy with an async call, its next records queue behind it.
         let busy: Promise<void> | undefined
         const queue = (work: Promise<void>): void => {
@@ -91,12 +189,11 @@ export function createTask(graph: ProcessorGraph, collect: RecordCollector): Tas
         throw new DeserializationError(topic, part, record.timestamp, { cause })
       }
     }
-    deliverTo.get(source.name)?.({
-      key: read(source.serdes.key, 'key'),
-      value: read(source.serdes.value, 'value'),
-      timestamp: record.timestamp,
-    })
-    return inFlight.size === 0 ? undefined : drain()
+    const key = read(source.serdes.key, 'key')
+    const value = read(source.serdes.value, 'value')
+    advanceStreamTime(record.timestamp)
+    deliverTo.get(source.name)?.({ key, value, timestamp: record.timestamp })
+    return andThen(settleInFlight(), () => fireDue('stream-time', streamTime ?? record.timestamp))
   }
 
   const drain = async (): Promise<void> => {
@@ -123,32 +220,49 @@ export function createTask(graph: ProcessorGraph, collect: RecordCollector): Tas
     return done
   }
 
+  /** Runs `job` once everything queued before it is done, so records and timers never overlap. */
+  const enqueue = (job: () => Promise<void> | undefined): Promise<void> => {
+    if (failure !== undefined) return Promise.reject(failure.error)
+    if (pending !== undefined) return settle(pending.then(job))
+    let work: Promise<void> | undefined
+    try {
+      work = job()
+    } catch (error) {
+      failure = { error }
+      return Promise.reject(error)
+    }
+    return work === undefined ? Promise.resolve() : settle(work)
+  }
+
   return {
     process(topic, record) {
-      if (failure !== undefined) return Promise.reject(failure.error)
-      if (pending !== undefined) return settle(pending.then(() => run(topic, record)))
-      let work: Promise<void> | undefined
-      try {
-        work = run(topic, record)
-      } catch (error) {
-        failure = { error }
-        return Promise.reject(error)
-      }
-      return work === undefined ? Promise.resolve() : settle(work)
+      return enqueue(() => run(topic, record))
+    },
+    fireWallClockTimers() {
+      return enqueue(() => fireDue('wall-clock-time', wallClockTime()))
     },
   }
 }
 
-function createContext(forward: Deliver): ProcessorContext<unknown, unknown> {
+function createContext(
+  forward: Deliver,
+  schedule: ProcessorContext<unknown, unknown>['schedule'],
+): ProcessorContext<unknown, unknown> {
   return {
     forward,
     store() {
       throw new Error('ctx.store is not implemented yet')
     },
-    schedule() {
-      throw new Error('ctx.schedule is not implemented yet')
-    },
+    schedule,
   }
+}
+
+/** Runs `next` after `work`, staying synchronous when there is no `work`. */
+function andThen(
+  work: Promise<void> | undefined,
+  next: () => Promise<void> | undefined,
+): Promise<void> | undefined {
+  return work === undefined ? next() : work.then(next)
 }
 
 function isThenable(value: unknown): value is PromiseLike<unknown> {

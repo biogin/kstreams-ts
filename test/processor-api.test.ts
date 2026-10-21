@@ -241,17 +241,11 @@ describe('async Processors', () => {
 })
 
 describe('ProcessorContext features that arrive later', () => {
-  it.each([
-    ['store', (ctx: ProcessorContext<string, string>) => ctx.store('counts')],
-    [
-      'schedule',
-      (ctx: ProcessorContext<string, string>) => ctx.schedule(1000, 'stream-time', () => {}),
-    ],
-  ])('ctx.%s throws "not implemented"', async (_name, use) => {
+  it('ctx.store throws "not implemented"', async () => {
     const app = createStreamsApp({ applicationId: 'later' })
     const processor = app.processor('later', (ctx: ProcessorContext<string, string>) => ({
       process() {
-        use(ctx)
+        ctx.store('counts')
       },
     }))
     app.stream('input', strings).process(processor)
