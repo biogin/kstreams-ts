@@ -6,3 +6,4 @@ SQLite State Store files live in a state directory and survive restarts. Each on
 
 - v1 relies on cooperative-sticky assignment to keep Tasks where their local state is. A custom assignor that sends Tasks to Workers that already have their state (using per-member join metadata) is planned for v1.x.
 - On disposable disks (e.g. Kubernetes without persistent volumes) every start is a full Restore. That works, but it's slow for large stores.
+- `@platformatic/kafka` has no per-partition pause, seek or assign. "Only the Task being restored is paused" is implemented by holding that Task's incoming records in memory until its Restore completes, rather than pausing its partition at the consumer.

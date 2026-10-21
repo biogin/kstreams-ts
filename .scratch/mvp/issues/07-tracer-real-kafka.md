@@ -12,4 +12,12 @@
 - [ ] `exactly-once` and `workers > 0` are rejected as not implemented yet
 - [ ] Integration test: N records in → all N out
 
+## Implementation notes (from research)
+
+- Copy the tested draft `scripts/kafka-local.sh` (start|stop|status|reset, Kafka 4.4.0 in `~/.cache/kstreams-ts/`, Java 17) from `local-broker.md`.
+- Test helpers: use idempotent producers and wait for partition leaders after `createTopics` (a non-idempotent producer wrote duplicates right after topic creation).
+- Set a short `sessionTimeout` in tests (the 60 s default blocks reassignment after a crash).
+- Client defaults: consumer isolation is read_committed, `consume()` starts at latest, autocommit is on. Set these explicitly.
+- Research notes: /Users/igorshalygin/.claude/jobs/e36bc646/tmp/notes/kafka-client.md, local-broker.md
+
 Spec: [../spec.md](../spec.md). Glossary: [CONTEXT.md](../../../CONTEXT.md). ADRs: [docs/adr/](../../../docs/adr/)
