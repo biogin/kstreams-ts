@@ -41,7 +41,7 @@ The defaults (4 iterations of 5 SIGKILLs) take about 3 minutes. Settings, as env
 - `KSTREAMS_CRASH_KILLS`: SIGKILLs per iteration (default 5).
 - `KSTREAMS_CRASH_SEED`: base seed; iteration `i` (from 0) uses seed + `i` (default: random). The seed fixes the plan (partitions, keys, commit settings, input values, kill strategies and delays), not the broker's timing.
 
-Known failure: the suite also checks Restore's Changelog reader against the log, and that reader currently drops committed records now and then (see the Comments in `.scratch/mvp/issues/17-crash-suite-v1.md`). Until that is fixed, the suite fails intermittently.
+The suite also checks Restore's Changelog reader (`createChangelogReader`) against the log. It once dropped committed records now and then, through the client's read_committed filter (platformatic/kafka#467); reads now go through `src/read-committed.ts`, which filters aborted transactions per fetch response the way the Java client does.
 
 Each iteration prints its seed, plan and kills. A failure names its seed and the command that reruns that iteration alone, e.g. `KSTREAMS_CRASH_SEED=1234 KSTREAMS_CRASH_ITERATIONS=1 KSTREAMS_CRASH_KILLS=5 npm run test:crash`.
 

@@ -40,7 +40,7 @@
 
 import {
   type ConsumeOptions,
-  Consumer,
+  type Consumer,
   compatibilityPartitioner,
   FetchIsolationLevels,
   findErrorBy,
@@ -54,6 +54,7 @@ import { checkCoPartitioned } from './co-partitioning.js'
 import { ensureChangelogs } from './internal-topics.js'
 import { Ownership } from './ownership.js'
 import type { ProcessorGraph, SerializedRecord } from './processor-graph.js'
+import { ReadCommittedConsumer } from './read-committed.js'
 import { createChangelogReader, type KafkaChangelogReader, restoreStores } from './restore.js'
 import { type ChangelogOffsets, createTask, type Task } from './task.js'
 
@@ -107,12 +108,14 @@ type Transaction = Awaited<ReturnType<Producer<Bytes, Bytes, Bytes, Bytes>['begi
  */
 export async function startWorker(graph: ProcessorGraph, options: WorkerOptions): Promise<Worker> {
   const { applicationId, brokers, clientId, transactionalId } = options
-  const consumer = new Consumer<Bytes, Bytes, Bytes, Bytes>({
+  const consumer = new ReadCommittedConsumer<Bytes, Bytes, Bytes, Bytes>({
     clientId,
     groupId: applicationId,
     bootstrapBrokers: brokers,
     // The commit cycle commits offsets itself, after the batch's outputs are acknowledged.
     autocommit: false,
+    // read_committed, with aborted transactions filtered by read-committed.ts rather than by the
+    // client (platformatic/kafka#467).
     isolationLevel: FetchIsolationLevels.READ_COMMITTED,
     sessionTimeout: options.sessionTimeoutMs,
     heartbeatInterval: Math.max(100, Math.min(3_000, Math.floor(options.sessionTimeoutMs / 3))),
