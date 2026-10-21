@@ -143,17 +143,37 @@ export function singleKeyEncoding<K>(serde: Serde<K>): KeyEncoding<K> {
 }
 
 /**
+ * Internal: receives every write to a State Store as its Changelog record: the key as the key
+ * Serde's bytes (not the store key, ADR-0015) and the value as the value Serde's bytes, or null
+ * for a delete (a Tombstone).
+ */
+export type ChangelogWriter = (key: Uint8Array, value: Uint8Array | null) => void
+
+/**
  * Internal: wraps a byte-level store with the store's Serdes. Keys are encoded with `encoding`,
- * by default as a single part encoded with the key Serde as fallback.
+ * by default as a single part encoded with the key Serde as fallback. With a `changelog`, every
+ * put and delete is also written to it.
  */
 export function keyValueStore<K, V>(
   store: StateStore,
   serdes: Serdes<K, V>,
   context: SerdeContext,
   encoding: KeyEncoding<K> = singleKeyEncoding(serdes.key),
+  changelog?: ChangelogWriter,
 ): KeyValueStore<K, V> {
   const key = (k: K) => encoding.encode(k, context)
   const value = (bytes: Uint8Array) => serdes.value.deserialize(bytes, context)
+  /** Writes `bytes` (null deletes) under `k`, and to the Changelog if there is one. */
+  const write = (k: K, bytes: Uint8Array | null) => {
+    if (changelog !== undefined && (k === null || k === undefined)) {
+      throw new Error(
+        `Cannot write a ${k} key to a State Store: its Changelog "${context.topic}" is compacted, which needs a key`,
+      )
+    }
+    if (bytes === null) store.delete(key(k))
+    else store.put(key(k), bytes)
+    changelog?.(serdes.key.serialize(k, context), bytes)
+  }
   const entries = (found: Iterable<[Uint8Array, Uint8Array]>): [K, V][] =>
     Array.from(found, ([k, v]) => [encoding.decode(k, context), value(v)])
   return {
@@ -162,11 +182,10 @@ export function keyValueStore<K, V>(
       return bytes === undefined ? undefined : value(bytes)
     },
     put(k, v) {
-      if (v === null) store.delete(key(k))
-      else store.put(key(k), serdes.value.serialize(v, context))
+      write(k, v === null ? null : serdes.value.serialize(v, context))
     },
     delete(k) {
-      store.delete(key(k))
+      write(k, null)
     },
     all() {
       return entries(store.all())

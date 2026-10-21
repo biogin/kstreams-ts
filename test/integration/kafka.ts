@@ -103,6 +103,24 @@ export function createKafka() {
       return readTopic(topic, done, { timeoutMs, settleMs: 0 })
     },
 
+    /**
+     * Reads `topic` from the beginning (read_committed) as raw bytes until `count` records arrived,
+     * then for `settleMs` more. For topics whose keys or values aren't strings.
+     */
+    async consumeBytes(
+      topic: string,
+      count: number,
+      { timeoutMs = 20_000, settleMs = 500 } = {},
+    ): Promise<BytesRecord[]> {
+      let seen = 0
+      return readMessages(topic, toBytesRecord, () => ++seen === count, { timeoutMs, settleMs })
+    },
+
+    /** Deletes `topic` on `close`, e.g. an Internal Topic the app under test created. */
+    deleteOnClose(topic: string): void {
+      topics.push(topic)
+    },
+
     /** The committed offset of every partition of `topic` for consumer group `groupId`. */
     async committedOffsets(groupId: string, topic: string): Promise<Map<number, bigint>> {
       const [group] = await admin.listConsumerGroupOffsets({ groups: [groupId] })
@@ -131,11 +149,46 @@ export function createKafka() {
   }
 }
 
-async function readTopic(
+/** A record read as bytes; a missing key or a tombstone is null. */
+export interface BytesRecord {
+  key: Buffer | null
+  value: Buffer | null
+  timestamp: number
+  partition: number
+}
+
+function toBytesRecord(message: Message): BytesRecord {
+  return {
+    key: message.key ?? null,
+    value: message.value ?? null,
+    timestamp: Number(message.timestamp),
+    partition: message.partition,
+  }
+}
+
+function toTestRecord(message: Message): TestRecord {
+  return {
+    key: message.key === undefined ? null : message.key.toString(),
+    value: message.value === undefined ? null : message.value.toString(),
+    timestamp: Number(message.timestamp),
+    partition: message.partition,
+  }
+}
+
+function readTopic(
   topic: string,
   done: (record: TestRecord) => boolean,
-  { timeoutMs, settleMs }: { timeoutMs: number; settleMs: number },
+  options: { timeoutMs: number; settleMs: number },
 ): Promise<TestRecord[]> {
+  return readMessages(topic, toTestRecord, done, options)
+}
+
+async function readMessages<R>(
+  topic: string,
+  convert: (message: Message) => R,
+  done: (record: R) => boolean,
+  { timeoutMs, settleMs }: { timeoutMs: number; settleMs: number },
+): Promise<R[]> {
   const consumer = new Consumer({
     clientId: uniqueName('test-consumer'),
     groupId: uniqueName('test-group'),
@@ -146,7 +199,7 @@ async function readTopic(
     heartbeatInterval: 1_000,
     maxWaitTime: 100,
   })
-  const records: TestRecord[] = []
+  const records: R[] = []
   try {
     const stream = await consumer.consume({ topics: [topic], mode: 'earliest' })
     await new Promise<void>((resolve, reject) => {
@@ -157,12 +210,7 @@ async function readTopic(
       )
       stream.on('error', reject)
       stream.on('data', (message: Message) => {
-        const record: TestRecord = {
-          key: message.key === undefined ? null : message.key.toString(),
-          value: message.value === undefined ? null : message.value.toString(),
-          timestamp: Number(message.timestamp),
-          partition: message.partition,
-        }
+        const record = convert(message)
         records.push(record)
         if (settle === undefined && done(record)) {
           clearTimeout(timeout)
