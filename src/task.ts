@@ -8,6 +8,7 @@ import {
   type Serde,
   serializeNullable,
 } from './serde.js'
+import { type KeyValueStore, keyValueStore, type NamedStore } from './state-store.js'
 
 /** Receives every record a sink writes, already serialized with the sink's Serdes. */
 export type RecordCollector = (topic: string, record: SerializedRecord) => void
@@ -25,6 +26,8 @@ export interface Task {
    * later record with the same error (fail-fast).
    */
   process(topic: string, record: SerializedRecord): Promise<void>
+  /** This Task's State Store named `name`. Throws if the graph has no such store. */
+  store(name: string): KeyValueStore<unknown, unknown>
 }
 
 export function createTask(graph: ProcessorGraph, collect: RecordCollector): Task {
@@ -34,6 +37,17 @@ export function createTask(graph: ProcessorGraph, collect: RecordCollector): Tas
     inFlight.add(work)
     const settled = () => inFlight.delete(work)
     work.then(settled, settled)
+  }
+
+  const stores = new Map<string, KeyValueStore<unknown, unknown>>()
+  for (const { name, serdes, supplier, changelogTopic } of graph.stores.values()) {
+    stores.set(name, keyValueStore(supplier({ name }), serdes, { topic: changelogTopic }))
+  }
+  const store = (ref: string | NamedStore<unknown, unknown>): KeyValueStore<unknown, unknown> => {
+    const name = typeof ref === 'string' ? ref : ref.name
+    const found = stores.get(name)
+    if (found === undefined) throw new Error(`Unknown State Store "${name}"`)
+    return found
   }
 
   const deliverTo = new Map<string, Deliver>()
@@ -49,7 +63,7 @@ export function createTask(graph: ProcessorGraph, collect: RecordCollector): Tas
         deliverTo.set(node.name, forwardTo(node.children))
         break
       case 'processor': {
-        const processor = node.supplier(createContext(forwardTo(node.children)))
+        const processor = node.supplier(createContext(forwardTo(node.children), store))
         // While this Processor is busy with an async call, its next records queue behind it.
         let busy: Promise<void> | undefined
         const queue = (work: Promise<void>): void => {
@@ -136,15 +150,17 @@ export function createTask(graph: ProcessorGraph, collect: RecordCollector): Tas
       }
       return work === undefined ? Promise.resolve() : settle(work)
     },
+    store,
   }
 }
 
-function createContext(forward: Deliver): ProcessorContext<unknown, unknown> {
+function createContext(
+  forward: Deliver,
+  store: (ref: string | NamedStore<unknown, unknown>) => KeyValueStore<unknown, unknown>,
+): ProcessorContext<unknown, unknown> {
   return {
     forward,
-    store() {
-      throw new Error('ctx.store is not implemented yet')
-    },
+    store: store as ProcessorContext<unknown, unknown>['store'],
     schedule() {
       throw new Error('ctx.schedule is not implemented yet')
     },

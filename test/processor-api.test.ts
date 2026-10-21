@@ -242,7 +242,6 @@ describe('async Processors', () => {
 
 describe('ProcessorContext features that arrive later', () => {
   it.each([
-    ['store', (ctx: ProcessorContext<string, string>) => ctx.store('counts')],
     [
       'schedule',
       (ctx: ProcessorContext<string, string>) => ctx.schedule(1000, 'stream-time', () => {}),
