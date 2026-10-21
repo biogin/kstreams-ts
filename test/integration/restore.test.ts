@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Producer } from '@platformatic/kafka'
 import { afterEach, beforeEach, expect, it } from 'vitest'
+import { CHECKPOINT_FILE, readCheckpoint } from '../../src/checkpoint.js'
 import {
   createStreamsApp,
   type StateStore,
@@ -15,7 +16,14 @@ import {
 } from '../../src/index.js'
 import { type ChangelogRecord, createChangelogReader } from '../../src/restore.js'
 import { keyValueStore, taskDirectory } from '../../src/state-store.js'
-import { brokers, createKafka, describeWithKafka, type TestRecord, uniqueName } from './kafka.js'
+import {
+  brokers,
+  createKafka,
+  describeWithKafka,
+  keptOpen,
+  type TestRecord,
+  uniqueName,
+} from './kafka.js'
 
 const strings = { key: serdes.string, value: serdes.string }
 
@@ -57,7 +65,7 @@ describeWithKafka('Restore from the Changelog (at-least-once, workers: 0)', () =
     return created
   }
 
-  /** In-memory stores, kept by Task so the test can read them once the app has stopped. */
+  /** In-memory stores, kept open by Task so the test can read them once the app has stopped. */
   function capturingSupplier(): { supplier: StateStoreSupplier; byTask: Map<number, StateStore> } {
     const byTask = new Map<number, StateStore>()
     return {
@@ -65,7 +73,7 @@ describeWithKafka('Restore from the Changelog (at-least-once, workers: 0)', () =
       supplier: (context) => {
         const store = stores.inMemory()(context)
         byTask.set(context.task, store)
-        return store
+        return keptOpen(store)
       },
     }
   }
@@ -156,7 +164,7 @@ describeWithKafka('Restore from the Changelog (at-least-once, workers: 0)', () =
     ])
   })
 
-  it('wipes a persisted SQLite store before restoring it, since it has no Checkpoint', async () => {
+  it('wipes a persisted SQLite store and fully restores it when its Checkpoint is missing', async () => {
     const input = await kafka.createTopic('input', 1)
     const output = await kafka.createTopic('output', 1)
     const applicationId = uniqueName('restore-sqlite')
@@ -178,13 +186,17 @@ describeWithKafka('Restore from the Changelog (at-least-once, workers: 0)', () =
     await kafka.produce(input, words(['a', 'a']))
     await kafka.consume(output, 2)
     await first.stop()
+    const directory = taskDirectory(stateDir, applicationId, 0)
+    expect(readCheckpoint(directory)).toBeDefined()
 
-    // A write the Changelog never got, e.g. one made just before a crash.
+    // A write the Changelog never got, e.g. one made just before a crash. The Task removes its
+    // Checkpoint before such a write.
+    rmSync(join(directory, CHECKPOINT_FILE))
     const local = stores.sqlite()({
       name: 'counts',
       applicationId,
       task: 0,
-      directory: taskDirectory(stateDir, applicationId, 0),
+      directory,
     })
     const topic = `${applicationId}-counts-changelog`
     const view = keyValueStore(local, { key: serdes.string, value: serdes.number }, { topic })
@@ -199,6 +211,72 @@ describeWithKafka('Restore from the Changelog (at-least-once, workers: 0)', () =
     expect(counts.slice(2).map(({ key }) => key)).toEqual(['a', 'ghost'])
     const read = await kafka.consumeBytes(output, 4)
     expect(read.slice(2).map(({ value }) => value?.readDoubleBE())).toEqual([3, 1])
+  })
+
+  it('restarts from the Checkpoint: replays only the Changelog records after it', async () => {
+    const input = await kafka.createTopic('input', 1)
+    const applicationId = uniqueName('restore-checkpoint')
+    const stateDir = mkdtempSync(join(tmpdir(), 'kstreams-checkpoint-'))
+    directories.push(stateDir)
+    const changelog = `${applicationId}-latest-changelog`
+    /** Counts the writes to the SQLite store of each run, Restore's included. */
+    const keeper = () => {
+      const run = { writes: 0 }
+      const created = app({ applicationId, stateDir }, ['latest'])
+      const store = created.store('latest', strings, {
+        supplier: (context) => countingWrites(stores.sqlite()(context), run),
+      })
+      const processor = created.processor<string, string | null, never, never>('keeper', (ctx) => ({
+        process({ key, value }) {
+          if (value !== null) ctx.store(store).put(key, value)
+        },
+      }))
+      created.stream(input, strings).process(processor)
+      return { app: created, run }
+    }
+
+    const first = keeper()
+    await first.app.start()
+    await kafka.produce(input, words(['a', 'b', 'c', 'a']))
+    await kafka.consumeBytes(changelog, 4)
+    await first.app.stop()
+    expect(first.run.writes).toBe(4)
+    expect(readCheckpoint(taskDirectory(stateDir, applicationId, 0))).toEqual(
+      new Map([['latest', 4n]]),
+    )
+
+    // Written to the Changelog after the Checkpoint, e.g. by a Worker that took the Task over.
+    await kafka.produce(changelog, [
+      { key: 'b', value: 'from-changelog', timestamp: 1, partition: 0 },
+    ])
+
+    const second = keeper()
+    await second.app.start()
+    await kafka.produce(input, [{ key: 'd', value: 'new', timestamp: 2 }])
+    await kafka.consumeBytes(changelog, 6)
+    await second.app.stop()
+
+    // One record replayed (not the four before the Checkpoint, and no wipe), one processed.
+    expect(second.run.writes).toBe(2)
+    const local = stores.sqlite()({
+      name: 'latest',
+      applicationId,
+      task: 0,
+      directory: taskDirectory(stateDir, applicationId, 0),
+    })
+    try {
+      expect(keyValueStore(local, strings, { topic: changelog }).all()).toEqual([
+        ['a', '3'],
+        ['b', 'from-changelog'],
+        ['c', '2'],
+        ['d', 'new'],
+      ])
+    } finally {
+      local.close()
+    }
+    expect(readCheckpoint(taskDirectory(stateDir, applicationId, 0))).toEqual(
+      new Map([['latest', 6n]]),
+    )
   })
 
   it('restores window stores by re-encoding the windowed Changelog keys', async () => {
@@ -231,6 +309,29 @@ describeWithKafka('Restore from the Changelog (at-least-once, workers: 0)', () =
     expect(counts.slice(3).map(({ value }) => value?.readDoubleBE())).toEqual([3, 2])
   })
 })
+
+/** `store`, counting its puts and deletes in `run.writes`. */
+function countingWrites(store: StateStore, run: { writes: number }): StateStore {
+  return {
+    persistent: store.persistent ?? false,
+    get: (key) => store.get(key),
+    put(key, value) {
+      run.writes++
+      store.put(key, value)
+    },
+    delete(key) {
+      run.writes++
+      store.delete(key)
+    },
+    all: () => store.all(),
+    range: (from, to) => store.range(from, to),
+    begin: () => store.begin(),
+    commit: () => store.commit(),
+    rollback: () => store.rollback(),
+    flush: () => store.flush?.(),
+    close: () => store.close(),
+  }
+}
 
 describeWithKafka('The restore consumer', () => {
   let kafka: ReturnType<typeof createKafka>

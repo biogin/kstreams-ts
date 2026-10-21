@@ -45,6 +45,20 @@ export interface StateStore {
   rollback(): void
   /** Releases the store's resources. The store is not used after this. */
   close(): void
+  /**
+   * Whether the store keeps its contents across restarts, in the Task's state directory. The
+   * engine keeps a Checkpoint for a persistent store and, on a restart, restores only the part of
+   * its Changelog after the Checkpoint; a store whose Checkpoint is missing or unclean is wiped and
+   * fully restored (ADR-0009). Stores that aren't persistent are fully restored on every start.
+   * Defaults to false.
+   */
+  readonly persistent?: boolean
+  /**
+   * Makes every committed write durable, surviving an OS crash. The engine calls it before it
+   * writes a Checkpoint of a persistent store. Optional: without it, writes are taken as durable
+   * once made.
+   */
+  flush?(): void
 }
 
 /** What a State Store supplier is told about the store it opens. */
@@ -74,8 +88,9 @@ export const stores = {
   },
   /**
    * The default durable State Store: a SQLite database (`better-sqlite3`) in the file
-   * `<store>.sqlite` of the Task's state directory, which is created if needed. Without a state
-   * directory the database is kept in memory.
+   * `<store>.sqlite` of the Task's state directory, which is created if needed. It is persistent:
+   * a restart restores only the part of its Changelog after its Checkpoint. Without a state
+   * directory the database is kept in memory, and is fully restored on every start.
    */
   sqlite(): StateStoreSupplier {
     return ({ name, directory }) => openSqliteStore(directory, name)

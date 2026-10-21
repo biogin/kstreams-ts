@@ -18,10 +18,11 @@ export function openSqliteStore(directory: string | undefined, name: string): St
     mkdirSync(directory, { recursive: true })
     file = join(directory, `${name}.sqlite`)
   }
-  return new SqliteStore(new Database(file))
+  return new SqliteStore(new Database(file), directory !== undefined)
 }
 
 class SqliteStore implements StateStore {
+  readonly persistent: boolean
   readonly #db: Database.Database
   readonly #get: Database.Statement<[Buffer], Row>
   readonly #put: Database.Statement<[Buffer, Buffer]>
@@ -31,7 +32,8 @@ class SqliteStore implements StateStore {
   readonly #to: Database.Statement<[Buffer], Row>
   readonly #between: Database.Statement<[Buffer, Buffer], Row>
 
-  constructor(db: Database.Database) {
+  constructor(db: Database.Database, persistent: boolean) {
+    this.persistent = persistent
     this.#db = db
     // WAL with synchronous=NORMAL survives a process crash; an OS crash may lose the last
     // commits, which Restore from the Changelog covers (ADR-0009).
@@ -92,6 +94,12 @@ class SqliteStore implements StateStore {
   rollback(): void {
     if (!this.#db.inTransaction) throw new Error('No transaction is open')
     this.#db.exec('ROLLBACK')
+  }
+
+  // A FULL WAL checkpoint syncs the WAL and copies it into the database file, which is synced too:
+  // synchronous=NORMAL alone doesn't sync on commit.
+  flush(): void {
+    if (this.persistent) this.#db.pragma('wal_checkpoint(FULL)')
   }
 
   close(): void {

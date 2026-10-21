@@ -1,6 +1,7 @@
 // Internal: Restore, rebuilding a Task's State Stores from their Changelogs before the Task
-// processes records (ADR-0009). This is a full Restore: the local store is wiped and every
-// committed Changelog record replayed. Checkpoints (partial Restore) are ticket 14.
+// processes records (ADR-0009). A store with a usable Checkpoint replays only the committed
+// Changelog records after it; any other store is wiped and every committed record replayed (a full
+// Restore). See checkpoint.ts for when a Checkpoint is usable.
 //
 // Changelogs are read by a restore consumer outside the consumer group, with the low-level
 // `fetch()` under `read_committed`, from the start of the partition up to its last stable offset
@@ -26,38 +27,49 @@ export interface ChangelogRecord {
 /** Reads the committed records of Changelog partitions. */
 export interface ChangelogReader {
   /**
-   * Reads `partition` of `topic` from its start to its end as of the call (its last stable
-   * offset), skipping aborted transactions. Calls `apply` with the records, in offset order, a
-   * chunk at a time.
+   * Reads `partition` of `topic` from offset `from` (by default its start) to its end as of the
+   * call (its last stable offset), skipping aborted transactions. Calls `apply` with the records,
+   * in offset order, a chunk at a time. Resolves to the offset after the last one read: where a
+   * later read would continue. Resolves to undefined, reading nothing, when `from` is outside the
+   * partition (before its start or past its end).
    */
-  read(topic: string, partition: number, apply: (records: ChangelogRecord[]) => void): Promise<void>
+  read(
+    topic: string,
+    partition: number,
+    apply: (records: ChangelogRecord[]) => void,
+    from?: bigint,
+  ): Promise<bigint | undefined>
 }
 
 /** A State Store of a Task, as opened, with its definition. */
 export interface RestoringStore {
   node: StoreNode
   store: StateStore
+  /**
+   * The store's Checkpoint: the Changelog offset it has applied up to. Undefined when it has
+   * none, or it is unclean: the store is then wiped and fully restored.
+   */
+  checkpoint?: bigint | undefined
 }
 
 /**
- * Fully restores each store from the Task's partition of its Changelog: wipes the store, then
- * replays the Changelog into it. Keys are decoded with the key Serde and re-encoded as store keys
- * (ADR-0015); Tombstones delete. Each chunk is applied in one store transaction.
+ * Restores each store from the Task's partition of its Changelog. A store with a Checkpoint
+ * replays the Changelog after it; others (and one whose Checkpoint is outside the Changelog) are
+ * wiped, then replay all of it. Keys are decoded with the key Serde and re-encoded as store keys
+ * (ADR-0015); Tombstones delete. Each chunk is applied in one store transaction. Resolves to the
+ * Changelog offset each store has applied up to, by store name.
  */
 export async function restoreStores(
   stores: readonly RestoringStore[],
   partition: number,
   reader: ChangelogReader,
-): Promise<void> {
-  for (const { node, store } of stores) {
+): Promise<Map<string, bigint>> {
+  const restored = new Map<string, bigint>()
+  for (const { node, store, checkpoint } of stores) {
     const topic = node.changelogTopic
     const context = { topic }
     const encoding = node.keyEncoding ?? singleKeyEncoding(node.serdes.key)
-    inTransaction(store, () => {
-      // Collected first: a store must not be written while it is iterated.
-      for (const key of Array.from(store.all(), ([key]) => key)) store.delete(key)
-    })
-    await reader.read(topic, partition, (records) =>
+    const apply = (records: ChangelogRecord[]) =>
       inTransaction(store, () => {
         for (const { key, value } of records) {
           if (key === null) {
@@ -69,9 +81,21 @@ export async function restoreStores(
           if (value === null) store.delete(storeKey)
           else store.put(storeKey, value)
         }
-      }),
-    )
+      })
+    let offset =
+      checkpoint === undefined ? undefined : await reader.read(topic, partition, apply, checkpoint)
+    if (offset === undefined) {
+      inTransaction(store, () => {
+        // Collected first: a store must not be written while it is iterated.
+        for (const key of Array.from(store.all(), ([key]) => key)) store.delete(key)
+      })
+      offset = await reader.read(topic, partition, apply)
+      if (offset === undefined)
+        throw new Error(`Cannot read Changelog "${topic}" partition ${partition}`)
+    }
+    restored.set(node.name, offset)
   }
+  return restored
 }
 
 function inTransaction(store: StateStore, work: () => void): void {
@@ -157,11 +181,13 @@ export function createChangelogReader({
   }
 
   return {
-    async read(topic, partition, apply) {
+    async read(topic, partition, apply, from) {
       // With read_committed, the latest offset is the last stable offset: no open transaction
       // is waited for, and every aborted one before it has its marker.
       const end = await offset(topic, partition, ListOffsetTimestamps.LATEST)
-      let position = await offset(topic, partition, ListOffsetTimestamps.EARLIEST)
+      const start = await offset(topic, partition, ListOffsetTimestamps.EARLIEST)
+      if (from !== undefined && (from < start || from > end)) return undefined
+      let position = from ?? start
       const aborted = new AbortedTransactions()
       let target = await leader(topic, partition, false)
       let retries = 0
@@ -210,6 +236,7 @@ export function createChangelogReader({
         position = aborted.committedRecords(fetched, position, records)
         if (records.length > 0) apply(records)
       }
+      return position
     },
     close: () => consumer.close(true),
   }

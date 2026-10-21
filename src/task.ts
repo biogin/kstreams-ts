@@ -1,5 +1,6 @@
 // Internal: runs a Processor graph for one Task. Shared by the Test Driver and the Kafka runtime.
 
+import { TaskCheckpoint } from './checkpoint.js'
 import type {
   ProcessorContext,
   ProcessorGraph,
@@ -36,11 +37,18 @@ export interface TaskOptions {
   changelog?: RecordCollector | undefined
   /**
    * Restores the Task's State Stores, as opened, before it processes anything: records and timers
-   * given to the Task meanwhile wait for it. A failed Restore fails the Task. Without one, stores
-   * start as their suppliers open them.
+   * given to the Task meanwhile wait for it. It resolves to the Changelog offset each store has
+   * applied up to, by store name. A failed Restore fails the Task. Without one, stores start as
+   * their suppliers open them.
+   *
+   * With a state directory, the Task also keeps a Checkpoint of its persistent stores there, and
+   * gives Restore each one's Checkpoint (see checkpoint.ts).
    */
-  restore?: ((stores: RestoringStore[]) => Promise<void>) | undefined
+  restore?: ((stores: RestoringStore[]) => Promise<ReadonlyMap<string, bigint>>) | undefined
 }
+
+/** Changelog offsets by Changelog topic, for one Task's partition of each. */
+export type ChangelogOffsets = ReadonlyMap<string, bigint>
 
 export interface Task {
   /**
@@ -66,6 +74,15 @@ export interface Task {
   store(name: string): KeyValueStore<unknown, unknown>
   /** The Task's counters so far. */
   metrics(): TaskMetrics
+  /**
+   * Writes the Checkpoint of the Task's persistent State Stores, if they were written since the
+   * last one. Call it only once the Changelog records of every store write so far are
+   * acknowledged, with `committed` holding the offset after the last of them in each Changelog
+   * written to, and when no record is being processed.
+   */
+  checkpoint(committed: ChangelogOffsets): void
+  /** Closes the Task's State Stores. Without a Checkpoint first, they are unclean. */
+  close(): void
 }
 
 export interface TaskMetrics {
@@ -183,12 +200,20 @@ export function createTask(
 
   const stores = new Map<string, KeyValueStore<unknown, unknown>>()
   const opened: RestoringStore[] = []
+  const directory =
+    stateDir === undefined ? undefined : taskDirectory(stateDir, graph.applicationId, task)
+  /** The Checkpoint of the persistent stores, which only a Task that is restored keeps. */
+  let checkpoint: TaskCheckpoint | undefined
   for (const node of graph.stores.values()) {
     const { name, serdes, supplier, changelogTopic, keyEncoding } = node
-    const directory =
-      stateDir === undefined ? undefined : taskDirectory(stateDir, graph.applicationId, task)
-    const store = supplier({ name, applicationId: graph.applicationId, task, directory })
-    opened.push({ node, store })
+    let store = supplier({ name, applicationId: graph.applicationId, task, directory })
+    let restoreFrom: bigint | undefined
+    if (directory !== undefined && restore !== undefined && store.persistent === true) {
+      checkpoint ??= new TaskCheckpoint(directory)
+      restoreFrom = checkpoint.offset(name)
+      store = checkpoint.track(name, store)
+    }
+    opened.push({ node, store, checkpoint: restoreFrom })
     const log =
       changelog &&
       ((key: Uint8Array, value: Uint8Array | null) =>
@@ -313,7 +338,14 @@ export function createTask(
   }
 
   // The first job: everything else queues behind it. Its failure fails the Task's later work.
-  if (restore !== undefined && opened.length > 0) enqueue(() => restore(opened)).catch(() => {})
+  if (restore !== undefined && opened.length > 0) {
+    enqueue(async () => {
+      const restored = await restore(opened)
+      for (const [name, offset] of restored) checkpoint?.advance(name, offset)
+      // Restore's own writes are in the Changelog already.
+      checkpoint?.write()
+    }).catch(() => {})
+  }
 
   return {
     process(topic, record) {
@@ -324,6 +356,19 @@ export function createTask(
     },
     store,
     metrics: () => ({ ...metrics }),
+    checkpoint(committed) {
+      if (checkpoint === undefined || failure !== undefined) return
+      if (pending !== undefined)
+        throw new Error('Cannot write a Checkpoint while records are processed')
+      for (const { node } of opened) {
+        const offset = committed.get(node.changelogTopic)
+        if (offset !== undefined) checkpoint.advance(node.name, offset)
+      }
+      checkpoint.write()
+    },
+    close() {
+      for (const { store } of opened) store.close()
+    },
   }
 }
 

@@ -5,6 +5,7 @@
 import { randomUUID } from 'node:crypto'
 import { Admin, Consumer, FetchIsolationLevels, type Message, Producer } from '@platformatic/kafka'
 import { describe } from 'vitest'
+import type { StateStore } from '../../src/index.js'
 
 export const BROKERS_ENV = 'KSTREAMS_KAFKA_BROKERS'
 
@@ -260,5 +261,23 @@ export async function eventually(
   while (!(await check())) {
     if (Date.now() > deadline) throw new Error(`Timed out waiting for ${message}`)
     await delay(50)
+  }
+}
+
+/**
+ * `store`, kept open when the Streams App closes it (on stop), so that a test can read it once
+ * the app has stopped.
+ */
+export function keptOpen(store: StateStore): StateStore {
+  return {
+    get: (key) => store.get(key),
+    put: (key, value) => store.put(key, value),
+    delete: (key) => store.delete(key),
+    all: () => store.all(),
+    range: (from, to) => store.range(from, to),
+    begin: () => store.begin(),
+    commit: () => store.commit(),
+    rollback: () => store.rollback(),
+    close() {},
   }
 }

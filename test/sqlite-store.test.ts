@@ -32,6 +32,27 @@ describe('SQLite State Store', () => {
     expect(existsSync(join(ctx.directory ?? '', 'counts.sqlite'))).toBe(true)
   })
 
+  it('is persistent with a state directory, and not without one', () => {
+    const persisted = stores.sqlite()(context())
+    const inMemory = stores.sqlite()({ ...context(), directory: undefined })
+    expect(persisted.persistent).toBe(true)
+    expect(inMemory.persistent).toBe(false)
+    persisted.close()
+    inMemory.close()
+  })
+
+  it('keeps flushed writes when closed and opened again', () => {
+    const ctx = context()
+    const first = stores.sqlite()(ctx)
+    first.put(text('flushed'), text('1'))
+    first.flush?.()
+    first.close()
+
+    const second = stores.sqlite()(ctx)
+    expect([...second.all()]).toEqual([[text('flushed'), text('1')]])
+    second.close()
+  })
+
   it('keeps committed writes when closed and opened again', () => {
     const ctx = context()
     const first = stores.sqlite()(ctx)

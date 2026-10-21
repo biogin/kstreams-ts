@@ -28,7 +28,10 @@ export interface StreamsAppConfig {
   /**
    * The directory local State Stores are kept in, under `<stateDir>/<applicationId>/<task>/`.
    * With one, State Stores that aren't given a supplier are SQLite databases there; without one,
-   * they are kept in memory. The Test Driver ignores it (see `createTestDriver`).
+   * they are kept in memory. Persistent stores keep a Checkpoint there (the file `.checkpoint`),
+   * so a restart restores only the part of their Changelogs after it; after a crash mid-batch the
+   * stores are wiped and fully restored. Without a persistent state directory (e.g. a disposable
+   * disk) every start is a full Restore. The Test Driver ignores it (see `createTestDriver`).
    */
   stateDir?: string
   /**

@@ -2,13 +2,15 @@
 // consumer (ADR-0007). With `workers: 0` the Streams App runs one Worker in the main thread.
 //
 // A Task is created when its first record arrives. Its State Stores are restored from their
-// Changelogs first (a full Restore, see restore.ts); its records wait in the Task meanwhile, and
-// the batch commits once they are processed.
+// Changelogs first (from their Checkpoints, or in full; see restore.ts and checkpoint.ts); its
+// records wait in the Task meanwhile, and the batch commits once they are processed.
 //
 // The commit cycle: read records into a batch until the commit interval runs out or the batch is
 // full, and process each record in its Task.
 // - At-least-once: then produce the batch's outputs and Changelog records, wait for the broker to
 //   acknowledge them, and only then commit the consumed offsets.
+// - Then each Task writes the Checkpoint of its persistent State Stores, with the Changelog
+//   offsets the broker acknowledged.
 // - Exactly-once: outputs go into the Worker's open Kafka transaction as they are produced; at the
 //   end of the batch the consumed offsets (the last record per partition) join the transaction
 //   and it commits. A failure aborts it, so `read_committed` readers never see the batch.
@@ -27,7 +29,7 @@ import { checkCoPartitioned } from './co-partitioning.js'
 import { ensureChangelogs } from './internal-topics.js'
 import type { ProcessorGraph, SerializedRecord } from './processor-graph.js'
 import { createChangelogReader, type KafkaChangelogReader, restoreStores } from './restore.js'
-import { createTask, type Task } from './task.js'
+import { type ChangelogOffsets, createTask, type Task } from './task.js'
 
 export interface WorkerOptions {
   applicationId: string
@@ -242,7 +244,20 @@ class CommitCycle {
       throw error
     } finally {
       next.catch(() => {})
+      this.#closeTasks()
     }
+  }
+
+  /** Closes every Task's State Stores. After a failure they are left without a Checkpoint. */
+  #closeTasks(): void {
+    for (const task of this.#tasks.values()) {
+      try {
+        task.close()
+      } catch {
+        // Closing the others matters more; an unclosed store is unclean anyway.
+      }
+    }
+    this.#tasks.clear()
   }
 
   /**
@@ -301,7 +316,7 @@ class CommitCycle {
           // A Task's State Stores are logged to the Changelog partition of the same number.
           changelog: (topic, record) =>
             this.#committer.produce({ ...toMessage(topic, record), partition }),
-          // Every Task starts with a full Restore; its records queue behind it.
+          // Every Task starts with a Restore; its records queue behind it.
           restore: (stores) => {
             const restorer = this.#restorer
             if (restorer === undefined) throw new Error('No restore consumer for State Stores')
@@ -328,9 +343,16 @@ class CommitCycle {
 
     const lastRead = [...this.#lastRead.values()]
     this.#lastRead = new Map()
-    await this.#committer.commit(lastRead)
+    const produced = await this.#committer.commit(lastRead)
+    // Only once the batch is committed: a Checkpoint must not get ahead of the Changelog.
+    for (const [partition, task] of this.#tasks) {
+      task.checkpoint(produced.get(partition) ?? new Map())
+    }
   }
 }
+
+/** The offset after the last record a batch produced, by partition, then by topic. */
+type ProducedOffsets = ReadonlyMap<number, ChangelogOffsets>
 
 /** Commits a batch under one Delivery Guarantee. */
 interface BatchCommitter {
@@ -338,9 +360,12 @@ interface BatchCommitter {
   produce(output: Output): void
   /**
    * Commits the current batch: its outputs, and the offsets after `lastRead` (the last record
-   * read from each partition). Rejects if any part of it failed.
+   * read from each partition). Rejects if any part of it failed. Resolves to the offset after the
+   * last output in each partition that outputs given an explicit partition (the Changelog records)
+   * went to. An offset may be lower than that, never higher: replaying a Changelog from too early
+   * is harmless.
    */
-  commit(lastRead: ConsumedMessage[]): Promise<void>
+  commit(lastRead: ConsumedMessage[]): Promise<ProducedOffsets>
   /** Gives up on the current batch after a failure. */
   abort(): Promise<void>
 }
@@ -363,10 +388,14 @@ class AtLeastOnceCommitter implements BatchCommitter {
     this.#outputs.push(output)
   }
 
-  async commit(lastRead: ConsumedMessage[]): Promise<void> {
+  async commit(lastRead: ConsumedMessage[]): Promise<ProducedOffsets> {
     const outputs = this.#outputs
     this.#outputs = []
-    if (outputs.length > 0) await this.#producer.send({ messages: outputs })
+    let produced: ProducedOffsets = new Map()
+    if (outputs.length > 0) {
+      const result = await this.#producer.send({ messages: outputs })
+      produced = producedOffsets(outputs, result.offsets ?? [])
+    }
     if (lastRead.length > 0) {
       await this.#consumer.commit({
         offsets: lastRead.map(({ topic, partition, offset, leaderEpoch }) => ({
@@ -377,6 +406,7 @@ class AtLeastOnceCommitter implements BatchCommitter {
         })),
       })
     }
+    return produced
   }
 
   async abort(): Promise<void> {
@@ -440,7 +470,8 @@ class TransactionalCommitter implements BatchCommitter {
     return this.#transaction
   }
 
-  async commit(lastRead: ConsumedMessage[]): Promise<void> {
+  // Exactly-once with State Stores (and so Checkpoints) is ticket 16: no offsets are reported yet.
+  async commit(lastRead: ConsumedMessage[]): Promise<ProducedOffsets> {
     await this.#sending
     if (this.#sendFailure !== undefined) throw this.#sendFailure.error
     if (lastRead.length > 0) {
@@ -452,6 +483,7 @@ class TransactionalCommitter implements BatchCommitter {
     const transaction = this.#transaction
     this.#transaction = undefined
     await transaction?.commit()
+    return new Map()
   }
 
   /**
@@ -491,6 +523,44 @@ class TransactionalCommitter implements BatchCommitter {
     this.#transaction = undefined
     await transaction?.abort()
   }
+}
+
+/**
+ * The offset after the last of `outputs` in each partition they were explicitly sent to, from the
+ * base offsets the broker acknowledged. One send writes one record batch per partition, so its
+ * records follow the base offset; if a partition got several base offsets, the records after
+ * the last one are not known, and only that one is counted.
+ */
+function producedOffsets(
+  outputs: readonly Output[],
+  acknowledged: readonly { topic: string; partition: number; offset: bigint }[],
+): ProducedOffsets {
+  const counts = new Map<string, number>()
+  for (const { topic, partition } of outputs) {
+    if (partition === undefined) continue
+    const id = `${topic}:${partition}`
+    counts.set(id, (counts.get(id) ?? 0) + 1)
+  }
+  const bases = new Map<string, bigint[]>()
+  for (const { topic, partition, offset } of acknowledged) {
+    const id = `${topic}:${partition}`
+    bases.set(id, [...(bases.get(id) ?? []), offset])
+  }
+  const produced = new Map<number, Map<string, bigint>>()
+  for (const { topic, partition, offset } of acknowledged) {
+    const id = `${topic}:${partition}`
+    const count = counts.get(id)
+    const found = bases.get(id) ?? []
+    if (count === undefined || offset !== found.reduce((a, b) => (a > b ? a : b))) continue
+    const next = found.length === 1 ? offset + BigInt(count) : offset + 1n
+    let byTopic = produced.get(partition)
+    if (byTopic === undefined) {
+      byTopic = new Map()
+      produced.set(partition, byTopic)
+    }
+    byTopic.set(topic, next)
+  }
+  return produced
 }
 
 function toMessage(

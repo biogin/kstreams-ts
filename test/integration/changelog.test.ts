@@ -15,6 +15,7 @@ import {
   brokers,
   createKafka,
   describeWithKafka,
+  keptOpen,
   type TestRecord,
   uniqueName,
 } from './kafka.js'
@@ -46,7 +47,7 @@ describeWithKafka('Changelogs on real Kafka (at-least-once, workers: 0)', () => 
     return created
   }
 
-  /** In-memory stores, kept by Task so the test can read them once the app has stopped. */
+  /** In-memory stores, kept open by Task so the test can read them once the app has stopped. */
   function capturingSupplier(): { supplier: StateStoreSupplier; byTask: Map<number, StateStore> } {
     const byTask = new Map<number, StateStore>()
     return {
@@ -54,7 +55,7 @@ describeWithKafka('Changelogs on real Kafka (at-least-once, workers: 0)', () => 
       supplier: (context) => {
         const store = stores.inMemory()(context)
         byTask.set(context.task, store)
-        return store
+        return keptOpen(store)
       },
     }
   }
