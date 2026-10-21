@@ -1,7 +1,7 @@
 import { ProcessorGraph, type ProcessorSupplier } from './processor-graph.js'
 import type { StreamRecord } from './record.js'
 import { serdes as builtInSerdes, type Serde, type Serdes } from './serde.js'
-import { type NamedStore, type StateStoreSupplier, stores } from './state-store.js'
+import { defaultStoreSupplier, type NamedStore, type StateStoreSupplier } from './state-store.js'
 import { type Sync, type SyncKeyValue, synchronous } from './sync-dsl.js'
 
 export interface StreamsAppConfig {
@@ -11,11 +11,19 @@ export interface StreamsAppConfig {
    * digits, `.`, `_` and `-`.
    */
   applicationId: string
+  /**
+   * The directory local State Stores are kept in, under `<stateDir>/<applicationId>/<task>/`.
+   * With one, State Stores that aren't given a supplier are SQLite databases there; without one,
+   * they are kept in memory. The Test Driver ignores it (see `createTestDriver`).
+   */
+  stateDir?: string
 }
 
 /** The in-process object that defines and runs an application. */
 export interface StreamsApp {
   readonly applicationId: string
+  /** The configured state directory, if any. */
+  readonly stateDir: string | undefined
   /**
    * Declares a Stream read from `topic`, decoded with the given key and value Serdes. A record with
    * a null value (tombstone) arrives as `null`, so the Stream's values are typed `V | null`; drop
@@ -39,7 +47,10 @@ export interface StreamsApp {
 }
 
 export interface StoreOptions {
-  /** Opens the State Store. Defaults to the in-memory store. */
+  /**
+   * Opens the State Store. Defaults to SQLite in the Task's state directory, or to the in-memory
+   * store when there is no state directory.
+   */
   supplier?: StateStoreSupplier
 }
 
@@ -146,7 +157,10 @@ export interface CountOptions {
    * so that the name stays stable as the app changes; without a name one is generated.
    */
   store?: string
-  /** Opens the State Store. Defaults to the in-memory store. */
+  /**
+   * Opens the State Store. Defaults to SQLite in the Task's state directory, or to the in-memory
+   * store when there is no state directory.
+   */
   storeSupplier?: StateStoreSupplier
 }
 
@@ -181,7 +195,7 @@ declare const tableTypes: unique symbol
 const NAME = /^[A-Za-z0-9._-]+$/
 
 export function createStreamsApp(config: StreamsAppConfig): StreamsApp {
-  const { applicationId } = config
+  const { applicationId, stateDir } = config
   if (typeof applicationId !== 'string' || !NAME.test(applicationId)) {
     throw new Error(
       `Invalid Application ID ${JSON.stringify(applicationId)}: use one or more ASCII letters, digits, ".", "_" or "-"`,
@@ -190,6 +204,7 @@ export function createStreamsApp(config: StreamsAppConfig): StreamsApp {
   const graph = new ProcessorGraph(applicationId)
   const app: StreamsApp = {
     applicationId,
+    stateDir,
     stream(topic, serdes) {
       return new StreamNode(graph, graph.addSource(topic, serdes), withTombstones(serdes))
     },
@@ -214,7 +229,7 @@ function addStore(
   graph: ProcessorGraph,
   name: string,
   serdes: Serdes<unknown, unknown>,
-  supplier: StateStoreSupplier = stores.inMemory(),
+  supplier: StateStoreSupplier = defaultStoreSupplier,
 ): void {
   if (typeof name !== 'string' || !NAME.test(name)) {
     throw new Error(

@@ -47,7 +47,17 @@ export interface TestDriver {
 }
 
 /** Read access to a State Store in the Test Driver, decoded with the store's Serdes. */
-export type TestStore<K, V> = Pick<KeyValueStore<K, V>, 'get' | 'all'>
+export type TestStore<K, V> = Pick<KeyValueStore<K, V>, 'get' | 'all' | 'range'>
+
+export interface TestDriverOptions {
+  /**
+   * A state directory for the Test Driver's Task (Task 0), e.g. a temporary directory. State
+   * Stores without a supplier then are SQLite databases under `<stateDir>/<applicationId>/0/`,
+   * as in a real Streams App. By default the Test Driver keeps them in memory, ignoring the
+   * Streams App's `stateDir`, so that each Test Driver starts empty.
+   */
+  stateDir?: string
+}
 
 export interface PipeOptions {
   /** Event Time of the record. Defaults to the Test Driver's wall-clock time, which starts at 0. */
@@ -73,7 +83,7 @@ export interface TestOutputTopic<K, V> {
   readAll(): StreamRecord<K | null, V | null>[]
 }
 
-export function createTestDriver(app: StreamsApp): TestDriver {
+export function createTestDriver(app: StreamsApp, options: TestDriverOptions = {}): TestDriver {
   const graph = processorGraphOf(app)
   let wallClockTime = 0
   const written = new Map<string, SerializedRecord[]>()
@@ -87,6 +97,7 @@ export function createTestDriver(app: StreamsApp): TestDriver {
       written.get(topic)?.push(record)
     },
     () => wallClockTime,
+    { stateDir: options.stateDir },
   )
 
   /** Runs work on the Task, stopping the Streams App if it fails. */
@@ -109,8 +120,8 @@ export function createTestDriver(app: StreamsApp): TestDriver {
     if (!graph.stores.has(name)) {
       throw new Error(`Streams App "${app.applicationId}" has no State Store "${name}"`)
     }
-    const { get, all } = task.store(name)
-    return { get, all }
+    const { get, all, range } = task.store(name)
+    return { get, all, range }
   }
 
   return {

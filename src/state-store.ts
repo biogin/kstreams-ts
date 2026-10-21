@@ -1,7 +1,10 @@
 // State Stores: the pluggable byte-level interface (ADR-0005), the built-in in-memory store, and
 // the typed key-value view Processors and the Test Driver use on top of it.
 
+import { join } from 'node:path'
 import type { SerdeContext, Serdes } from './serde.js'
+import { openSqliteStore } from './sqlite-store.js'
+import { keyOf, storeKey } from './store-key.js'
 
 /**
  * A key-value State Store as implementations provide it: keys and values are bytes, already
@@ -26,6 +29,14 @@ export interface StateStore {
    * store while iterating.
    */
   all(): Iterable<[key: Uint8Array, value: Uint8Array]>
+  /**
+   * The entries whose keys are at least `from` and less than `to`, in ascending key byte order.
+   * An undefined bound leaves that end open. Don't write to the store while iterating.
+   */
+  range(
+    from: Uint8Array | undefined,
+    to: Uint8Array | undefined,
+  ): Iterable<[key: Uint8Array, value: Uint8Array]>
   /** Starts a transaction. Throws if one is already open. */
   begin(): void
   /** Makes the open transaction's writes durable. Throws if no transaction is open. */
@@ -40,6 +51,16 @@ export interface StateStore {
 export interface StateStoreContext {
   /** The name the State Store was given in the Streams App. */
   readonly name: string
+  /** The Application ID of the Streams App. */
+  readonly applicationId: string
+  /** The Task the store belongs to: its partition number. */
+  readonly task: number
+  /**
+   * The Task's state directory, `<stateDir>/<applicationId>/<task>`, for the store's files. It
+   * may not exist yet. Undefined when no state directory is configured (e.g. in the Test Driver),
+   * meaning state is kept in memory.
+   */
+  readonly directory: string | undefined
 }
 
 /** Opens a State Store. Called once per State Store per Task. */
@@ -51,6 +72,26 @@ export const stores = {
   inMemory(): StateStoreSupplier {
     return () => new InMemoryStore()
   },
+  /**
+   * The default durable State Store: a SQLite database (`better-sqlite3`) in the file
+   * `<store>.sqlite` of the Task's state directory, which is created if needed. Without a state
+   * directory the database is kept in memory.
+   */
+  sqlite(): StateStoreSupplier {
+    return ({ name, directory }) => openSqliteStore(directory, name)
+  },
+}
+
+/**
+ * Internal: the supplier of State Stores that aren't given one. SQLite is the default durable
+ * store, used when the Task has a state directory; otherwise the store is kept in memory.
+ */
+export const defaultStoreSupplier: StateStoreSupplier = (context) =>
+  context.directory === undefined ? new InMemoryStore() : stores.sqlite()(context)
+
+/** Internal: the state directory of a Task, under the configured state directory. */
+export function taskDirectory(stateDir: string, applicationId: string, task: number): string {
+  return join(stateDir, applicationId, String(task))
 }
 
 /**
@@ -64,8 +105,18 @@ export interface KeyValueStore<K, V> {
   put(key: K, value: V): void
   /** Removes `key`. Does nothing if it has no value. */
   delete(key: K): void
-  /** Every entry, in ascending order of the serialized key bytes. */
+  /** Every entry, in ascending key order (see `range`). */
   all(): [key: K, value: V][]
+  /**
+   * The entries with keys from `from` to `to`, both included, in ascending key order. Empty when
+   * `from` comes after `to`.
+   *
+   * Keys are ordered by value, not by their Serde bytes: null, then false and true, numbers
+   * numerically, strings by Unicode code point, byte arrays by unsigned bytes, then arrays of
+   * these element by element. Keys of other types (e.g. objects) come last, ordered by their
+   * Serde bytes.
+   */
+  range(from: K, to: K): [key: K, value: V][]
 }
 
 declare const storeTypes: unique symbol
@@ -83,8 +134,10 @@ export function keyValueStore<K, V>(
   serdes: Serdes<K, V>,
   context: SerdeContext,
 ): KeyValueStore<K, V> {
-  const key = (k: K) => serdes.key.serialize(k, context)
+  const key = (k: K) => storeKey(k, serdes.key, context)
   const value = (bytes: Uint8Array) => serdes.value.deserialize(bytes, context)
+  const entries = (found: Iterable<[Uint8Array, Uint8Array]>): [K, V][] =>
+    Array.from(found, ([k, v]) => [keyOf(k, serdes.key, context), value(v)])
   return {
     get(k) {
       const bytes = store.get(key(k))
@@ -98,7 +151,15 @@ export function keyValueStore<K, V>(
       store.delete(key(k))
     },
     all() {
-      return Array.from(store.all(), ([k, v]) => [serdes.key.deserialize(k, context), value(v)])
+      return entries(store.all())
+    },
+    range(from, to) {
+      // A store key is a single self-delimiting part, so `to` followed by a 0 byte is the first
+      // byte string after it: the exclusive end that includes `to`.
+      const end = key(to)
+      const after = new Uint8Array(end.length + 1)
+      after.set(end)
+      return entries(store.range(key(from), after))
     },
   }
 }
@@ -131,7 +192,14 @@ class InMemoryStore implements StateStore {
   }
 
   all(): [Uint8Array, Uint8Array][] {
+    return this.range(undefined, undefined)
+  }
+
+  range(from: Uint8Array | undefined, to: Uint8Array | undefined): [Uint8Array, Uint8Array][] {
+    const low = from === undefined ? undefined : hex(from)
+    const high = to === undefined ? undefined : hex(to)
     return [...this.#entries]
+      .filter(([id]) => (low === undefined || id >= low) && (high === undefined || id < high))
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
       .map(([, { key, value }]) => [key.slice(), value.slice()])
   }

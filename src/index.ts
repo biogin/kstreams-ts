@@ -39,6 +39,7 @@ export {
   createTestDriver,
   type PipeOptions,
   type TestDriver,
+  type TestDriverOptions,
   type TestInputTopic,
   type TestOutputTopic,
   type TestStore,

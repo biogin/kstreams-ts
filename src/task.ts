@@ -15,13 +15,20 @@ import {
   type Serde,
   serializeNullable,
 } from './serde.js'
-import { type KeyValueStore, keyValueStore, type NamedStore } from './state-store.js'
+import { type KeyValueStore, keyValueStore, type NamedStore, taskDirectory } from './state-store.js'
 
 /** Receives every record a sink writes, already serialized with the sink's Serdes. */
 export type RecordCollector = (topic: string, record: SerializedRecord) => void
 
 /** Delivers a deserialized record to one graph node. */
 type Deliver = (record: StreamRecord<unknown, unknown>) => void
+
+export interface TaskOptions {
+  /** The Task's id: its partition number. Defaults to 0. */
+  task?: number
+  /** The configured state directory. Without one, State Stores get no directory. */
+  stateDir?: string | undefined
+}
 
 export interface Task {
   /**
@@ -64,6 +71,7 @@ export function createTask(
   graph: ProcessorGraph,
   collect: RecordCollector,
   wallClockTime: () => number = Date.now,
+  { task = 0, stateDir }: TaskOptions = {},
 ): Task {
   // Async Processor calls of the current record that have not settled yet.
   const inFlight = new Set<Promise<void>>()
@@ -139,7 +147,10 @@ export function createTask(
 
   const stores = new Map<string, KeyValueStore<unknown, unknown>>()
   for (const { name, serdes, supplier, changelogTopic } of graph.stores.values()) {
-    stores.set(name, keyValueStore(supplier({ name }), serdes, { topic: changelogTopic }))
+    const directory =
+      stateDir === undefined ? undefined : taskDirectory(stateDir, graph.applicationId, task)
+    const opened = supplier({ name, applicationId: graph.applicationId, task, directory })
+    stores.set(name, keyValueStore(opened, serdes, { topic: changelogTopic }))
   }
   const store = (ref: string | NamedStore<unknown, unknown>): KeyValueStore<unknown, unknown> => {
     const name = typeof ref === 'string' ? ref : ref.name

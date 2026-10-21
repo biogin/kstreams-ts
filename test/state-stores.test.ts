@@ -1,4 +1,7 @@
-import { describe, expect, expectTypeOf, it } from 'vitest'
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, expectTypeOf, it } from 'vitest'
 import {
   createStreamsApp,
   createTestDriver,
@@ -96,7 +99,9 @@ describe('groupByKey().count()', () => {
     const driver = createTestDriver(app)
     await driver.input<string, string>('clicks').pipe('alice', 'home')
 
-    expect(opened).toEqual([{ name: 'counts' }])
+    expect(opened).toEqual([
+      { name: 'counts', applicationId: 'count-supplier', task: 0, directory: undefined },
+    ])
     expect(driver.store<string, number>('counts').get('alice')).toBe(1)
   })
 
@@ -234,7 +239,8 @@ describe('State Stores in Processors', () => {
       deserialize: (bytes, ctx) => serdes.string.deserialize(bytes, ctx),
     }
     const app = createStreamsApp({ applicationId: 'orders-app' })
-    app.store('totals', { key: spy, value: serdes.string })
+    // The value Serde: string keys are stored with the store key encoding, not their Serde.
+    app.store('totals', { key: serdes.string, value: spy })
     const p = app.processor('p', (ctx: ProcessorContext<string, string | null>) => ({
       process(record: StreamRecord<string, string | null>) {
         if (record.value !== null) ctx.store<string, string>('totals').put(record.key, record.value)
@@ -268,5 +274,139 @@ describe('State Store definition errors', () => {
     const app = createStreamsApp({ applicationId: 'no-store' })
     app.stream('input', strings).to('output')
     expect(() => createTestDriver(app).store('nope')).toThrow(/"nope"/)
+  })
+})
+
+describe('State Store key order and range scans', () => {
+  it('orders keys by their value, not by their Serde bytes', async () => {
+    // serdes.number writes IEEE 754 bytes, whose byte order puts -1 after 10.
+    const app = createStreamsApp({ applicationId: 'key-order' })
+    app
+      .stream('readings', { key: serdes.number, value: serdes.string })
+      .groupByKey()
+      .count({ store: 'per-sensor' })
+
+    const driver = createTestDriver(app)
+    const readings = driver.input<number, string>('readings')
+    for (const sensor of [10, -1, 2, 0.5, -20]) await readings.pipe(sensor, 'x')
+
+    expect(
+      driver
+        .store<number, number>('per-sensor')
+        .all()
+        .map(([key]) => key),
+    ).toEqual([-20, -1, 0.5, 2, 10])
+  })
+
+  it('range-scans a State Store from one key to another, both included', async () => {
+    const app = createStreamsApp({ applicationId: 'range' })
+    const seen = app.store('seen', { key: serdes.string, value: serdes.number })
+    const between: [string, number][][] = []
+    const p = app.processor('p', (ctx: ProcessorContext<string, string | null>) => {
+      const store = ctx.store(seen)
+      return {
+        process(record: StreamRecord<string, string | null>) {
+          store.put(record.key, record.timestamp)
+          between.push(store.range('b', 'd'))
+        },
+      }
+    })
+    app.stream('input', strings).process(p)
+
+    const driver = createTestDriver(app)
+    const input = driver.input<string, string>('input')
+    for (const [i, key] of ['d', 'a', 'c', 'e', 'b', 'bb'].entries()) {
+      await input.pipe(key, 'x', { timestamp: i })
+    }
+
+    expect(between.at(-1)).toEqual([
+      ['b', 4],
+      ['bb', 5],
+      ['c', 2],
+      ['d', 0],
+    ])
+    expect(driver.store(seen).range('a', 'b')).toEqual([
+      ['a', 1],
+      ['b', 4],
+    ])
+    expect(driver.store(seen).range('x', 'a')).toEqual([])
+  })
+
+  it('stores keys its encoding has no order for (e.g. objects) by their Serde bytes', async () => {
+    const app = createStreamsApp({ applicationId: 'object-keys' })
+    const json = serdes.json<{ user: string }>()
+    app.stream('clicks', { key: json, value: serdes.string }).groupByKey().count({ store: 'c' })
+
+    const driver = createTestDriver(app)
+    const clicks = driver.input<{ user: string }, string>('clicks')
+    await clicks.pipe({ user: 'bob' }, 'x')
+    await clicks.pipe({ user: 'alice' }, 'x')
+    await clicks.pipe({ user: 'bob' }, 'x')
+
+    const counts = driver.store<{ user: string }, number>('c')
+    expect(counts.get({ user: 'bob' })).toBe(2)
+    expect(counts.all()).toEqual([
+      [{ user: 'alice' }, 1],
+      [{ user: 'bob' }, 2],
+    ])
+  })
+})
+
+describe('durable State Stores', () => {
+  const tempDirs: string[] = []
+  const tempDir = (): string => {
+    const dir = mkdtempSync(join(tmpdir(), 'kstreams-state-'))
+    tempDirs.push(dir)
+    return dir
+  }
+  afterEach(() => {
+    for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('opens SQLite stores under <stateDir>/<applicationId>/<task>/ by default', async () => {
+    const app = createStreamsApp({ applicationId: 'durable' })
+    app.stream('clicks', strings).groupByKey().count({ store: 'counts' })
+    const stateDir = tempDir()
+
+    const driver = createTestDriver(app, { stateDir })
+    await driver.input<string, string>('clicks').pipe('alice', 'home')
+
+    expect(driver.store<string, number>('counts').get('alice')).toBe(1)
+    expect(existsSync(join(stateDir, 'durable', '0', 'counts.sqlite'))).toBe(true)
+  })
+
+  it('tells the State Store supplier the Task and its state directory', () => {
+    const opened: StateStoreContext[] = []
+    const app = createStreamsApp({ applicationId: 'durable-context' })
+    app.store('s', strings, {
+      supplier: (context) => {
+        opened.push(context)
+        return stores.inMemory()(context)
+      },
+    })
+    const stateDir = tempDir()
+
+    createTestDriver(app, { stateDir })
+
+    expect(opened).toEqual([
+      {
+        name: 's',
+        applicationId: 'durable-context',
+        task: 0,
+        directory: join(stateDir, 'durable-context', '0'),
+      },
+    ])
+  })
+
+  it('keeps State Stores in memory in the Test Driver unless it is given a state directory', async () => {
+    const stateDir = tempDir()
+    const app = createStreamsApp({ applicationId: 'in-memory-driver', stateDir })
+    app.stream('clicks', strings).groupByKey().count({ store: 'counts' })
+
+    const driver = createTestDriver(app)
+    await driver.input<string, string>('clicks').pipe('alice', 'home')
+
+    expect(driver.store<string, number>('counts').get('alice')).toBe(1)
+    expect(readdirSync(stateDir)).toEqual([])
   })
 })
