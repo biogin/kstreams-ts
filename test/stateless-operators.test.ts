@@ -21,7 +21,7 @@ function stringStream(applicationId = 'stateless') {
 describe('filter', () => {
   it('keeps only the records the predicate accepts', () => {
     const { app, stream } = stringStream()
-    stream.filter((key, value) => key !== 'skip' && value.length > 1).to('output')
+    stream.filter((key, value) => key !== 'skip' && value !== null && value.length > 1).to('output')
 
     const driver = createTestDriver(app)
     const input = driver.input<string, string>('input')
@@ -63,7 +63,7 @@ describe('map', () => {
   it('changes key and value types, written with the Serdes given to .to()', () => {
     const { app, stream } = stringStream()
     stream
-      .map((key, value) => ({ key: { user: key }, value: value.length }))
+      .map((key, value) => ({ key: { user: key }, value: value?.length ?? null }))
       .to('output', { key: json<{ user: string }>(), value: json<number>() })
 
     const driver = createTestDriver(app)
@@ -111,7 +111,7 @@ describe('chained stateless operators', () => {
     const peeked: number[] = []
     const { app, stream } = stringStream()
     const lengths = stream
-      .filter((_key, value) => value !== '')
+      .filter((_key, value): value is string => value !== null && value !== '')
       .map((key, value) => ({ key, value: value.length }))
       .peek((_key, length) => peeked.push(length))
     lengths
@@ -150,12 +150,12 @@ describe('chained stateless operators', () => {
 
 // Type-level tests: checked by `npm run typecheck`, not at runtime.
 describe('type inference through the chain', () => {
-  it('infers key and value types from the input Serdes', () => {
+  it('infers key and value types from the input Serdes, with null for tombstones', () => {
     const { stream } = stringStream()
-    expectTypeOf(stream).toEqualTypeOf<Stream<string, string>>()
+    expectTypeOf(stream).toEqualTypeOf<Stream<string, string | null>>()
     stream.filter((key, value) => {
       expectTypeOf(key).toEqualTypeOf<string>()
-      expectTypeOf(value).toEqualTypeOf<string>()
+      expectTypeOf(value).toEqualTypeOf<string | null>()
       return true
     })
   })
@@ -163,6 +163,7 @@ describe('type inference through the chain', () => {
   it('carries the types map returns through the rest of the chain, with no annotations', () => {
     const { stream } = stringStream()
     const chained = stream
+      .filter((_key, value): value is string => value !== null)
       .map((key, value) => ({ key: value.length, value: { name: key, tags: [value] } }))
       .filter((key, value) => {
         expectTypeOf(key).toEqualTypeOf<number>()
@@ -187,7 +188,7 @@ describe('type inference through the chain', () => {
 
   it('requires .to() Serdes that match the mapped types', () => {
     const { stream } = stringStream()
-    const mapped = stream.map((key, value) => ({ key, value: value.length }))
+    const mapped = stream.map((key, value) => ({ key, value: value?.length ?? null }))
     expect(() =>
       // @ts-expect-error a string Serde cannot write number values
       mapped.to('typed', { key: serdes.string, value: serdes.string }),

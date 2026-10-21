@@ -16,8 +16,12 @@ export interface StreamsAppConfig {
 /** The in-process object that defines and runs an application. */
 export interface StreamsApp {
   readonly applicationId: string
-  /** Declares a Stream read from `topic`, decoded with the given key and value Serdes. */
-  stream<K, V>(topic: string, serdes: Serdes<K, V>): Stream<K, V>
+  /**
+   * Declares a Stream read from `topic`, decoded with the given key and value Serdes. A record with
+   * a null value (tombstone) arrives as `null`, so the Stream's values are typed `V | null`; drop
+   * tombstones with a type guard, e.g. `.filter((key, value): value is V => value !== null)`.
+   */
+  stream<K, V>(topic: string, serdes: Serdes<K, V>): Stream<K, V | null>
   /**
    * Registers a Processor under a unique `name`. The supplier is called once per Task with that
    * Task's context. Connect it to a Stream with `stream.process(...)`.
@@ -57,6 +61,9 @@ export interface NamedProcessor<KIn, VIn, KOut, VOut> {
  * Functions passed to its operators must be synchronous (ADR-0012): an async function fails to
  * compile and is rejected when the app is built, and one that returns a Promise throws
  * `AsyncNotAllowedError` on the first record. Async work belongs in a Processor.
+ *
+ * Operators and Processors get every record, tombstones included: where a Stream can carry them
+ * (read from a topic, or the updates of a Table) its value type includes `null`.
  */
 export interface Stream<K, V> {
   /** Keeps only the records for which `predicate` returns true. */
@@ -78,7 +85,7 @@ export interface Stream<K, V> {
    * Writes every record to `topic`. Serdes not given here default to the ones this Stream was
    * read with.
    */
-  to(topic: string, serdes?: Partial<Serdes<K, V>>): void
+  to(topic: string, serdes?: Partial<Serdes<K, NonNullable<V>>>): void
   /**
    * Sends every record to a Processor and returns the Stream of records it forwards. Connecting
    * several Streams to one Processor merges them; each call returns that same output Stream. The
@@ -87,21 +94,48 @@ export interface Stream<K, V> {
   process<KOut, VOut>(processor: NamedProcessor<K, V, KOut, VOut>): Stream<KOut, VOut>
   /**
    * Groups the records by their current key, to aggregate them per key. Needs a key Serde for the
-   * aggregation's State Store: pass one if this Stream has none (e.g. after `map`).
+   * aggregation's State Store: pass one if this Stream has none (e.g. after `map`). The value Serde
+   * is used by `reduce`. Aggregations skip tombstones, so the grouped values are never null.
    */
-  groupByKey(serdes?: Partial<Serdes<K, V>>): GroupedStream<K, V>
+  groupByKey(serdes?: Partial<Serdes<K, NonNullable<V>>>): GroupedStream<K, NonNullable<V>>
 }
 
 type KeyOf<R> = R extends { key: infer KOut } ? KOut : never
 type ValueOf<R> = R extends { value: infer VOut } ? VOut : never
 
-/** A Stream grouped by key, ready to be aggregated per key. */
+/**
+ * A Stream grouped by key, ready to be aggregated per key into a Table. Like Kafka Streams, every
+ * aggregation skips records with a null key or a null value (tombstone). Each update of the Table
+ * is forwarded with the Event Time of the record that caused it.
+ */
 export interface GroupedStream<K, V> {
-  /**
-   * Counts the records of each key into a Table. Records with a null key or a null value
-   * (tombstone) are skipped and not counted.
-   */
+  /** Counts the records of each key into a Table. */
   count(options?: CountOptions): Table<K, number>
+  /**
+   * Folds the records of each key into a Table: `aggregator` gets each record and the key's
+   * current aggregate (from `initializer` when the key has none) and returns the new aggregate.
+   * Returning null deletes the key from the Table and forwards a tombstone; the key's next record
+   * starts again from `initializer`. `options.serde` stores the aggregates.
+   */
+  aggregate<
+    VA,
+    RI extends VA | PromiseLike<unknown> = VA,
+    RA extends VA | null | PromiseLike<unknown> = VA | null,
+  >(
+    initializer: () => Sync<RI>,
+    aggregator: (key: K, value: V, aggregate: VA) => Sync<RA>,
+    options: AggregateOptions<VA>,
+  ): Table<K, VA>
+  /**
+   * Combines the values of each key into a Table: the first value of a key is stored as is, and
+   * each later one is combined with the stored value by `reducer`. Returning null deletes the key
+   * and forwards a tombstone. Stores with `options.serde`, else the value Serde of the grouped
+   * Stream; throws if there is neither.
+   */
+  reduce<R extends V | null | PromiseLike<unknown> = V | null>(
+    reducer: (aggregate: V, value: V, key: K) => Sync<R>,
+    options?: ReduceOptions<V>,
+  ): Table<K, V>
   /** Type-only: the key and value types of the grouped records. */
   readonly [recordTypes]?: { key: K; value: V }
 }
@@ -116,10 +150,28 @@ export interface CountOptions {
   storeSupplier?: StateStoreSupplier
 }
 
+export interface AggregateOptions<VA> extends CountOptions {
+  /** Serializes the aggregates in the State Store, and in the Table's Stream by default. */
+  serde: Serde<VA>
+}
+
+export interface ReduceOptions<V> extends CountOptions {
+  /**
+   * Serializes the values in the State Store, and in the Table's Stream by default. Defaults to
+   * the value Serde of the grouped Stream.
+   */
+  serde?: Serde<V>
+}
+
 /** A keyed view where each record is an upsert of the latest value for its key. */
 export interface Table<K, V> {
   /** The name of the State Store the Table is kept in. */
   readonly store: string
+  /**
+   * The Stream of the Table's updates: one record per change, with the key's new value, or a
+   * tombstone (null) when the key is deleted. It has the Table's Serdes, so `.to()` needs none.
+   */
+  toStream(): Stream<K, V | null>
   /** Type-only: the key and value types of the Table. */
   readonly [tableTypes]?: { key: K; value: V }
 }
@@ -139,7 +191,7 @@ export function createStreamsApp(config: StreamsAppConfig): StreamsApp {
   const app: StreamsApp = {
     applicationId,
     stream(topic, serdes) {
-      return new StreamNode(graph, graph.addSource(topic, serdes), serdes)
+      return new StreamNode(graph, graph.addSource(topic, serdes), withTombstones(serdes))
     },
     processor(name, supplier) {
       if (typeof name !== 'string' || name === '') {
@@ -196,10 +248,10 @@ export function processorGraphOf(app: StreamsApp): ProcessorGraph {
 class StreamNode<K, V> implements Stream<K, V> {
   readonly #graph: ProcessorGraph
   readonly #node: string
-  /** Serdes known to fit this Stream's records, inherited from its input topic. */
-  readonly #serdes: Partial<Serdes<K, V>>
+  /** Serdes known to fit this Stream's records, inherited from its input topic or Table. */
+  readonly #serdes: Partial<Serdes<K, NonNullable<V>>>
 
-  constructor(graph: ProcessorGraph, node: string, serdes: Partial<Serdes<K, V>>) {
+  constructor(graph: ProcessorGraph, node: string, serdes: Partial<Serdes<K, NonNullable<V>>>) {
     this.#graph = graph
     this.#node = node
     this.#serdes = serdes
@@ -251,12 +303,12 @@ class StreamNode<K, V> implements Stream<K, V> {
   /** Adds a Processor downstream of this Stream and returns the Stream of what it forwards. */
   #then<KOut, VOut>(
     supplier: ProcessorSupplier<K, V, KOut, VOut>,
-    serdes: Partial<Serdes<KOut, VOut>>,
+    serdes: Partial<Serdes<KOut, NonNullable<VOut>>>,
   ): Stream<KOut, VOut> {
     return new StreamNode(this.#graph, this.#graph.addProcessor(supplier, [this.#node]), serdes)
   }
 
-  to(topic: string, serdes: Partial<Serdes<K, V>> = {}): void {
+  to(topic: string, serdes: Partial<Serdes<K, NonNullable<V>>> = {}): void {
     const key = serdes.key ?? this.#serdes.key
     const value = serdes.value ?? this.#serdes.value
     this.#graph.addSink(
@@ -266,12 +318,13 @@ class StreamNode<K, V> implements Stream<K, V> {
     )
   }
 
-  groupByKey(serdes: Partial<Serdes<K, V>> = {}): GroupedStream<K, V> {
+  groupByKey(serdes: Partial<Serdes<K, NonNullable<V>>> = {}): GroupedStream<K, NonNullable<V>> {
     const key = serdes.key ?? this.#serdes.key
     if (key === undefined) {
       throw new Error('No key Serde for groupByKey: pass one to .groupByKey({ key })')
     }
-    return new GroupedStreamNode(this.#graph, this.#node, key)
+    const value = serdes.value ?? this.#serdes.value
+    return new GroupedStreamNode(this.#graph, this.#node, { key, value })
   }
 
   process<KOut, VOut>(processor: NamedProcessor<K, V, KOut, VOut>): Stream<KOut, VOut> {
@@ -287,36 +340,100 @@ class StreamNode<K, V> implements Stream<K, V> {
 class GroupedStreamNode<K, V> implements GroupedStream<K, V> {
   readonly #graph: ProcessorGraph
   readonly #node: string
-  readonly #key: Serde<K>
+  readonly #serdes: { key: Serde<K>; value: Serde<V> | undefined }
 
-  constructor(graph: ProcessorGraph, node: string, key: Serde<K>) {
+  constructor(
+    graph: ProcessorGraph,
+    node: string,
+    serdes: { key: Serde<K>; value: Serde<V> | undefined },
+  ) {
     this.#graph = graph
     this.#node = node
-    this.#key = key
+    this.#serdes = serdes
   }
 
   count(options: CountOptions = {}): Table<K, number> {
-    const store = options.store ?? this.#graph.storeName('count')
-    addStore(
-      this.#graph,
-      store,
-      { key: this.#key, value: builtInSerdes.number },
-      options.storeSupplier,
+    return this.#aggregation('count', builtInSerdes.number, options, (_key, _value, count) => {
+      return (count ?? 0) + 1
+    })
+  }
+
+  aggregate<VA>(
+    initializer: () => unknown,
+    aggregator: (key: K, value: V, aggregate: VA) => unknown,
+    options: AggregateOptions<VA>,
+  ): Table<K, VA> {
+    // Once Promises are ruled out (at runtime by `synchronous`), these return aggregates.
+    const initial = synchronous('aggregate', initializer) as () => VA
+    const next = synchronous('aggregate', aggregator) as (key: K, value: V, aggregate: VA) => VA
+    return this.#aggregation('aggregate', options.serde, options, (key, value, aggregate) =>
+      next(key, value, aggregate === undefined ? initial() : aggregate),
     )
+  }
+
+  reduce(
+    reducer: (aggregate: V, value: V, key: K) => unknown,
+    options: ReduceOptions<V> = {},
+  ): Table<K, V> {
+    const combine = synchronous('reduce', reducer) as (aggregate: V, value: V, key: K) => V
+    const serde = options.serde ?? this.#serdes.value
+    if (serde === undefined) {
+      throw new Error(
+        'No value Serde for reduce: pass one to .reduce(reducer, { serde }) or to .groupByKey({ value })',
+      )
+    }
+    return this.#aggregation('reduce', serde, options, (key, value, aggregate) =>
+      aggregate === undefined ? value : combine(aggregate, value, key),
+    )
+  }
+
+  /**
+   * Adds a State Store and a Processor that keeps, per key, the result of `update` on the key's
+   * current value (undefined if none). A null result deletes the key and forwards a tombstone.
+   */
+  #aggregation<VA>(
+    operator: string,
+    serde: Serde<VA>,
+    options: CountOptions,
+    update: (key: K, value: V, aggregate: VA | undefined) => VA | null,
+  ): Table<K, VA> {
+    const store = options.store ?? this.#graph.storeName(operator)
+    const serdes = { key: this.#serdes.key, value: serde }
+    addStore(this.#graph, store, serdes, options.storeSupplier)
     // Like Kafka Streams, aggregations skip records without a key or with a tombstone value.
-    const supplier: ProcessorSupplier<K | null, V | null, K, number> = (ctx) => {
-      const counts = ctx.store<K, number>(store)
+    const supplier: ProcessorSupplier<K | null, V | null, K, VA | null> = (ctx) => {
+      const aggregates = ctx.store<K, VA>(store)
       return {
         process({ key, value, timestamp }) {
           if (key === null || value === null) return
-          const count = (counts.get(key) ?? 0) + 1
-          counts.put(key, count)
-          ctx.forward({ key, value: count, timestamp })
+          const aggregate = update(key, value, aggregates.get(key))
+          if (aggregate === null) aggregates.delete(key)
+          else aggregates.put(key, aggregate)
+          ctx.forward({ key, value: aggregate, timestamp })
         },
       }
     }
-    this.#graph.addProcessor(supplier, [this.#node])
-    return { store }
+    const node = this.#graph.addProcessor(supplier, [this.#node])
+    return new TableNode(this.#graph, node, store, serdes)
+  }
+}
+
+class TableNode<K, V> implements Table<K, V> {
+  readonly store: string
+  readonly #graph: ProcessorGraph
+  /** The Processor that keeps the Table and forwards its updates. */
+  readonly #node: string
+  readonly #serdes: Serdes<K, V>
+
+  constructor(graph: ProcessorGraph, node: string, store: string, serdes: Serdes<K, V>) {
+    this.#graph = graph
+    this.#node = node
+    this.store = store
+    this.#serdes = serdes
+  }
+
+  toStream(): Stream<K, V | null> {
+    return new StreamNode(this.#graph, this.#node, withTombstones(this.#serdes))
   }
 }
 
@@ -325,4 +442,9 @@ function required<T>(serde: Serde<T> | undefined, part: 'key' | 'value', topic: 
     throw new Error(`No ${part} Serde for output topic "${topic}": pass one to .to()`)
   }
   return serde
+}
+
+/** A Serde never sees null, so the Serdes of `V` are those of a Stream of `V | null` too. */
+function withTombstones<K, V>(serdes: Serdes<K, V>): Serdes<K, NonNullable<V | null>> {
+  return serdes as Serdes<K, NonNullable<V | null>>
 }

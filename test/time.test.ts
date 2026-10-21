@@ -18,12 +18,12 @@ const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
  */
 function timerApp(intervalMs: number, type: TimerType) {
   const app = createStreamsApp({ applicationId: `timer-${type}` })
-  const ticker = app.processor('ticker', (ctx: ProcessorContext<string, string>) => {
+  const ticker = app.processor('ticker', (ctx: ProcessorContext<string, string | null>) => {
     ctx.schedule(intervalMs, type, (timestamp) => {
       ctx.forward({ key: 'tick', value: String(timestamp), timestamp })
     })
     return {
-      process(record: StreamRecord<string, string>) {
+      process(record: StreamRecord<string, string | null>) {
         ctx.forward(record)
       },
     }
@@ -109,7 +109,7 @@ describe('Stream Time timers', () => {
 
   it('can be cancelled', async () => {
     const app = createStreamsApp({ applicationId: 'cancel' })
-    const once = app.processor('once', (ctx: ProcessorContext<string, string>) => {
+    const once = app.processor('once', (ctx: ProcessorContext<string, string | null>) => {
       const timer = ctx.schedule(10, 'stream-time', (timestamp) => {
         ctx.forward({ key: 'tick', value: 'once', timestamp })
         timer.cancel()
@@ -129,10 +129,10 @@ describe('Stream Time timers', () => {
 
   it('can be scheduled while processing a record, starting from the current Stream Time', async () => {
     const app = createStreamsApp({ applicationId: 'timeout' })
-    const timeout = app.processor('timeout', (ctx: ProcessorContext<string, string>) => {
+    const timeout = app.processor('timeout', (ctx: ProcessorContext<string, string | null>) => {
       let armed = false
       return {
-        process(record: StreamRecord<string, string>) {
+        process(record: StreamRecord<string, string | null>) {
           if (armed) return
           armed = true
           const timer = ctx.schedule(30, 'stream-time', (timestamp) => {
@@ -158,7 +158,7 @@ describe('Stream Time timers', () => {
   it('fire after the record that advanced Stream Time is fully processed, async ones awaited', async () => {
     const events: string[] = []
     const app = createStreamsApp({ applicationId: 'async-timer' })
-    const slow = app.processor('slow', (ctx: ProcessorContext<string, string>) => {
+    const slow = app.processor('slow', (ctx: ProcessorContext<string, string | null>) => {
       ctx.schedule(10, 'stream-time', async (timestamp) => {
         events.push(`timer ${timestamp} start`)
         await delay(5)
@@ -166,7 +166,7 @@ describe('Stream Time timers', () => {
         ctx.forward({ key: 'tick', value: String(timestamp), timestamp })
       })
       return {
-        async process(record: StreamRecord<string, string>) {
+        async process(record: StreamRecord<string, string | null>) {
           events.push(`record ${record.value} start`)
           await delay(5)
           events.push(`record ${record.value} end`)
@@ -196,7 +196,7 @@ describe('Stream Time timers', () => {
 
   it('reject an interval that is not a positive number', () => {
     const app = createStreamsApp({ applicationId: 'bad-interval' })
-    const bad = app.processor('bad', (ctx: ProcessorContext<string, string>) => {
+    const bad = app.processor('bad', (ctx: ProcessorContext<string, string | null>) => {
       ctx.schedule(0, 'stream-time', () => {})
       return { process() {} }
     })
@@ -238,12 +238,12 @@ describe('wall-clock timers', () => {
   it('wait for queued records before firing', async () => {
     const events: string[] = []
     const app = createStreamsApp({ applicationId: 'wall-clock-queue' })
-    const slow = app.processor('slow', (ctx: ProcessorContext<string, string>) => {
+    const slow = app.processor('slow', (ctx: ProcessorContext<string, string | null>) => {
       ctx.schedule(10, 'wall-clock-time', (timestamp) => {
         events.push(`timer ${timestamp}`)
       })
       return {
-        async process(record: StreamRecord<string, string>) {
+        async process(record: StreamRecord<string, string | null>) {
           await delay(5)
           events.push(`record ${record.value}`)
         },
@@ -260,7 +260,7 @@ describe('wall-clock timers', () => {
 
   it('stop the Streams App when a timer throws', async () => {
     const app = createStreamsApp({ applicationId: 'timer-throws' })
-    const boom = app.processor('boom', (ctx: ProcessorContext<string, string>) => {
+    const boom = app.processor('boom', (ctx: ProcessorContext<string, string | null>) => {
       ctx.schedule(10, 'wall-clock-time', () => {
         throw new Error('boom')
       })
