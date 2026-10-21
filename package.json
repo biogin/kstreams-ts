@@ -23,9 +23,12 @@
     "lint": "biome check .",
     "format": "biome check --write .",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "kafka": "scripts/kafka-local.sh"
   },
   "dependencies": {
+    "@platformatic/kafka": "^2.14.0",
     "better-sqlite3": "^13.0.3"
   },
   "devDependencies": {
