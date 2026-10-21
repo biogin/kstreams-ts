@@ -79,17 +79,6 @@ describe('Application State', () => {
     expect(app.state).toBe('created')
   })
 
-  it('refuses to start an exactly-once app with State Stores (not implemented yet)', async () => {
-    const app = createStreamsApp({
-      applicationId: 'eos-stateful',
-      brokers: ['localhost:9092'],
-      guarantee: 'exactly-once',
-    })
-    app.stream('input', { key: serdes.string, value: serdes.string }).groupByKey().count()
-    await expect(app.start()).rejects.toThrow(/exactly-once with State Stores is not implemented/)
-    expect(app.state).toBe('created')
-  })
-
   it('refuses to start an app that reads no topic', async () => {
     const app = createStreamsApp({ applicationId: 'empty', brokers: ['localhost:9092'] })
     await expect(app.start()).rejects.toThrow(/reads no topic/)

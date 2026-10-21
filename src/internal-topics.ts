@@ -38,9 +38,14 @@ export async function ensureChangelogs(
           configs: [{ name: 'cleanup.policy', value: 'compact' }],
         })
         .catch(async (error: unknown) => {
-          // Fine if another instance, started at the same time, created them first.
-          const now = new Set(await admin.listTopics())
-          if (missing.some((topic) => !now.has(topic))) throw error
+          // Fine if they exist after all: another instance, started at the same time, created them
+          // first, or the broker's metadata didn't list them yet (it can lag behind a creation).
+          for (let attempt = 0; attempt < 20; attempt++) {
+            const now = new Set(await admin.listTopics())
+            if (missing.every((topic) => now.has(topic))) return
+            await new Promise((resolve) => setTimeout(resolve, 100))
+          }
+          throw error
         })
     }
     await checkPartitions(admin, changelogs, partitions)

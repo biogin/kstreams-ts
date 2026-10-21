@@ -17,7 +17,13 @@ import {
   type Serde,
   serializeNullable,
 } from './serde.js'
-import { type KeyValueStore, keyValueStore, type NamedStore, taskDirectory } from './state-store.js'
+import {
+  type KeyValueStore,
+  keyValueStore,
+  type NamedStore,
+  type StateStore,
+  taskDirectory,
+} from './state-store.js'
 
 /** Receives every record a sink writes, already serialized with the sink's Serdes. */
 export type RecordCollector = (topic: string, record: SerializedRecord) => void
@@ -45,6 +51,14 @@ export interface TaskOptions {
    * gives Restore each one's Checkpoint (see checkpoint.ts).
    */
   restore?: ((stores: RestoringStore[]) => Promise<ReadonlyMap<string, bigint>>) | undefined
+  /**
+   * Under exactly-once: the Task's State Store writes go into store transactions (ADR-0002). One
+   * begins on every store before the Task's first record or timer after Restore or the last
+   * commit, and stays open until `commit` (once the Kafka transaction with the writes' Changelog
+   * records has committed) or `rollback` (when it aborted). Committing a store transaction then
+   * doesn't make the Checkpoint unclean: the Changelog already has every write it adds.
+   */
+  storeTransactions?: boolean | undefined
 }
 
 /** Changelog offsets by Changelog topic, for one Task's partition of each. */
@@ -75,10 +89,27 @@ export interface Task {
   /** The Task's counters so far. */
   metrics(): TaskMetrics
   /**
+   * Resolves once the Task's State Stores are restored (right away without Restore). Rejects if
+   * Restore failed.
+   */
+  restored(): Promise<void>
+  /**
+   * Commits the open store transactions (see {@link TaskOptions.storeTransactions}), if any.
+   * Call it only once the Changelog records of their writes are committed, and when no record is
+   * being processed.
+   */
+  commit(): void
+  /**
+   * Rolls back the open store transactions, if any: every store write since the last commit is
+   * undone. The Task's other state (Stream Time, timers) is not; a Task whose batch was aborted
+   * should be closed.
+   */
+  rollback(): void
+  /**
    * Writes the Checkpoint of the Task's persistent State Stores, if they were written since the
    * last one. Call it only once the Changelog records of every store write so far are
    * acknowledged, with `committed` holding the offset after the last of them in each Changelog
-   * written to, and when no record is being processed.
+   * written to, and when no record is being processed nor any store transaction open.
    */
   checkpoint(committed: ChangelogOffsets): void
   /** Closes the Task's State Stores. Without a Checkpoint first, they are unclean. */
@@ -124,7 +155,7 @@ export function createTask(
   graph: ProcessorGraph,
   collect: RecordCollector,
   wallClockTime: () => number = Date.now,
-  { task = 0, stateDir, changelog, restore }: TaskOptions = {},
+  { task = 0, stateDir, changelog, restore, storeTransactions }: TaskOptions = {},
 ): Task {
   // Async Processor calls of the current record that have not settled yet.
   const inFlight = new Set<Promise<void>>()
@@ -204,12 +235,13 @@ export function createTask(
     stateDir === undefined ? undefined : taskDirectory(stateDir, graph.applicationId, task)
   /** The Checkpoint of the persistent stores, which only a Task that is restored keeps. */
   let checkpoint: TaskCheckpoint | undefined
+  const transactional = storeTransactions === true
   for (const node of graph.stores.values()) {
     const { name, serdes, supplier, changelogTopic, keyEncoding } = node
     let store = supplier({ name, applicationId: graph.applicationId, task, directory })
     let restoreFrom: bigint | undefined
     if (directory !== undefined && restore !== undefined && store.persistent === true) {
-      checkpoint ??= new TaskCheckpoint(directory)
+      checkpoint ??= new TaskCheckpoint(directory, { changelogFirst: transactional })
       restoreFrom = checkpoint.offset(name)
       store = checkpoint.track(name, store)
     }
@@ -338,28 +370,68 @@ export function createTask(
   }
 
   // The first job: everything else queues behind it. Its failure fails the Task's later work.
+  let restored: Promise<void> = Promise.resolve()
   if (restore !== undefined && opened.length > 0) {
-    enqueue(async () => {
-      const restored = await restore(opened)
-      for (const [name, offset] of restored) checkpoint?.advance(name, offset)
+    restored = enqueue(async () => {
+      const applied = await restore(opened)
+      for (const [name, offset] of applied) checkpoint?.advance(name, offset)
       // Restore's own writes are in the Changelog already.
       checkpoint?.write()
-    }).catch(() => {})
+    })
+    restored.catch(() => {})
+  }
+
+  /** Whether the stores have an open store transaction. */
+  let inTransaction = false
+  /** Runs `job` in the open store transaction, beginning one first if needed. */
+  const transacted = (job: () => Promise<void> | undefined) => (): Promise<void> | undefined => {
+    if (transactional && !inTransaction && opened.length > 0) {
+      for (const { store } of opened) store.begin()
+      inTransaction = true
+    }
+    return job()
+  }
+  /** Ends the open store transaction of every store, with `end`. */
+  const endTransaction = (end: (store: StateStore) => void): void => {
+    if (!inTransaction) return
+    inTransaction = false
+    let first: { error: unknown } | undefined
+    for (const { store } of opened) {
+      try {
+        end(store)
+      } catch (error) {
+        first ??= { error }
+      }
+    }
+    if (first !== undefined) throw first.error
   }
 
   return {
     process(topic, record) {
-      return enqueue(() => run(topic, record))
+      return enqueue(transacted(() => run(topic, record)))
     },
     fireWallClockTimers() {
-      return enqueue(() => fireDue('wall-clock-time', wallClockTime()))
+      return enqueue(transacted(() => fireDue('wall-clock-time', wallClockTime())))
     },
     store,
     metrics: () => ({ ...metrics }),
+    restored: () => restored,
+    commit() {
+      if (pending !== undefined) {
+        throw new Error('Cannot commit store transactions while records are processed')
+      }
+      endTransaction((store) => store.commit())
+    },
+    rollback() {
+      endTransaction((store) => store.rollback())
+    },
     checkpoint(committed) {
       if (checkpoint === undefined || failure !== undefined) return
       if (pending !== undefined)
         throw new Error('Cannot write a Checkpoint while records are processed')
+      if (inTransaction) {
+        throw new Error('Cannot write a Checkpoint while a store transaction is open')
+      }
       for (const { node } of opened) {
         const offset = committed.get(node.changelogTopic)
         if (offset !== undefined) checkpoint.advance(node.name, offset)

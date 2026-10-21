@@ -68,6 +68,7 @@ function fakeChangelog(start = 0n) {
 function counterTask(
   log: ReturnType<typeof fakeChangelog>,
   supplier: StateStoreSupplier = stores.sqlite(),
+  storeTransactions = false,
 ): Task {
   const app = createStreamsApp({ applicationId })
   const counts = app.store('counts', { key: serdes.string, value: serdes.number }, { supplier })
@@ -83,6 +84,7 @@ function counterTask(
     // Store writes go to the in-memory Changelog, as the broker would acknowledge them.
     changelog: (_topic, { key, value }) => log.records.push({ key, value }),
     restore: (opened) => restoreStores(opened, 0, log.reader),
+    storeTransactions,
   })
   open.push(task)
   return task
@@ -253,3 +255,127 @@ describe('Checkpoints of persistent State Stores', () => {
 function entries(t: Task): unknown {
   return t.store('counts').all()
 }
+
+describe('Store transactions under exactly-once (ADR-0002)', () => {
+  /** A counter Task whose store writes go into store transactions. */
+  const transactional = (log: ReturnType<typeof fakeChangelog>) =>
+    counterTask(log, stores.sqlite(), true)
+
+  /** The exactly-once commit: Kafka has committed, then the store transaction and the Checkpoint. */
+  function commitAll(task: Task, log: ReturnType<typeof fakeChangelog>): void {
+    task.commit()
+    commit(task, log)
+  }
+
+  it('restores before the first store transaction begins', async () => {
+    const log = fakeChangelog()
+    log.records.push({ key: text('a'), value: serdes.number.serialize(5, context) })
+    const task = transactional(log)
+    await task.restored()
+
+    expect(count(task, 'a')).toBe(5)
+    await pipe(task, 'a')
+    commitAll(task, log)
+    expect(count(task, 'a')).toBe(6)
+  })
+
+  it('keeps the writes until commit; rollback undoes every write since the last commit', async () => {
+    const log = fakeChangelog()
+    const task = transactional(log)
+    await pipe(task, 'a', 'b')
+    commitAll(task, log)
+
+    await pipe(task, 'a', 'c')
+    expect(count(task, 'a')).toBe(2)
+    task.rollback()
+
+    expect(count(task, 'a')).toBe(1)
+    expect(count(task, 'c')).toBeUndefined()
+    // The next record begins a new store transaction.
+    await pipe(task, 'c')
+    commitAll(task, log)
+    expect(count(task, 'c')).toBe(1)
+  })
+
+  it('keeps the Checkpoint through the writes and their commit, then advances it', async () => {
+    const log = fakeChangelog()
+    const task = transactional(log)
+    await pipe(task, 'a')
+    commitAll(task, log)
+    expect(readCheckpoint(directory)).toEqual(new Map([['counts', 1n]]))
+
+    await pipe(task, 'a', 'b')
+    expect(readCheckpoint(directory)).toEqual(new Map([['counts', 1n]]))
+    task.commit()
+    // The Changelog already has everything the store commit adds: still a usable Checkpoint.
+    expect(readCheckpoint(directory)).toEqual(new Map([['counts', 1n]]))
+    commit(task, log)
+    expect(readCheckpoint(directory)).toEqual(new Map([['counts', 3n]]))
+  })
+
+  it('refuses to write a Checkpoint while a store transaction is open', async () => {
+    const log = fakeChangelog()
+    const task = transactional(log)
+    await pipe(task, 'a')
+
+    expect(() => commit(task, log)).toThrow(/store transaction/)
+  })
+
+  it('a crash after the Kafka commit, before the store commit: replays the batch from the Checkpoint', async () => {
+    const log = fakeChangelog()
+    const first = transactional(log)
+    await pipe(first, 'a', 'b')
+    commitAll(first, log)
+    // Committed to the Changelog (Kafka committed), but the process dies before the store commit.
+    await pipe(first, 'a', 'a')
+    close(first)
+
+    const second = transactional(log)
+    await pipe(second, 'a')
+    commitAll(second, log)
+
+    expect(log.reads.at(-1)).toBe(2n)
+    expect(count(second, 'a')).toBe(4)
+    expect(count(second, 'b')).toBe(1)
+  })
+
+  it('a crash after the store commit, before the Checkpoint: replaying the batch again is harmless', async () => {
+    const log = fakeChangelog()
+    const first = transactional(log)
+    await pipe(first, 'a', 'b')
+    commitAll(first, log)
+    await pipe(first, 'a', 'c')
+    first.commit()
+    close(first)
+
+    const second = transactional(log)
+    await pipe(second, 'a')
+    commitAll(second, log)
+
+    expect(log.reads.at(-1)).toBe(2n)
+    expect(entries(second)).toEqual([
+      ['a', 3],
+      ['b', 1],
+      ['c', 1],
+    ])
+  })
+
+  it('an aborted batch: rolled back, and restored from the Checkpoint without a wipe', async () => {
+    const log = fakeChangelog()
+    const first = transactional(log)
+    await pipe(first, 'a')
+    commitAll(first, log)
+    await pipe(first, 'a', 'ghost')
+    // The Kafka transaction aborts: read_committed readers never see its Changelog records.
+    log.records.splice(1)
+    first.rollback()
+    close(first)
+
+    const second = transactional(log)
+    await pipe(second, 'a')
+    commitAll(second, log)
+
+    expect(log.reads.at(-1)).toBe(1n)
+    expect(entries(second)).toEqual([['a', 2]])
+  })
+})
