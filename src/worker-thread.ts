@@ -6,6 +6,8 @@
 // about its failure, over the messages below.
 
 import { Worker as Thread } from 'node:worker_threads'
+import { DeserializationError } from './serde.js'
+import { AsyncNotAllowedError } from './sync-dsl.js'
 import type { Worker } from './worker.js'
 
 /** What the thread needs to rebuild the app and run its Worker. */
@@ -22,7 +24,10 @@ export type ToWorkerThread = { type: 'stop' }
 export type FromWorkerThread =
   | { type: 'running' }
   | { type: 'stopped' }
-  /** The Worker couldn't start, or stopped because of an error; it has closed its clients. */
+  /**
+   * The Worker couldn't start, or stopped because of an error; it has closed its clients. The
+   * error is sent as {@link transferableError} made it.
+   */
   | { type: 'failed'; error: unknown }
 
 export interface WorkerThreadOptions {
@@ -81,7 +86,7 @@ export function startWorkerThread(options: WorkerThreadOptions): Promise<Worker>
       void thread.terminate()
       onStopped?.()
     } else {
-      fail(message.error)
+      fail(errorFromThread(message.error))
     }
   })
   // An uncaught exception in the thread, e.g. thrown by the App Module.
@@ -121,4 +126,88 @@ export function startWorkerThread(options: WorkerThreadOptions): Promise<Worker>
   return new Promise<Worker>((resolve, reject) => {
     onStart = { resolve, reject }
   })
+}
+
+// Errors cross the thread boundary by structured clone, which keeps only the message, the stack
+// and the cause of an Error, and turns every Error subclass into a plain Error. So the thread sends
+// an error as below, and the main thread rebuilds it: as an instance of its class for the library's
+// errors and JavaScript's built-in ones, with every own property that can be copied (e.g. the
+// `topic` of a DeserializationError, or the `code` of a Kafka client error).
+
+/** The classes errors keep across the thread boundary, by `name`. */
+const ERROR_CLASSES: Readonly<Record<string, { prototype: Error }>> = {
+  AsyncNotAllowedError,
+  DeserializationError,
+  AggregateError,
+  EvalError,
+  RangeError,
+  ReferenceError,
+  SyntaxError,
+  TypeError,
+  URIError,
+}
+
+/** An Error as a worker thread sends it. */
+interface TransferredError {
+  kstreamsTransferredError: true
+  name: string
+  stack: string | undefined
+  /** Own data properties: name, value, and whether it is enumerable. */
+  properties: [string, unknown, boolean][]
+}
+
+/** Internal, for the thread side: `error` as it can be posted to the main thread. */
+export function transferableError(error: unknown, depth = 0): unknown {
+  if (!(error instanceof Error)) return cloneable(error) ? error : String(error)
+  // A cause chain that loops back is cut off.
+  if (depth > 10) return error.message
+  const properties: [string, unknown, boolean][] = []
+  for (const name of Object.getOwnPropertyNames(error)) {
+    const descriptor = Object.getOwnPropertyDescriptor(error, name)
+    if (name === 'stack' || descriptor === undefined || !('value' in descriptor)) continue
+    const value: unknown = descriptor.value
+    if (value instanceof Error || name === 'cause') {
+      properties.push([name, transferableError(value, depth + 1), descriptor.enumerable === true])
+    } else if (cloneable(value)) {
+      properties.push([name, value, descriptor.enumerable === true])
+    }
+  }
+  return {
+    kstreamsTransferredError: true,
+    name: error.name,
+    stack: error.stack,
+    properties,
+  } satisfies TransferredError
+}
+
+/** Internal, for the main thread: the error a worker thread sent, rebuilt. */
+export function errorFromThread(sent: unknown): unknown {
+  if (!isTransferred(sent)) return sent
+  const known = Object.hasOwn(ERROR_CLASSES, sent.name) ? ERROR_CLASSES[sent.name] : undefined
+  const error = Object.create((known ?? Error).prototype) as Error
+  const define = (name: string, value: unknown, enumerable: boolean) =>
+    Object.defineProperty(error, name, { value, enumerable, writable: true, configurable: true })
+  if (sent.stack !== undefined) define('stack', sent.stack, false)
+  if (error.name !== sent.name) define('name', sent.name, false)
+  for (const [name, value, enumerable] of sent.properties) {
+    define(name, errorFromThread(value), enumerable)
+  }
+  return error
+}
+
+function isTransferred(value: unknown): value is TransferredError {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    (value as Partial<TransferredError>).kstreamsTransferredError === true
+  )
+}
+
+function cloneable(value: unknown): boolean {
+  try {
+    structuredClone(value)
+    return true
+  } catch {
+    return false
+  }
 }
