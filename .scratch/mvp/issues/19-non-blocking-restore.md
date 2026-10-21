@@ -14,6 +14,6 @@
 
 - `@platformatic/kafka` has no per-partition pause, `assign()` or `seek()`. Pausing only the restoring Task (ADR-0009) is done by holding that Task's incoming records in memory until its Restore completes (bounded; document the memory trade-off).
 - The restore consumer can use the low-level `consumer.fetch()` without a group, and it skips aborted transactions. Loop until the read_committed end offset, because transaction markers take up offsets (tested).
-- Research notes: /Users/igorshalygin/.claude/jobs/e36bc646/tmp/notes/kafka-client.md
+- Research notes: .scratch/mvp/research/kafka-client.md
 
 Spec: [../spec.md](../spec.md). Glossary: [CONTEXT.md](../../../CONTEXT.md). ADRs: [docs/adr/](../../../docs/adr/)

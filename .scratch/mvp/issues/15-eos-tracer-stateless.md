@@ -15,7 +15,7 @@
 - **Restart fencing bug:** a new Producer reusing a `transactionalId` gets `PRODUCER_FENCED` because the client sends producerId 0 / epoch 0. Pass `producerId: -1n, producerEpoch: -1` to the Producer constructor (verified: restart after a crash takes ~300 ms, zombie writes are rejected). Cover it in tests; consider reporting upstream.
 - Committing or aborting an empty transaction fails with `INVALID_TXN_STATE`. Only begin a transaction when there is something to send or commit.
 - `addOffset(message)` uses the generation the message was fetched under, so after any rebalance it fails with ILLEGAL_GENERATION. Pass the consumer's current group metadata instead (code in the note).
-- Research notes: /Users/igorshalygin/.claude/jobs/e36bc646/tmp/notes/kafka-client.md
+- Research notes: .scratch/mvp/research/kafka-client.md
 
 Spec: [../spec.md](../spec.md). Glossary: [CONTEXT.md](../../../CONTEXT.md). ADRs: [docs/adr/](../../../docs/adr/)
 

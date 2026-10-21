@@ -18,7 +18,7 @@
 - Test helpers: use idempotent producers and wait for partition leaders after `createTopics` (a non-idempotent producer wrote duplicates right after topic creation).
 - Set a short `sessionTimeout` in tests (the 60 s default blocks reassignment after a crash).
 - Client defaults: consumer isolation is read_committed, `consume()` starts at latest, autocommit is on. Set these explicitly.
-- Research notes: /Users/igorshalygin/.claude/jobs/e36bc646/tmp/notes/kafka-client.md, local-broker.md
+- Research notes: .scratch/mvp/research/kafka-client.md, local-broker.md
 
 Spec: [../spec.md](../spec.md). Glossary: [CONTEXT.md](../../../CONTEXT.md). ADRs: [docs/adr/](../../../docs/adr/)
 
