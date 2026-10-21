@@ -11,3 +11,7 @@
 - [ ] Produce errors and `AsyncNotAllowedError` skip handlers
 
 Spec: [../spec.md](../spec.md). Glossary: [CONTEXT.md](../../../CONTEXT.md). ADRs: [docs/adr/](../../../docs/adr/)
+
+## Notes from ticket 18
+
+- Errors from worker threads reach the main thread as plain `Error`s and lose their class (e.g. `DeserializationError`, `AsyncNotAllowedError`). Error handling and `skipsErrorHandlers` must work inside the thread, and errors crossing the boundary should keep a recognizable type/code.

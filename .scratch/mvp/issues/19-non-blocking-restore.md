@@ -17,3 +17,7 @@
 - Research notes: .scratch/mvp/research/kafka-client.md
 
 Spec: [../spec.md](../spec.md). Glossary: [CONTEXT.md](../../../CONTEXT.md). ADRs: [docs/adr/](../../../docs/adr/)
+
+## Notes from ticket 18
+
+- Shared `stateDir` across Workers with no per-Task directory lock (see ticket 29 note); non-blocking Restore must not open a Task's stores before the previous owner has closed them.
