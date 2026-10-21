@@ -17,3 +17,9 @@ Spec: [../spec.md](../spec.md). Glossary: [CONTEXT.md](../../../CONTEXT.md). ADR
 ## Notes from ticket 15
 
 - Transactional IDs are `<applicationId>-worker-<n>`, per Worker number, not per process: two processes running the same exactly-once app would fence each other. Needs a stable instance identity (e.g. persisted in the state directory) folded into the transactional ID.
+
+## Notes from ticket 28
+
+- The client reads committed offsets without `requireStable`. With several exactly-once members, a new owner can start from a stale offset and produce duplicates. Before processing newly assigned partitions, fetch their stable committed offsets.
+- Transactional IDs are still per Worker number (see ticket 15 note), so two exactly-once processes fence each other; ticket 28's exactly-once rebalance test uses a raw consumer as the second member for that reason.
+- Re-check `src/ownership.ts` under cooperative-sticky: join events can arrive late, and one rebalance can bump the generation twice.
