@@ -4,12 +4,16 @@ import { serdes as builtInSerdes, type Serde, type Serdes } from './serde.js'
 import {
   defaultStoreSupplier,
   type KeyEncoding,
+  type KeyValueStore,
   type NamedStore,
+  rangeByStoreKey,
   type StateStoreSupplier,
 } from './state-store.js'
+import { encodeKey } from './store-key.js'
 import { type Sync, type SyncKeyValue, synchronous } from './sync-dsl.js'
 import { taskInternals } from './task.js'
 import {
+  firstKeptWindowStart,
   type TumblingWindows,
   type Windowed,
   windowedSerde,
@@ -764,39 +768,72 @@ interface Keying<K, KT> {
   serde: Serde<KT>
   /** How the State Store encodes the Table's keys. Undefined for the default single part. */
   encoding: KeyEncoding<KT> | undefined
-  /**
-   * Called once per Task: returns the Table key a record updates and the timestamp to forward the
-   * update with, or undefined to drop the record.
-   */
+  /** Called once per Task, with the Task's view of the Table's State Store. */
   forTask(
     ctx: ProcessorContext<unknown, unknown>,
-  ): (key: K, timestamp: number) => { key: KT; timestamp: number } | undefined
+    store: KeyValueStore<KT, unknown>,
+  ): TaskKeying<K, KT>
+}
+
+interface TaskKeying<K, KT> {
+  /**
+   * Returns the Table key a record updates and the timestamp to forward the update with, or
+   * undefined to drop the record.
+   */
+  place(key: K, timestamp: number): { key: KT; timestamp: number } | undefined
+  /** Called before each record: deletes the entries Stream Time has made expire, if any. */
+  expire(): void
 }
 
 /** Keys the Table by the grouped key; updates keep the record's Event Time. */
 function byKey<K>(serde: Serde<K>): Keying<K, K> {
-  return { serde, encoding: undefined, forTask: () => (key, timestamp) => ({ key, timestamp }) }
+  return {
+    serde,
+    encoding: undefined,
+    forTask: () => ({ place: (key, timestamp) => ({ key, timestamp }), expire() {} }),
+  }
 }
 
 /**
  * Keys the Table by the grouped key and the window of the record. Updates are timestamped with
  * the window end; records for windows that Stream Time has closed are dropped and counted as late.
+ *
+ * Retention: a window is kept for its size plus the Grace Period, until Stream Time passes its end
+ * plus the Grace Period. Then its entries are deleted, which writes their Tombstones to the
+ * Changelog; nothing is forwarded. Expired windows are looked for before each record, but only
+ * when Stream Time has made another window expire since the last look: then one range scan over
+ * the store keys before the first window still kept (they are time-first, ADR-0015) finds them
+ * all, however many windows Stream Time jumped over.
  */
 function byWindow<K>(serde: Serde<K>, windows: TumblingWindows): Keying<K, Windowed<K>> {
   return {
     serde: windowedSerde(serde, windows),
     encoding: windowKeyEncoding(serde, windows),
-    forTask(ctx) {
+    forTask(ctx, store) {
       const task = taskInternals(ctx)
-      return (key, timestamp) => {
-        const window = windowOf(windows, timestamp)
-        // The Task advances Stream Time before processing a record, so it is known here.
-        const streamTime = task.streamTime() ?? timestamp
-        if (window.end + windows.graceMs <= streamTime) {
-          task.recordLateDropped()
-          return undefined
-        }
-        return { key: { key, window }, timestamp: window.end }
+      /** The start of the first window that was kept at the last look for expired windows. */
+      let keptFrom: number | undefined
+      return {
+        place(key, timestamp) {
+          const window = windowOf(windows, timestamp)
+          // The Task advances Stream Time before processing a record, so it is known here.
+          const streamTime = task.streamTime() ?? timestamp
+          if (window.end + windows.graceMs <= streamTime) {
+            task.recordLateDropped()
+            return undefined
+          }
+          return { key: { key, window }, timestamp: window.end }
+        },
+        expire() {
+          const streamTime = task.streamTime()
+          if (streamTime === undefined) return
+          const from = firstKeptWindowStart(windows, streamTime)
+          if (keptFrom !== undefined && from <= keptFrom) return
+          keptFrom = from
+          for (const [key] of rangeByStoreKey(store, undefined, encodeKey([from]))) {
+            store.delete(key)
+          }
+        },
       }
     },
   }
@@ -879,9 +916,13 @@ class AggregationNode<K, V, KT> {
     // Like Kafka Streams, aggregations skip records without a key or with a tombstone value.
     const supplier: ProcessorSupplier<K | null, V | null, KT, VA | null> = (ctx) => {
       const aggregates = ctx.store<KT, VA>(store)
-      const place = keying.forTask(ctx as ProcessorContext<unknown, unknown>)
+      const { place, expire } = keying.forTask(
+        ctx as ProcessorContext<unknown, unknown>,
+        aggregates as KeyValueStore<KT, unknown>,
+      )
       return {
         process({ key, value, timestamp }) {
+          expire()
           if (key === null || value === null) return
           const target = place(key, timestamp)
           if (target === undefined) return

@@ -166,7 +166,7 @@ describe('tumbling windows', () => {
     const amounts = driver.input<string, number>('amounts')
     await amounts.pipe('alice', 3, { timestamp: 0 })
     await amounts.pipe('alice', 5, { timestamp: 10 * MINUTE })
-    await amounts.pipe('alice', 1, { timestamp: 61 * MINUTE })
+    await amounts.pipe('alice', 1, { timestamp: 60 * MINUTE })
 
     const hour = 60 * MINUTE
     expect(driver.store('totals').all()).toEqual([
@@ -189,6 +189,100 @@ describe('tumbling windows', () => {
     const app = createStreamsApp({ applicationId: 'window-types' })
     const table = app.stream('clicks', strings).groupByKey().window(tumbling(MINUTE)).count()
     expectTypeOf(table).toEqualTypeOf<Table<Windowed<string>, number>>()
+  })
+})
+
+describe('window retention', () => {
+  it('drops a window from its store once Stream Time passes its end plus the Grace Period', async () => {
+    const driver = createTestDriver(clickCounts('window-retention', '10s'))
+    const clicks = driver.input<string, string>('clicks')
+    const counts = driver.store<Windowed<string>, number>('counts')
+    await clicks.pipe('alice', 'home', { timestamp: 1_000 })
+    await clicks.pipe('bob', 'home', { timestamp: 2_000 })
+    await clicks.pipe('alice', 'pay', { timestamp: 70_000 }) // [0, 60s) closed, still kept
+
+    expect(counts.all()).toEqual([
+      [inMinute('alice', 0), 1],
+      [inMinute('bob', 0), 1],
+      [inMinute('alice', MINUTE), 1],
+    ])
+
+    await clicks.pipe('bob', 'pay', { timestamp: 70_001 }) // Stream Time passes 60s + 10s
+    expect(counts.all()).toEqual([
+      [inMinute('alice', MINUTE), 1],
+      [inMinute('bob', MINUTE), 1],
+    ])
+    expect(counts.get(inMinute('alice', 0))).toBeUndefined()
+  })
+
+  it('drops every expired window at once, however far Stream Time jumps', async () => {
+    const driver = createTestDriver(clickCounts('window-retention-jump'))
+    const clicks = driver.input<string, string>('clicks')
+    for (let minute = 0; minute < 5; minute++) {
+      await clicks.pipe('alice', 'home', { timestamp: minute * MINUTE })
+    }
+    await clicks.pipe('bob', 'home', { timestamp: 4 * MINUTE + 1 })
+
+    // Stream Time 4m + 1ms passes the end of [3m, 4m): only the last minute is kept.
+    expect(driver.store('counts').all()).toEqual([
+      [inMinute('alice', 4 * MINUTE), 1],
+      [inMinute('bob', 4 * MINUTE), 1],
+    ])
+
+    await clicks.pipe('bob', 'away', { timestamp: 60 * MINUTE + 1 })
+    expect(driver.store('counts').all()).toEqual([[inMinute('bob', 60 * MINUTE), 1]])
+  })
+
+  it('does not forward anything when windows expire', async () => {
+    const driver = createTestDriver(clickCounts('window-retention-quiet'))
+    const clicks = driver.input<string, string>('clicks')
+    await clicks.pipe('alice', 'home', { timestamp: 0 })
+    await clicks.pipe('bob', 'home', { timestamp: 10 * MINUTE })
+
+    expect(driver.output('counts').readAll()).toHaveLength(2)
+  })
+
+  it('drops expired windows from SQLite stores', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'kstreams-windows-'))
+    try {
+      const driver = createTestDriver(clickCounts('window-retention-sqlite'), { stateDir })
+      const clicks = driver.input<string, string>('clicks')
+      await clicks.pipe('alice', 'home', { timestamp: 0 })
+      await clicks.pipe('bob', 'home', { timestamp: 2 * MINUTE })
+
+      expect(driver.store('counts').all()).toEqual([[inMinute('bob', 2 * MINUTE), 1]])
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('serdes.windowed', () => {
+  it('reads and writes windowed keys as the key Serde bytes and the 8-byte window start', async () => {
+    const driver = createTestDriver(clickCounts('window-serde'))
+    await driver.input<string, string>('clicks').pipe('ab', 'home', { timestamp: MINUTE + 5 })
+
+    const key = serdes.windowed(serdes.string, '1m')
+    const context = { topic: 'counts' }
+    const [record] = driver.output('counts', { key: serdes.bytes }).readAll()
+    expect(key.deserialize(record?.key as Uint8Array, context)).toEqual(inMinute('ab', MINUTE))
+    expect(key.serialize(inMinute('ab', MINUTE), context)).toEqual(record?.key)
+  })
+
+  it('takes the windows of the aggregation instead of a size', () => {
+    const windows = tumbling('1h', { grace: '1m' })
+    const key = serdes.windowed(serdes.number, windows)
+    const context = { topic: 't' }
+    const hour = 60 * MINUTE
+    const windowed = { key: 7, window: { start: hour, end: 2 * hour } }
+    expect(key.deserialize(key.serialize(windowed, context), context)).toEqual(windowed)
+    expectTypeOf(key).toEqualTypeOf<Serde<Windowed<number>>>()
+  })
+
+  it('rejects window sizes that are not positive and bytes too short for a window start', () => {
+    expect(() => serdes.windowed(serdes.string, 0)).toThrow(/window size/i)
+    const key = serdes.windowed(serdes.string, '1m')
+    expect(() => key.deserialize(new Uint8Array(7), { topic: 't' })).toThrow(/8 bytes/)
   })
 })
 

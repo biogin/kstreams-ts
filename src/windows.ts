@@ -77,8 +77,21 @@ export function windowOf({ sizeMs }: TumblingWindows, timestamp: number): Window
 }
 
 /**
+ * Internal: the start of the first window still kept at `streamTime`. A window is kept until
+ * Stream Time passes its end plus the Grace Period (retention = size + Grace Period); the windows
+ * that start before this one have expired.
+ */
+export function firstKeptWindowStart(windows: TumblingWindows, streamTime: number): number {
+  // Window `start` expires once start + size + grace < streamTime.
+  const expiredBefore = streamTime - windows.sizeMs - windows.graceMs
+  const { start } = windowOf(windows, expiredBefore)
+  return start === expiredBefore ? start : start + windows.sizeMs
+}
+
+/**
  * Internal: the Serde of windowed keys on topics: the key's Serde bytes followed by the window
  * start as an 8-byte big-endian signed integer. The window end is start plus the window size.
+ * Public as `serdes.windowed`.
  */
 export function windowedSerde<K>(serde: Serde<K>, { sizeMs }: TumblingWindows): Serde<Windowed<K>> {
   return {
