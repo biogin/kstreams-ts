@@ -30,6 +30,13 @@ export interface TestDriver {
     topic: string,
     serdes?: Partial<Serdes<K, V>>,
   ): TestOutputTopic<K, V>
+  /**
+   * Moves the Test Driver's wall-clock time (which starts at 0) forward by `ms` and fires the
+   * wall-clock timers that are then due. Records already piped are processed first. Wall-clock
+   * time never affects Stream Time: only record timestamps do. Rejects if `ms` is negative, or
+   * with the error a timer raised, which stops the Streams App like a failed record.
+   */
+  advanceWallClockTime(ms: number): Promise<void>
 }
 
 export interface PipeOptions {
@@ -58,15 +65,34 @@ export interface TestOutputTopic<K, V> {
 
 export function createTestDriver(app: StreamsApp): TestDriver {
   const graph = processorGraphOf(app)
-  const wallClockTime = 0
+  let wallClockTime = 0
   const written = new Map<string, SerializedRecord[]>()
   for (const topic of graph.sinks.keys()) written.set(topic, [])
   /** The error that stopped the Streams App, if any. */
   let stoppedBy: { error: unknown } | undefined
 
-  const task = createTask(graph, (topic, record) => {
-    written.get(topic)?.push(record)
-  })
+  const task = createTask(
+    graph,
+    (topic, record) => {
+      written.get(topic)?.push(record)
+    },
+    () => wallClockTime,
+  )
+
+  /** Runs work on the Task, stopping the Streams App if it fails. */
+  const runOnTask = async (work: () => Promise<void>): Promise<void> => {
+    if (stoppedBy !== undefined) {
+      throw new Error(`Streams App "${app.applicationId}" stopped after an earlier error`, {
+        cause: stoppedBy.error,
+      })
+    }
+    try {
+      await work()
+    } catch (error) {
+      stoppedBy ??= { error }
+      throw error
+    }
+  }
 
   return {
     input<K, V>(topic: string, serdes: Partial<Serdes<K, V>> = {}): TestInputTopic<K, V> {
@@ -78,25 +104,22 @@ export function createTestDriver(app: StreamsApp): TestDriver {
       const value = serdes.value ?? source.serdes.value
       const context = { topic }
       return {
-        async pipe(k, v, options = {}) {
-          if (stoppedBy !== undefined) {
-            throw new Error(`Streams App "${app.applicationId}" stopped after an earlier error`, {
-              cause: stoppedBy.error,
-            })
-          }
-          const record = {
-            key: serializeNullable(key, k, context),
-            value: serializeNullable(value, v, context),
-            timestamp: options.timestamp ?? wallClockTime,
-          }
-          try {
-            await task.process(topic, record)
-          } catch (error) {
-            stoppedBy ??= { error }
-            throw error
-          }
+        pipe(k, v, options = {}) {
+          return runOnTask(() =>
+            task.process(topic, {
+              key: serializeNullable(key, k, context),
+              value: serializeNullable(value, v, context),
+              timestamp: options.timestamp ?? wallClockTime,
+            }),
+          )
         },
       }
+    },
+
+    async advanceWallClockTime(ms) {
+      if (!(ms >= 0)) throw new Error(`Wall-clock time cannot move backwards (got ${ms} ms)`)
+      wallClockTime += ms
+      await runOnTask(() => task.fireWallClockTimers())
     },
 
     output<K, V>(topic: string, serdes: Partial<Serdes<K, V>> = {}): TestOutputTopic<K, V> {

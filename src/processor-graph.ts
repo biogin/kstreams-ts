@@ -18,6 +18,19 @@ export interface Processor<KIn, VIn> {
 /** When a scheduled timer fires: as Stream Time advances, or as wall-clock time passes. */
 export type TimerType = 'stream-time' | 'wall-clock-time'
 
+/**
+ * Called when a timer fires, with the time it fired at: the Task's Stream Time for a Stream Time
+ * timer, the wall-clock time for a wall-clock timer. May be async; the Task awaits it like a
+ * Processor's `process`.
+ */
+export type TimerCallback = (timestamp: number) => void | Promise<void>
+
+/** A timer returned by `ProcessorContext.schedule`. */
+export interface Timer {
+  /** Stops the timer. It never fires again. */
+  cancel(): void
+}
+
 /** What a Processor can do besides receiving records. One context per Processor per Task. */
 export interface ProcessorContext<KOut, VOut> {
   /**
@@ -27,8 +40,17 @@ export interface ProcessorContext<KOut, VOut> {
   forward(record: StreamRecord<KOut, VOut>): void
   /** A State Store by name. Not implemented yet: always throws. */
   store(name: string): never
-  /** Schedules a recurring timer every `intervalMs`. Not implemented yet: always throws. */
-  schedule(intervalMs: number, type: TimerType, callback: (timestamp: number) => void): never
+  /**
+   * Schedules a recurring timer that fires every `intervalMs` (a positive number) after it is
+   * scheduled, measured in Stream Time or in wall-clock time. If the time jumps over several
+   * intervals at once, the timer fires once, with the current time. A Stream Time timer scheduled
+   * before the Task has seen any record starts counting from the first record's Event Time.
+   *
+   * Timers fire between records, never while one is being processed, and records forwarded from
+   * the callback go through the Processor's children as usual. They are not given a timestamp:
+   * set one, usually the `timestamp` the callback receives.
+   */
+  schedule(intervalMs: number, type: TimerType, callback: TimerCallback): Timer
 }
 
 /** Creates one Processor instance per Task. */
