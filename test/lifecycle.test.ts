@@ -18,10 +18,10 @@ describe('Streams App configuration', () => {
     ).not.toThrow()
   })
 
-  it('rejects exactly-once as not implemented yet', () => {
-    expect(() => createStreamsApp({ applicationId: 'eos', guarantee: 'exactly-once' })).toThrow(
-      /exactly-once is not implemented yet/,
-    )
+  it('accepts exactly-once', () => {
+    expect(() =>
+      createStreamsApp({ applicationId: 'eos', guarantee: 'exactly-once' }),
+    ).not.toThrow()
   })
 
   it('rejects an unknown Delivery Guarantee', () => {
@@ -74,6 +74,17 @@ describe('Application State', () => {
     const app = createStreamsApp({ applicationId: 'no-brokers' })
     app.stream('input', { key: serdes.string, value: serdes.string }).to('output')
     await expect(app.start()).rejects.toThrow(/no brokers/i)
+    expect(app.state).toBe('created')
+  })
+
+  it('refuses to start an exactly-once app with State Stores (not implemented yet)', async () => {
+    const app = createStreamsApp({
+      applicationId: 'eos-stateful',
+      brokers: ['localhost:9092'],
+      guarantee: 'exactly-once',
+    })
+    app.stream('input', { key: serdes.string, value: serdes.string }).groupByKey().count()
+    await expect(app.start()).rejects.toThrow(/exactly-once with State Stores is not implemented/)
     expect(app.state).toBe('created')
   })
 

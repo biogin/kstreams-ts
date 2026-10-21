@@ -77,20 +77,23 @@ export function createKafka() {
     },
 
     /**
-     * Reads `topic` from the beginning (read_committed) until `count` records arrived, then keeps
-     * reading for `settleMs` to catch any extra (duplicate) records. Rejects after `timeoutMs`.
+     * Reads `topic` from the beginning until `count` records arrived (right away for 0), then
+     * keeps reading for `settleMs` to catch any extra (duplicate) records. Rejects after
+     * `timeoutMs`. Reads only committed records unless `uncommitted` is set.
      */
     async consume(
       topic: string,
       count: number,
-      { timeoutMs = 20_000, settleMs = 500 } = {},
+      { timeoutMs = 20_000, settleMs = 500, uncommitted = false } = {},
     ): Promise<TestRecord[]> {
       const consumer = new Consumer({
         clientId: uniqueName('test-consumer'),
         groupId: uniqueName('test-group'),
         bootstrapBrokers: brokers,
         autocommit: false,
-        isolationLevel: FetchIsolationLevels.READ_COMMITTED,
+        isolationLevel: uncommitted
+          ? FetchIsolationLevels.READ_UNCOMMITTED
+          : FetchIsolationLevels.READ_COMMITTED,
         sessionTimeout: 10_000,
         heartbeatInterval: 1_000,
         maxWaitTime: 100,
@@ -107,6 +110,10 @@ export function createKafka() {
               ),
             timeoutMs,
           )
+          if (count === 0) {
+            clearTimeout(timeout)
+            settle = setTimeout(resolve, settleMs)
+          }
           stream.on('error', reject)
           stream.on('data', (message: Message) => {
             records.push({
@@ -130,7 +137,11 @@ export function createKafka() {
 
     /** The committed offset of every partition of `topic` for consumer group `groupId`. */
     async committedOffsets(groupId: string, topic: string): Promise<Map<number, bigint>> {
-      const [group] = await admin.listConsumerGroupOffsets({ groups: [groupId] })
+      // `requireStable` waits for offsets committed in a transaction to be written.
+      const [group] = await admin.listConsumerGroupOffsets({
+        groups: [groupId],
+        requireStable: true,
+      })
       const offsets = new Map<number, bigint>()
       for (const partition of group?.topics.find(({ name }) => name === topic)?.partitions ?? []) {
         offsets.set(partition.partitionIndex, partition.committedOffset)
