@@ -74,6 +74,8 @@ export interface WorkerOptions {
   shutdownTimeoutMs: number
   /** The replication factor of the Changelog topics the Worker creates. */
   changelogReplicationFactor: number
+  /** Whether the Worker creates missing Internal Topics (true) or only checks them (false). */
+  autoCreateInternalTopics: boolean
   /** The state directory State Stores are kept under, if any. */
   stateDir: string | undefined
   /** Called once if the Worker stops because of an error; it has closed its clients by then. */
@@ -161,9 +163,11 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
     // Checked before joining the group, so a misconfigured app never takes any Task.
     await checkCoPartitioned(consumer, applicationId, topics)
     await ensureChangelogs(graph, {
+      applicationId,
       brokers,
       clientId,
       replicationFactor: options.changelogReplicationFactor,
+      autoCreate: options.autoCreateInternalTopics,
     })
     // Fences the Worker's previous producer before the group's offsets are read and any
     // Changelog is restored: the broker aborts (or completes) a transaction it left open, e.g.

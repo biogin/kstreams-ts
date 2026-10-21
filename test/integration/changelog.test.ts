@@ -113,7 +113,7 @@ describeWithKafka('Changelogs on real Kafka (at-least-once, workers: 0)', () => 
       .count({ store: 'counts' })
 
     await expect(counter.start()).rejects.toThrow(
-      `Changelog "${changelog}" has 1 partition, but the input topics have 2`,
+      `Internal Topic "${changelog}" has 1 partition, but it needs 2`,
     )
   })
 
