@@ -13,3 +13,7 @@
 Split from the original ticket 13; Restore is ticket 27.
 
 Spec: [../spec.md](../spec.md). Glossary: [CONTEXT.md](../../../CONTEXT.md). ADRs: [docs/adr/](../../../docs/adr/)
+
+## Notes from ticket 22
+
+- Window stores: Changelog keys must use the windowed key Serde, and Restore (ticket 27) must re-encode with `StoreNode.keyEncoding`, not `storeKey`.

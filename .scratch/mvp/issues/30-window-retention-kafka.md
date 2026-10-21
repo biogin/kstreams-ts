@@ -12,3 +12,8 @@
 Split from the original ticket 22.
 
 Spec: [../spec.md](../spec.md). Glossary: [CONTEXT.md](../../../CONTEXT.md). ADRs: [docs/adr/](../../../docs/adr/)
+
+## Notes from ticket 22
+
+- Export a windowed key Serde (e.g. `serdes.windowed(inner, size)`) so consumers outside the app can read windowed Table topics; the format is key Serde bytes + 8-byte window start.
+- Window store keys are time-first (`[windowStart, key]`), so retention cleanup is one range scan up to the cutoff.
