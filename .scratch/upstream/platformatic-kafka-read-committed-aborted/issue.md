@@ -113,7 +113,7 @@ Keep per-partition state across fetch responses, the way the Java client does:
 3. Drop a transactional data batch if its `producerId` is in the set. An abort marker removes its `producerId` from the set. Control batches are still passed through, so offset tracking keeps working as it does now.
 4. Clear the partition's state when the fetch position is reset (seek, rebalance, offset out of range).
 
-This also makes the open-range special case and the #391 guard unnecessary. We already use a filter built this way around `consumer.fetch()`, and it passes the scenario above (an aborted transaction spread over several 1 KB fetches, with committed and non-transactional records around it). We can open a PR based on it, with a test.
+This also makes the open-range special case and the #391 guard unnecessary. I'm building a stream-processing library on top of `@platformatic/kafka` and already use a filter built this way around `consumer.fetch()`. It passes the scenario above (an aborted transaction spread over several 1 KB fetches, with committed and non-transactional records around it). I'm happy to open a PR based on it, with a test.
 
 <details>
 <summary><code>repro.mjs</code> and <code>package.json</code></summary>
