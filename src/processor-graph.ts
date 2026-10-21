@@ -1,18 +1,34 @@
-// Internal: the Processor graph the DSL compiles to. Not exported from the package entry point
-// (the public Processor API arrives in ticket 06 and will be built on these types).
+// The Processor graph the DSL compiles to, and the public Processor API types it is built on.
+// The graph itself is internal; only the types above `SerializedRecord` are exported.
 
 import type { StreamRecord } from './record.js'
 import type { Serdes } from './serde.js'
 
-/** Per-record logic. Receives records from its parents. */
+/**
+ * Per-record logic. Receives records from its parents and sends results on with
+ * `ProcessorContext.forward`.
+ *
+ * `process` may be async (for example to call an HTTP service). A Task awaits it before handing
+ * the Processor its next record, so records within one Task never overlap.
+ */
 export interface Processor<KIn, VIn> {
-  process(record: StreamRecord<KIn, VIn>): void
+  process(record: StreamRecord<KIn, VIn>): void | Promise<void>
 }
 
-/** What a Processor can do besides receiving records. */
+/** When a scheduled timer fires: as Stream Time advances, or as wall-clock time passes. */
+export type TimerType = 'stream-time' | 'wall-clock-time'
+
+/** What a Processor can do besides receiving records. One context per Processor per Task. */
 export interface ProcessorContext<KOut, VOut> {
-  /** Sends a record to every child of this Processor. */
+  /**
+   * Sends a record to every child of this Processor. Async children are queued and awaited by the
+   * Task, so there is no need to await `forward`.
+   */
   forward(record: StreamRecord<KOut, VOut>): void
+  /** A State Store by name. Not implemented yet: always throws. */
+  store(name: string): never
+  /** Schedules a recurring timer every `intervalMs`. Not implemented yet: always throws. */
+  schedule(intervalMs: number, type: TimerType, callback: (timestamp: number) => void): never
 }
 
 /** Creates one Processor instance per Task. */
@@ -90,10 +106,14 @@ export class ProcessorGraph {
     return node.name
   }
 
-  addProcessor(supplier: AnySupplier, parents: readonly string[]): string {
+  /** Adds a Processor node. Without a `name`, one is generated. */
+  addProcessor(supplier: AnySupplier, parents: readonly string[], name?: string): string {
+    if (name !== undefined && this.#nodes.has(name)) {
+      throw new Error(`A Processor named "${name}" already exists in this Streams App`)
+    }
     const node: ProcessorNode = {
       kind: 'processor',
-      name: this.#name('processor'),
+      name: name ?? this.#name('processor'),
       supplier,
       children: [],
     }
@@ -110,17 +130,28 @@ export class ProcessorGraph {
     return node.name
   }
 
+  /** Makes `child` (an existing node) receive the records `parent` forwards. */
+  connect(parent: string, child: string): void {
+    if (!this.#nodes.has(child)) throw new Error(`Unknown node "${child}"`)
+    this.#parent(parent).children.push(child)
+  }
+
   #attach(node: GraphNode, parents: readonly string[]): void {
-    for (const parentName of parents) {
-      const parent = this.#nodes.get(parentName)
-      if (parent === undefined) throw new Error(`Unknown parent node "${parentName}"`)
-      if (parent.kind === 'sink') throw new Error(`Sink node "${parentName}" cannot have children`)
-      parent.children.push(node.name)
-    }
+    for (const parentName of parents) this.#parent(parentName).children.push(node.name)
     this.#nodes.set(node.name, node)
   }
 
+  #parent(name: string): SourceNode | ProcessorNode {
+    const parent = this.#nodes.get(name)
+    if (parent === undefined) throw new Error(`Unknown parent node "${name}"`)
+    if (parent.kind === 'sink') throw new Error(`Sink node "${name}" cannot have children`)
+    return parent
+  }
+
   #name(prefix: string): string {
-    return `${prefix}-${String(this.#nextId++).padStart(4, '0')}`
+    let name: string
+    do name = `${prefix}-${String(this.#nextId++).padStart(4, '0')}`
+    while (this.#nodes.has(name))
+    return name
   }
 }

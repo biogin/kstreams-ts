@@ -185,17 +185,15 @@ describe('deserialization errors', () => {
     return createTestDriver(app)
   }
 
-  it('raises a typed DeserializationError for malformed JSON', () => {
+  it('raises a typed DeserializationError for malformed JSON', async () => {
     const driver = jsonApp()
     // Write raw text with the test's own Serde, bypassing the app's JSON Serde.
     const raw = driver.input<string, string>('orders', { value: serdes.string })
 
-    let error: unknown
-    try {
-      raw.pipe('o-1', '{"id": "o-1",', { timestamp: 5 })
-    } catch (e) {
-      error = e
-    }
+    const error: unknown = await raw.pipe('o-1', '{"id": "o-1",', { timestamp: 5 }).then(
+      () => undefined,
+      (e: unknown) => e,
+    )
     expect(error).toBeInstanceOf(DeserializationError)
     expect(error).toMatchObject({
       name: 'DeserializationError',
@@ -208,24 +206,24 @@ describe('deserialization errors', () => {
     expect(driver.output('output').readAll()).toEqual([])
   })
 
-  it('reports the key as the failing part when the key is malformed', () => {
+  it('reports the key as the failing part when the key is malformed', async () => {
     const app = createStreamsApp({ applicationId: 'keys' })
     app.stream('input', { key: serdes.number, value: serdes.string }).to('output')
     const driver = createTestDriver(app)
 
-    expect(() =>
+    await expect(
       driver.input<string, string>('input', { key: serdes.string }).pipe('nope', 'v'),
-    ).toThrow(expect.objectContaining({ name: 'DeserializationError', part: 'key' }))
+    ).rejects.toThrow(expect.objectContaining({ name: 'DeserializationError', part: 'key' }))
   })
 
-  it('stops the Streams App: later records are refused', () => {
+  it('stops the Streams App: later records are refused', async () => {
     const driver = jsonApp()
-    expect(() =>
+    await expect(
       driver.input<string, string>('orders', { value: serdes.string }).pipe('k', 'not json'),
-    ).toThrow(DeserializationError)
+    ).rejects.toThrow(DeserializationError)
 
     const valid: Order = { id: 'o-2', items: [], paid: true, note: null }
-    expect(() => driver.input<string, Order>('orders').pipe('o-2', valid)).toThrow(
+    await expect(driver.input<string, Order>('orders').pipe('o-2', valid)).rejects.toThrow(
       expect.objectContaining({
         message: expect.stringMatching(/stopped/i),
         cause: expect.any(DeserializationError),

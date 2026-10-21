@@ -9,8 +9,8 @@ import { createTask } from './task.js'
  * in and on the way out.
  *
  * Like a real Streams App with no error handlers, the Test Driver stops at the first error a
- * record raises (e.g. a `DeserializationError`): `pipe` rethrows it, and every later `pipe`
- * throws.
+ * record raises (e.g. a `DeserializationError`): `pipe` rejects with it, and every later `pipe`
+ * rejects.
  */
 export interface TestDriver {
   /**
@@ -39,10 +39,14 @@ export interface PipeOptions {
 
 export interface TestInputTopic<K, V> {
   /**
-   * Serializes the record with the topic's Serdes and processes it to completion. A null value is
-   * a tombstone.
+   * Serializes the record with the topic's Serdes and processes it. A null value is a tombstone.
+   * When every Processor is synchronous, the record is fully processed before `pipe` returns.
+   * Await the returned Promise when the Streams App has async Processors: it resolves once the
+   * record is fully processed and rejects if processing failed. Records piped without awaiting are
+   * queued and processed one after another, never overlapping. After a failure, every later `pipe`
+   * rejects too.
    */
-  pipe(key: K | null, value: V | null, options?: PipeOptions): void
+  pipe(key: K | null, value: V | null, options?: PipeOptions): Promise<void>
 }
 
 export interface TestOutputTopic<K, V> {
@@ -74,7 +78,7 @@ export function createTestDriver(app: StreamsApp): TestDriver {
       const value = serdes.value ?? source.serdes.value
       const context = { topic }
       return {
-        pipe(k, v, options = {}) {
+        async pipe(k, v, options = {}) {
           if (stoppedBy !== undefined) {
             throw new Error(`Streams App "${app.applicationId}" stopped after an earlier error`, {
               cause: stoppedBy.error,
@@ -86,9 +90,9 @@ export function createTestDriver(app: StreamsApp): TestDriver {
             timestamp: options.timestamp ?? wallClockTime,
           }
           try {
-            task.process(topic, record)
+            await task.process(topic, record)
           } catch (error) {
-            stoppedBy = { error }
+            stoppedBy ??= { error }
             throw error
           }
         },
