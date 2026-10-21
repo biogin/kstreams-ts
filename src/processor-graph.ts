@@ -1,6 +1,7 @@
 // The Processor graph the DSL compiles to, and the public Processor API types it is built on.
 // The graph itself is internal; only the types above `SerializedRecord` are exported.
 
+import type { ErrorHandlers } from './error-handlers.js'
 import type { StreamRecord } from './record.js'
 import type { Serdes } from './serde.js'
 import type { KeyEncoding, KeyValueStore, NamedStore, StateStoreSupplier } from './state-store.js'
@@ -66,6 +67,9 @@ export type ProcessorSupplier<KIn, VIn, KOut, VOut> = (
 /** A record as it is on a topic: serialized key and value. A null value is a tombstone. */
 export type SerializedRecord = StreamRecord<Uint8Array | null, Uint8Array | null>
 
+/** A record a Task writes: serialized, and with Kafka record headers if it has any. */
+export type OutputRecord = SerializedRecord & { headers?: Readonly<Record<string, Uint8Array>> }
+
 // Inside the graph, record types are erased; the DSL keeps them typed at its surface.
 // biome-ignore lint/suspicious/noExplicitAny: type erasure at the graph boundary
 type AnySerdes = Serdes<any, any>
@@ -118,9 +122,12 @@ export class ProcessorGraph {
 
   /** The Application ID of the Streams App the graph belongs to. */
   readonly applicationId: string
+  /** The error handlers records that fail go to; none stops the app on the first error. */
+  readonly errorHandlers: ErrorHandlers | undefined
 
-  constructor(applicationId: string) {
+  constructor(applicationId: string, errorHandlers?: ErrorHandlers) {
     this.applicationId = applicationId
+    this.errorHandlers = errorHandlers
   }
 
   get nodes(): ReadonlyMap<string, GraphNode> {

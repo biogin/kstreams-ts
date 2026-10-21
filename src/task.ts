@@ -1,7 +1,9 @@
 // Internal: runs a Processor graph for one Task. Shared by the Test Driver and the Kafka runtime.
 
 import { TaskCheckpoint } from './checkpoint.js'
+import { type FailedRecord, handleError } from './error-handlers.js'
 import type {
+  OutputRecord,
   ProcessorContext,
   ProcessorGraph,
   SerializedRecord,
@@ -25,8 +27,11 @@ import {
   taskDirectory,
 } from './state-store.js'
 
-/** Receives every record a sink writes, already serialized with the sink's Serdes. */
-export type RecordCollector = (topic: string, record: SerializedRecord) => void
+/**
+ * Receives every record a sink writes, already serialized with the sink's Serdes, and the records
+ * error handlers write (e.g. to a dead-letter topic).
+ */
+export type RecordCollector = (topic: string, record: OutputRecord) => void
 
 /** Delivers a deserialized record to one graph node. */
 type Deliver = (record: StreamRecord<unknown, unknown>) => void
@@ -70,13 +75,14 @@ export interface Task {
    * record only starts once every Processor (async ones included) has finished with the one before.
    * Work that is all synchronous completes before `process` returns. The Promise resolves once the
    * record is fully processed, and rejects if processing failed (e.g. with a
-   * {@link DeserializationError} if the topic's Serdes can't read it). A failed Task rejects every
-   * later record with the same error (fail-fast).
+   * {@link DeserializationError} if the topic's Serdes can't read it) and the graph's error
+   * handler for it didn't skip the record. A failed Task rejects every later record with the same
+   * error (fail-fast). `offset` is the record's offset in its partition, for error handlers.
    *
    * The record's Event Time advances the Task's Stream Time (which never moves back). Once the
    * record is fully processed, the Stream Time timers that are due fire.
    */
-  process(topic: string, record: SerializedRecord): Promise<void>
+  process(topic: string, record: SerializedRecord, offset: bigint): Promise<void>
   /**
    * Fires the wall-clock timers that are due at the current wall-clock time. The runtime calls
    * this from its loop; the Test Driver calls it when wall-clock time is advanced. It is queued
@@ -159,14 +165,32 @@ export function createTask(
 ): Task {
   // Async Processor calls of the current record that have not settled yet.
   const inFlight = new Set<Promise<void>>()
+  /** The first error an async call of the current record raised. */
+  let asyncFailure: { error: unknown } | undefined
   const track = (work: Promise<void>): void => {
     inFlight.add(work)
-    const settled = () => inFlight.delete(work)
-    work.then(settled, settled)
+    work.then(
+      () => inFlight.delete(work),
+      (error: unknown) => {
+        inFlight.delete(work)
+        asyncFailure ??= { error }
+      },
+    )
   }
 
+  /**
+   * Waits until no async call is left, then throws the first error one raised. Returns a Promise
+   * only if there is anything to wait for.
+   */
   const settleInFlight = (): Promise<void> | undefined =>
-    inFlight.size === 0 ? undefined : drain()
+    inFlight.size === 0 && asyncFailure === undefined ? undefined : drain()
+
+  /** Waits until no async call is left, ignoring their errors: a record already failed. */
+  const quiesce = (): Promise<void> | undefined => {
+    const work = settleInFlight()
+    if (work === undefined) return undefined
+    return work.catch(() => {})
+  }
 
   /** The highest Event Time seen so far. Unknown until the first record. */
   let streamTime: number | undefined
@@ -286,8 +310,12 @@ export function createTask(
         // While this Processor is busy with an async call, its next records queue behind it.
         let busy: Promise<void> | undefined
         const queue = (work: Promise<void>): void => {
-          const done = work.then(() => {
+          const idle = () => {
             if (busy === done) busy = undefined
+          }
+          const done = work.then(idle, (error: unknown) => {
+            idle()
+            throw error
           })
           busy = done
           track(done)
@@ -313,10 +341,18 @@ export function createTask(
     }
   }
 
-  /** Runs one record. Returns a Promise only if async work is still going on. */
-  const run = (topic: string, record: SerializedRecord): Promise<void> | undefined => {
+  /**
+   * Runs one record. Returns a Promise only if async work is still going on. A record that fails
+   * goes to the graph's error handler for its kind, which skips it or fails the record.
+   */
+  const run = (
+    topic: string,
+    record: SerializedRecord,
+    offset: bigint,
+  ): Promise<void> | undefined => {
     const source = graph.sources.get(topic)
     if (source === undefined) throw new Error(`Topic "${topic}" is not an input of this Task`)
+    const failed: FailedRecord = { topic, partition: task, offset, ...record }
     const read = <T>(serde: Serde<T>, part: 'key' | 'value') => {
       try {
         return deserializeNullable(serde, record[part], { topic })
@@ -324,16 +360,40 @@ export function createTask(
         throw new DeserializationError(topic, part, record.timestamp, { cause })
       }
     }
-    const key = read(source.serdes.key, 'key')
-    const value = read(source.serdes.value, 'value')
+    let key: unknown
+    let value: unknown
+    try {
+      key = read(source.serdes.key, 'key')
+      value = read(source.serdes.value, 'value')
+    } catch (error) {
+      // A skipped record doesn't advance Stream Time.
+      handleError(graph.errorHandlers, 'deserialization', error, failed, collect)
+      return undefined
+    }
     advanceStreamTime(record.timestamp)
-    deliverTo.get(source.name)?.({ key, value, timestamp: record.timestamp })
-    return andThen(settleInFlight(), () => fireDue('stream-time', streamTime ?? record.timestamp))
+    const onError = (error: unknown) =>
+      // The record's async work still going on finishes before the next record starts.
+      andThen(quiesce(), () => {
+        handleError(graph.errorHandlers, 'processing', error, failed, collect)
+        return undefined
+      })
+    let processed: Promise<void> | undefined
+    try {
+      deliverTo.get(source.name)?.({ key, value, timestamp: record.timestamp })
+      processed = settleInFlight()?.catch(onError)
+    } catch (error) {
+      processed = onError(error)
+    }
+    // Timers are not a record's processing: their errors always fail the Task.
+    return andThen(processed, () => fireDue('stream-time', streamTime ?? record.timestamp))
   }
 
   const drain = async (): Promise<void> => {
     // Async Processors may forward to more async Processors, so wait until nothing is left.
-    while (inFlight.size > 0) await Promise.all(inFlight)
+    while (inFlight.size > 0) await Promise.allSettled(inFlight)
+    const failed = asyncFailure
+    asyncFailure = undefined
+    if (failed !== undefined) throw failed.error
   }
 
   let failure: { error: unknown } | undefined
@@ -407,8 +467,8 @@ export function createTask(
   }
 
   return {
-    process(topic, record) {
-      return enqueue(transacted(() => run(topic, record)))
+    process(topic, record, offset) {
+      return enqueue(transacted(() => run(topic, record, offset)))
     },
     fireWallClockTimers() {
       return enqueue(transacted(() => fireDue('wall-clock-time', wallClockTime())))
