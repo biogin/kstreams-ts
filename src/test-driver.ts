@@ -44,6 +44,16 @@ export interface TestDriver {
    */
   store<K, V>(store: NamedStore<K, V>): TestStore<K, V>
   store<K = unknown, V = unknown>(name: string): TestStore<K, V>
+  /** The Streams App's counters so far, e.g. how many late records windows have dropped. */
+  metrics(): TestDriverMetrics
+}
+
+export interface TestDriverMetrics {
+  /**
+   * Records dropped by windowed aggregations because they arrived after their window's Grace
+   * Period. Each windowed aggregation that drops a record counts it.
+   */
+  lateRecordsDropped: number
 }
 
 /** Read access to a State Store in the Test Driver, decoded with the store's Serdes. */
@@ -126,6 +136,10 @@ export function createTestDriver(app: StreamsApp, options: TestDriverOptions = {
 
   return {
     store: store as TestDriver['store'],
+
+    metrics() {
+      return task.metrics()
+    },
 
     input<K, V>(topic: string, serdes: Partial<Serdes<K, V>> = {}): TestInputTopic<K, V> {
       const source = graph.sources.get(topic)

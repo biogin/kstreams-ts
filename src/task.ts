@@ -52,6 +52,30 @@ export interface Task {
   fireWallClockTimers(): Promise<void>
   /** This Task's State Store named `name`. Throws if the graph has no such store. */
   store(name: string): KeyValueStore<unknown, unknown>
+  /** The Task's counters so far. */
+  metrics(): TaskMetrics
+}
+
+export interface TaskMetrics {
+  /** Records dropped by windowed aggregations because they arrived after the Grace Period. */
+  lateRecordsDropped: number
+}
+
+/** Internal: what the DSL's own Processors get from their Task besides the public context. */
+export interface TaskInternals {
+  /** The Task's Stream Time, including the record being processed. Unknown before any record. */
+  streamTime(): number | undefined
+  /** Counts a record dropped because it arrived after its window's Grace Period. */
+  recordLateDropped(): void
+}
+
+const internals = new WeakMap<object, TaskInternals>()
+
+/** Internal: the Task behind a Processor context the Task created. */
+export function taskInternals(context: ProcessorContext<unknown, unknown>): TaskInternals {
+  const found = internals.get(context)
+  if (found === undefined) throw new TypeError('Not a Processor context created by a Task')
+  return found
 }
 
 /** A timer scheduled by a Processor. */
@@ -146,17 +170,25 @@ export function createTask(
   }
 
   const stores = new Map<string, KeyValueStore<unknown, unknown>>()
-  for (const { name, serdes, supplier, changelogTopic } of graph.stores.values()) {
+  for (const { name, serdes, supplier, changelogTopic, keyEncoding } of graph.stores.values()) {
     const directory =
       stateDir === undefined ? undefined : taskDirectory(stateDir, graph.applicationId, task)
     const opened = supplier({ name, applicationId: graph.applicationId, task, directory })
-    stores.set(name, keyValueStore(opened, serdes, { topic: changelogTopic }))
+    stores.set(name, keyValueStore(opened, serdes, { topic: changelogTopic }, keyEncoding))
   }
   const store = (ref: string | NamedStore<unknown, unknown>): KeyValueStore<unknown, unknown> => {
     const name = typeof ref === 'string' ? ref : ref.name
     const found = stores.get(name)
     if (found === undefined) throw new Error(`Unknown State Store "${name}"`)
     return found
+  }
+
+  const metrics: TaskMetrics = { lateRecordsDropped: 0 }
+  const taskSide: TaskInternals = {
+    streamTime: () => streamTime,
+    recordLateDropped() {
+      metrics.lateRecordsDropped++
+    },
   }
 
   const deliverTo = new Map<string, Deliver>()
@@ -172,7 +204,9 @@ export function createTask(
         deliverTo.set(node.name, forwardTo(node.children))
         break
       case 'processor': {
-        const processor = node.supplier(createContext(forwardTo(node.children), store, schedule))
+        const context = createContext(forwardTo(node.children), store, schedule)
+        internals.set(context, taskSide)
+        const processor = node.supplier(context)
         // While this Processor is busy with an async call, its next records queue behind it.
         let busy: Promise<void> | undefined
         const queue = (work: Promise<void>): void => {
@@ -267,6 +301,7 @@ export function createTask(
       return enqueue(() => fireDue('wall-clock-time', wallClockTime()))
     },
     store,
+    metrics: () => ({ ...metrics }),
   }
 }
 
