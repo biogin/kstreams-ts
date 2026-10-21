@@ -1,6 +1,8 @@
-# MVP implementation status (paused 2026-10-21)
+# MVP implementation status
 
-Integration branch: `mvp`. Plan for this run: stop at milestone M3, then code review.
+Integration branch: `mvp`. Plan (changed 2026-10-21): finish ALL remaining tickets before any release, then one code review over everything and a fix pass, then release prep (ticket 26) as 0.1 beta. The earlier M3 stop is dropped. Order: 24 → (after the aborted-transaction fix merges) 18, 30, 23 → 29 → 19 → 20 → 25 → 26 → code review.
+
+Since the pause: tickets 28 and 17 merged; the crash suite found Changelog reads dropping committed records (client filter keyed by producer ID); a fix agent is replacing the client's READ_COMMITTED filter with our own Java-style per-response filter (branch `fix/aborted-txn-filter`).
 
 ## Merged (19 of 30)
 
