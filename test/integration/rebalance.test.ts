@@ -9,7 +9,6 @@ import { afterEach, beforeEach, expect, it } from 'vitest'
 import {
   createStreamsApp,
   type DeliveryGuarantee,
-  type Serde,
   type StreamsApp,
   serdes,
   stores,
@@ -106,26 +105,15 @@ describeWithKafka('revoke and graceful shutdown (workers: 0)', () => {
   }
 
   /** The counts in the SQLite stores of `tasks`, as the app left them on disk. */
-  function storedCounts(
-    stateDir: string,
-    applicationId: string,
-    tasks: number,
-    value: Serde<number> = serdes.number,
-  ): Map<string, number> {
+  function storedCounts(stateDir: string, applicationId: string, tasks: number) {
     const counts = new Map<string, number>()
+    const countSerdes = { key: serdes.string, value: serdes.number }
     for (let task = 0; task < tasks; task++) {
       const directory = taskDirectory(stateDir, applicationId, task)
       const store = stores.sqlite()({ name: 'counts', applicationId, task, directory })
       try {
-        for (const [key, count] of keyValueStore(
-          store,
-          { key: serdes.string, value },
-          {
-            topic: 'counts',
-          },
-        ).all()) {
-          counts.set(key, count)
-        }
+        const entries = keyValueStore(store, countSerdes, { topic: 'counts' }).all()
+        for (const [key, count] of entries) counts.set(key, count)
       } finally {
         store.close()
       }
