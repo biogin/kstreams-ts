@@ -1,0 +1,8 @@
+# Local State Stores persist across restarts with Checkpoints; unclean stores are wiped
+
+SQLite State Store files live in a state directory and survive restarts. Each one records a Checkpoint, and Restore replays only the part of the Changelog after it. A store whose Checkpoint is missing or unclean is wiped and fully rebuilt. We never try to repair it, because the Changelog is the source of truth. Restore uses a separate per-Worker consumer outside the group, reading with `read_committed`, and only the Task being restored is paused. The Worker's other Tasks keep processing.
+
+## Consequences
+
+- v1 relies on cooperative-sticky assignment to keep Tasks where their local state is. A custom assignor that sends Tasks to Workers that already have their state (using per-member join metadata) is planned for v1.x.
+- On disposable disks (e.g. Kubernetes without persistent volumes) every start is a full Restore. That works, but it's slow for large stores.

@@ -1,0 +1,3 @@
+# A crash test suite against real Kafka is the proof behind the exactly-once claim
+
+The exactly-once claim is only as credible as its evidence. A crash test suite runs against real Kafka (testcontainers): it kills Workers at random points mid-batch and forces rebalances and restarts. It then checks that outputs and State Stores exactly match a reference run, with no duplicates and nothing missing. It runs nightly in CI, and we don't make or advertise the exactly-once claim for any release where it fails. The in-memory Test Driver is a public product feature, but it can't prove exactly-once, because it never touches a real broker.

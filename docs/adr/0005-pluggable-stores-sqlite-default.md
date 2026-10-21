@@ -1,0 +1,3 @@
+# State Stores are pluggable; SQLite via `better-sqlite3` is the default durable store
+
+State Stores sit behind an interface, with an in-memory version for tests and a SQLite version (`better-sqlite3`) as the default durable store. We use SQLite instead of RocksDB because RocksDB's Node bindings are fragile. Its transactions line up naturally with Kafka transactions. We chose `better-sqlite3` over `node:sqlite` because it's proven; switch once `node:sqlite` is stable, which removes a native dependency. Store keys are encoded to deterministic, order-preserving bytes so that range scans (windows) work regardless of the key Serde.
