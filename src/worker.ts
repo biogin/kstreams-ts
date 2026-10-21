@@ -20,6 +20,21 @@
 //   offsets of the transaction's sends. A failure aborts the Kafka transaction and rolls back the
 //   store transactions, so neither `read_committed` readers nor the stores keep the batch.
 //
+// Tasks are assigned whole and cooperative-sticky (task-assignor.ts): a rebalance moves as few
+// Tasks as it can, and a Task that moves is first revoked from its old owner, then assigned to its
+// new one in a second rebalance.
+//
+// Starting a Task (its first record, under exactly-once or with State Stores) happens between
+// batches too, and waits for the Task's previous owner, which may be another Worker or process:
+// - for its Task directory lock, when there is a state directory (state-directory.ts): the
+//   previous owner closes the Task, and so unlocks it, once it notices it lost the Task;
+// - under exactly-once, for its stable committed offsets (stable-offsets.ts): records before them
+//   were processed and committed already, and are skipped;
+// - for its Changelog partitions to have no transaction left open from before (restore.ts).
+// While a Worker waits for a lock or for stable offsets, it notices partitions it loses, and gives
+// up the wait to deal with them first, so two Workers waiting for each other's Tasks never
+// deadlock.
+//
 // Rebalances (ADR-0006): the client only reports them after the fact (see ownership.ts). A
 // rebalance that loses partitions ends the batch. Records still buffered for lost partitions are
 // dropped, and so are records fetched during a partition's earlier ownership, and records the
@@ -39,6 +54,7 @@
 // Worker closes the Tasks and leaves the group anyway.
 
 import {
+  COOPERATIVE_STICKY_ASSIGNOR,
   type ConsumeOptions,
   type Consumer,
   compatibilityPartitioner,
@@ -56,7 +72,10 @@ import { Ownership } from './ownership.js'
 import type { ProcessorGraph, SerializedRecord } from './processor-graph.js'
 import { ReadCommittedConsumer } from './read-committed.js'
 import { createChangelogReader, type KafkaChangelogReader, restoreStores } from './restore.js'
+import { createStableOffsetReader, type StableOffsetReader } from './stable-offsets.js'
+import { lockTask, unlockTask } from './state-directory.js'
 import { type ChangelogOffsets, createTask, type Task } from './task.js'
+import { assignTasks } from './task-assignor.js'
 
 export interface WorkerOptions {
   applicationId: string
@@ -79,6 +98,8 @@ export interface WorkerOptions {
   autoCreateInternalTopics: boolean
   /** The state directory State Stores are kept under, if any. */
   stateDir: string | undefined
+  /** Names the Worker in the Task directory locks it takes (see state-directory.ts). */
+  lockHolder: string
   /** Called once if the Worker stops because of an error; it has closed its clients by then. */
   onError(error: unknown): void
 }
@@ -122,6 +143,10 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
     sessionTimeout: options.sessionTimeoutMs,
     heartbeatInterval: Math.max(100, Math.min(3_000, Math.floor(options.sessionTimeoutMs / 3))),
     maxWaitTime: 500,
+    // Whole Tasks, cooperative-sticky (task-assignor.ts). Version 3 subscriptions carry the
+    // partitions each member owns, and the generation it owned them in.
+    protocols: [{ name: COOPERATIVE_STICKY_ASSIGNOR, version: 3 }],
+    partitionAssigner: assignTasks,
   })
   let roundRobin = 0
   const producer = new Producer<Bytes, Bytes, Bytes, Bytes>({
@@ -152,6 +177,15 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
     graph.stores.size === 0
       ? undefined
       : createChangelogReader({ brokers, clientId: `${clientId}-restore` })
+  // Exactly-once: where a new Task starts, once its previous owner's transaction has completed.
+  const stableOffsets =
+    transactionalId === undefined
+      ? undefined
+      : createStableOffsetReader({
+          brokers,
+          clientId: `${clientId}-offsets`,
+          groupId: applicationId,
+        })
 
   const topics = [...graph.sources.keys()]
   const consumeOptions: ConsumeOptions<Bytes, Bytes, Bytes, Bytes> = {
@@ -178,7 +212,11 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
     if (transactionalId !== undefined) await (await producer.beginTransaction()).cancel()
     stream = await consumer.consume(consumeOptions)
   } catch (error) {
-    await Promise.allSettled([closeQuietly(consumer, producer), restorer?.close()])
+    await Promise.allSettled([
+      closeQuietly(consumer, producer),
+      restorer?.close(),
+      stableOffsets?.close(),
+    ])
     throw error
   }
 
@@ -193,6 +231,7 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
     // offsets of the partitions the consumer has.
     openStream: () => consumer.consume(consumeOptions),
     restorer,
+    stableOffsets,
   })
   const done = cycle.run().then(
     () => close(),
@@ -210,7 +249,11 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
       await cycle.closeStream()
     } finally {
       // Closing the consumer leaves the group, so its Tasks move to other members right away.
-      await Promise.allSettled([closeQuietly(consumer, producer, force), restorer?.close()])
+      await Promise.allSettled([
+        closeQuietly(consumer, producer, force),
+        restorer?.close(),
+        stableOffsets?.close(),
+      ])
     }
   }
 
@@ -262,6 +305,8 @@ interface CommitCycleClients {
   openStream(): Promise<Stream>
   /** Reads the Changelogs of a new Task's State Stores; undefined without State Stores. */
   restorer: KafkaChangelogReader | undefined
+  /** Exactly-once: reads the stable committed offsets of a new Task's partitions. */
+  stableOffsets: StableOffsetReader | undefined
 }
 
 class CommitCycle {
@@ -277,8 +322,12 @@ class CommitCycle {
   #next: Promise<IteratorResult<ConsumedMessage>> = new Promise(() => {})
   /** Reads the Changelogs of a new Task's State Stores; undefined without State Stores. */
   readonly #restorer: KafkaChangelogReader | undefined
+  /** Exactly-once: reads the stable committed offsets of a new Task's partitions. */
+  readonly #stableOffsets: StableOffsetReader | undefined
   /** One Task per partition number, shared by all the Co-partitioned input topics. */
   readonly #tasks = new Map<number, Task>()
+  /** The Tasks whose directories this Worker has locked. */
+  readonly #locked = new Set<number>()
 
   #stopRequested = false
   /** Set once a stop gave the batch up: nothing is committed after that. */
@@ -313,6 +362,7 @@ class CommitCycle {
     this.#options = options
     this.#exactlyOnce = options.transactionalId !== undefined
     this.#restorer = clients.restorer
+    this.#stableOffsets = clients.stableOffsets
     this.#openStream = clients.openStream
     this.#stream = clients.stream
     this.#messages = clients.stream[Symbol.asyncIterator]()
@@ -376,10 +426,29 @@ class CommitCycle {
     }
   }
 
-  /** Rolls back and closes every Task. */
+  /** Rolls back and closes every Task, and unlocks their directories. */
   #closeTasks(): void {
     for (const task of this.#tasks.values()) closeTask(task)
     this.#tasks.clear()
+    for (const partition of [...this.#locked]) this.#unlock(partition)
+  }
+
+  /** Rolls back and closes the Task of `partition`, if open, and unlocks its directory. */
+  #closeTask(partition: number): void {
+    const task = this.#tasks.get(partition)
+    if (task !== undefined) closeTask(task)
+    this.#tasks.delete(partition)
+    this.#unlock(partition)
+  }
+
+  #unlock(partition: number): void {
+    const { stateDir, applicationId, lockHolder } = this.#options
+    if (!this.#locked.delete(partition) || stateDir === undefined) return
+    try {
+      unlockTask(stateDir, applicationId, partition, lockHolder)
+    } catch {
+      // The Streams App removes its Task locks once its Workers have stopped.
+    }
   }
 
   /**
@@ -395,13 +464,15 @@ class CommitCycle {
     const held = this.#held
     this.#held = undefined
     if (held !== undefined && this.#accepts(held)) {
-      await this.#restored(held.partition)
-      if (ownership.lostPending) {
+      if (!(await this.#started(held.partition))) {
         this.#held = held
         return
       }
-      this.#process(held)
-      count++
+      // The stable committed offset may be past it.
+      if (this.#accepts(held)) {
+        this.#process(held)
+        count++
+      }
     }
     let timer: NodeJS.Timeout | undefined
     const timeUp = new Promise<typeof TIME_UP>((resolve) => {
@@ -422,17 +493,18 @@ class CommitCycle {
           break
         }
         if (!this.#accepts(message)) continue
-        if (this.#needsRestore(message.partition)) {
-          // Restore only between batches: nothing of this batch may be produced or written yet.
+        if (this.#needsStart(message.partition)) {
+          // Start a Task only between batches: nothing of this batch may be produced or written
+          // yet.
           if (count > 0) {
             this.#held = message
             break
           }
-          await this.#restored(message.partition)
-          if (ownership.lostPending) {
+          if (!(await this.#started(message.partition))) {
             this.#held = message
             break
           }
+          if (!this.#accepts(message)) continue
         }
         this.#process(message)
         count++
@@ -454,14 +526,44 @@ class CommitCycle {
     )
   }
 
-  /** Whether a record for `partition` creates a Task whose State Stores must be restored. */
-  #needsRestore(partition: number): boolean {
-    return this.#restorer !== undefined && !this.#tasks.has(partition)
+  /**
+   * Whether a record for `partition` creates a Task that must be started between batches: under
+   * exactly-once, or with State Stores.
+   */
+  #needsStart(partition: number): boolean {
+    return (
+      (this.#restorer !== undefined || this.#stableOffsets !== undefined) &&
+      !this.#tasks.has(partition)
+    )
   }
 
-  /** Creates the Task of `partition` if needed, and waits for its Restore. */
-  async #restored(partition: number): Promise<void> {
+  /**
+   * Starts the Task of `partition` if needed (see the top of this file): locks its directory,
+   * skips what its stable committed offsets say was processed, creates it and waits for its
+   * Restore. Resolves to false if partitions were lost or the cycle is to end meanwhile; the Task
+   * is then started later, when its record comes again.
+   */
+  async #started(partition: number): Promise<boolean> {
+    if (this.#tasks.has(partition)) return true
+    const giveUp = () =>
+      this.#ownership.lostPending || this.#stopRequested || this.#failure !== undefined
+    const { stateDir, applicationId, lockHolder } = this.#options
+    if (stateDir !== undefined && this.#graph.stores.size > 0 && !this.#locked.has(partition)) {
+      if (!(await lockTask(stateDir, applicationId, partition, lockHolder, giveUp))) return false
+      this.#locked.add(partition)
+    }
+    if (this.#stableOffsets !== undefined) {
+      const topics = [...this.#graph.sources.keys()]
+      const stable = await this.#stableOffsets.read(topics, partition, giveUp)
+      if (stable === undefined) return false
+      for (const [topic, offset] of stable) {
+        const key = partitionKey(topic, partition)
+        const position = this.#position.get(key)
+        if (position === undefined || offset > position) this.#position.set(key, offset)
+      }
+    }
     await this.#task(partition).restored()
+    return !this.#ownership.lostPending
   }
 
   #process(message: ConsumedMessage): void {
@@ -581,11 +683,7 @@ class CommitCycle {
   /** Closes the Tasks of the `lost` partitions and forgets how far they were read. */
   #forget(lost: ReadonlySet<number>): void {
     if (lost.size === 0) return
-    for (const partition of lost) {
-      const task = this.#tasks.get(partition)
-      if (task !== undefined) closeTask(task)
-      this.#tasks.delete(partition)
-    }
+    for (const partition of lost) this.#closeTask(partition)
     for (const positions of [this.#position, this.#committedPosition]) {
       for (const key of positions.keys()) {
         if (lost.has(Number(key.slice(key.lastIndexOf(':') + 1)))) positions.delete(key)

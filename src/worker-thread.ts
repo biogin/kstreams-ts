@@ -12,6 +12,8 @@ import type { Worker } from './worker.js'
 export interface WorkerThreadData {
   appModule: string
   applicationId: string
+  /** The App Process ID (see state-directory.ts). */
+  processId: string
   workerNumber: number
 }
 
@@ -28,6 +30,8 @@ export type FromWorkerThread =
 export interface WorkerThreadOptions {
   appModule: URL
   applicationId: string
+  /** The App Process ID (see state-directory.ts). */
+  processId: string
   workerNumber: number
   /** How long the Worker may take to stop gracefully; the thread gets a margin on top. */
   shutdownTimeoutMs: number
@@ -52,8 +56,13 @@ const entry = new URL(
  * consumer group; rejects, after the thread has ended, if it could not.
  */
 export function startWorkerThread(options: WorkerThreadOptions): Promise<Worker> {
-  const { appModule, applicationId, workerNumber } = options
-  const workerData: WorkerThreadData = { appModule: appModule.href, applicationId, workerNumber }
+  const { appModule, applicationId, processId, workerNumber } = options
+  const workerData: WorkerThreadData = {
+    appModule: appModule.href,
+    applicationId,
+    processId,
+    workerNumber,
+  }
   const thread = new Thread(entry, { workerData, name: `${applicationId}-worker-${workerNumber}` })
   const exited = new Promise<number>((resolve) => thread.once('exit', resolve))
 

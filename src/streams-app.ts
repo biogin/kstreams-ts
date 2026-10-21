@@ -2,6 +2,12 @@ import { type ProcessorContext, ProcessorGraph, type ProcessorSupplier } from '.
 import type { StreamRecord } from './record.js'
 import { serdes as builtInSerdes, type Serde, type Serdes } from './serde.js'
 import {
+  claimProcessIdentity,
+  type ProcessIdentity,
+  taskLockHolder,
+  unlockTasksOf,
+} from './state-directory.js'
+import {
   defaultStoreSupplier,
   type KeyEncoding,
   type NamedStore,
@@ -405,7 +411,7 @@ export function createStreamsApp(config: StreamsAppConfig): StreamsApp {
  */
 export async function startWorkerOf(
   app: unknown,
-  { appModule, applicationId, workerNumber, onError }: WorkerOfOptions,
+  { appModule, applicationId, processId, workerNumber, onError }: WorkerOfOptions,
 ): Promise<Worker> {
   const runtime = runtimes.get(app as StreamsApp)
   if (runtime === undefined) {
@@ -418,12 +424,14 @@ export async function startWorkerOf(
       `App Module ${appModule} exports Streams App "${(app as StreamsApp).applicationId}", not "${applicationId}"`,
     )
   }
-  return runtime.startWorker(workerNumber, onError)
+  return runtime.startWorker(processId, workerNumber, onError)
 }
 
 export interface WorkerOfOptions {
   appModule: string
   applicationId: string
+  /** The App Process ID of the process the thread runs in (see state-directory.ts). */
+  processId: string
   workerNumber: number
   onError(error: unknown): void
 }
@@ -518,6 +526,8 @@ class Runtime {
   #workersStopped: Promise<void> | undefined
   /** The error that put the app in the `error` state. */
   #failure: { error: unknown } | undefined
+  /** The App Process ID, while the app runs. */
+  #identity: ProcessIdentity | undefined
 
   constructor(graph: ProcessorGraph, settings: RuntimeSettings) {
     this.#graph = graph
@@ -534,14 +544,17 @@ class Runtime {
       throw new Error(`Streams App "${applicationId}" cannot start: it is ${this.#state}`)
     }
     this.#checkStartable()
+    const identity = claimProcessIdentity(this.#settings.stateDir, applicationId)
+    this.#identity = identity
     const onError = (error: unknown) => this.#fail(error)
     const starting =
       appModule === undefined
-        ? [this.startWorker(0, onError)]
+        ? [this.startWorker(identity.id, 0, onError)]
         : Array.from({ length: workers }, (_, workerNumber) =>
             startWorkerThread({
               appModule,
               applicationId,
+              processId: identity.id,
               workerNumber,
               shutdownTimeoutMs,
               onError,
@@ -557,17 +570,23 @@ class Runtime {
     if (this.#state === 'created') this.#state = 'running'
   }
 
-  /** Starts Worker `workerNumber` in this thread. */
-  startWorker(workerNumber: number, onError: (error: unknown) => void): Promise<Worker> {
+  /** Starts Worker `workerNumber` of App Process `processId` in this thread. */
+  startWorker(
+    processId: string,
+    workerNumber: number,
+    onError: (error: unknown) => void,
+  ): Promise<Worker> {
     const brokers = this.#checkStartable()
     const { applicationId, guarantee } = this.#settings
-    const workerId = `${applicationId}-worker-${workerNumber}`
+    const workerId = `${applicationId}-${processId}-worker-${workerNumber}`
     return startWorker(this.#graph, {
       ...this.#settings,
       brokers,
       clientId: workerId,
-      // Stable across restarts, so a restarted Worker fences its predecessor's producer.
+      // Unique among the live Workers of the application, and the same when the process restarts
+      // with the same state directory, so a restarted Worker fences its predecessor's producer.
       transactionalId: guarantee === 'exactly-once' ? workerId : undefined,
+      lockHolder: taskLockHolder(processId, workerNumber),
       onError,
     })
   }
@@ -613,8 +632,25 @@ class Runtime {
           this.#fail(error)
         }
       }),
-    ).then(() => {})
+    ).then(() => this.#releaseIdentity())
     return this.#workersStopped
+  }
+
+  /**
+   * Once every Worker has stopped: removes the Task locks they still hold (a terminated worker
+   * thread can't), and gives the App Process ID up.
+   */
+  #releaseIdentity(): void {
+    const identity = this.#identity
+    if (identity === undefined) return
+    this.#identity = undefined
+    const { stateDir, applicationId } = this.#settings
+    try {
+      if (stateDir !== undefined) unlockTasksOf(stateDir, applicationId, identity.id)
+      identity.release()
+    } catch {
+      // A lock left behind is stale once this process is gone.
+    }
   }
 
   #fail(error: unknown): void {

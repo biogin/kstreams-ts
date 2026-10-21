@@ -4,9 +4,15 @@
 // Restore). See checkpoint.ts for when a Checkpoint is usable.
 //
 // Changelogs are read by a restore consumer outside the consumer group, with the low-level
-// `fetch()` under `read_committed`, from the start of the partition up to its last stable offset
-// (as of the start of the read). Aborted transactions are filtered out per fetch response by
-// read-committed.ts, not by the client (platformatic/kafka#467).
+// `fetch()` under `read_committed`, from the start of the partition up to its last stable offset.
+// Aborted transactions are filtered out per fetch response by read-committed.ts, not by the client
+// (platformatic/kafka#467).
+//
+// A Task that moved may still have a transaction of its previous owner open on its Changelog
+// partition (one the previous owner is about to abort, or one that committed but whose markers
+// aren't written yet). Its records would then sit after the last stable offset and be missed, so a
+// read first waits until every transaction open on the partition when it started has ended: until
+// the last stable offset reaches the end the partition had then.
 
 import { FetchIsolationLevels, IS_CONTROL, ListOffsetTimestamps } from '@platformatic/kafka'
 import type { StoreNode } from './processor-graph.js'
@@ -22,8 +28,8 @@ export interface ChangelogRecord {
 /** Reads the committed records of Changelog partitions. */
 export interface ChangelogReader {
   /**
-   * Reads `partition` of `topic` from offset `from` (by default its start) to its end as of the
-   * call (its last stable offset), skipping aborted transactions. Calls `apply` with the records,
+   * Reads `partition` of `topic` from offset `from` (by default its start) to its end (its last
+   * stable offset, once the transactions open at the call have ended), skipping aborted ones. Calls `apply` with the records,
    * in offset order, a chunk at a time. Resolves to the offset after the last one read: where a
    * later read would continue. Resolves to undefined, reading nothing, when `from` is outside the
    * partition (before its start or past its end).
@@ -125,6 +131,8 @@ const RETRIABLE_FETCH_ERRORS = new Set([
   75, // UNKNOWN_LEADER_EPOCH
 ])
 const MAX_FETCH_RETRIES = 50
+/** How often a read checks whether the transactions open on its partition have ended. */
+const TRANSACTION_POLL_MS = 100
 const FETCH_RETRY_DELAY_MS = 100
 
 /** Creates a restore consumer: a Kafka client that reads Changelogs without joining a group. */
@@ -141,12 +149,17 @@ export function createChangelogReader({
     isolationLevel: FetchIsolationLevels.READ_COMMITTED,
   })
 
-  async function offset(topic: string, partition: number, timestamp: bigint): Promise<bigint> {
+  async function offset(
+    topic: string,
+    partition: number,
+    timestamp: bigint,
+    isolationLevel: number = FetchIsolationLevels.READ_COMMITTED,
+  ): Promise<bigint> {
     const offsets = await consumer.listOffsets({
       topics: [topic],
       partitions: { [topic]: [partition] },
       timestamp,
-      isolationLevel: FetchIsolationLevels.READ_COMMITTED,
+      isolationLevel,
     })
     const found = offsets.get(topic)?.[partition]
     if (found === undefined) throw new Error(`No offset for Changelog "${topic}" ${partition}`)
@@ -169,9 +182,20 @@ export function createChangelogReader({
 
   return {
     async read(topic, partition, apply, from) {
-      // With read_committed, the latest offset is the last stable offset: no open transaction
-      // is waited for, and every aborted one before it has its marker.
-      const end = await offset(topic, partition, ListOffsetTimestamps.LATEST)
+      // With read_committed, the latest offset is the last stable offset: every aborted
+      // transaction before it has its marker. It must reach the end as of now (read_uncommitted):
+      // see the top of this file.
+      const written = await offset(
+        topic,
+        partition,
+        ListOffsetTimestamps.LATEST,
+        FetchIsolationLevels.READ_UNCOMMITTED,
+      )
+      let end = await offset(topic, partition, ListOffsetTimestamps.LATEST)
+      while (end < written) {
+        await new Promise((resolve) => setTimeout(resolve, TRANSACTION_POLL_MS))
+        end = await offset(topic, partition, ListOffsetTimestamps.LATEST)
+      }
       const start = await offset(topic, partition, ListOffsetTimestamps.EARLIEST)
       if (from !== undefined && (from < start || from > end)) return undefined
       let position = from ?? start
