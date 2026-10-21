@@ -29,6 +29,7 @@ describeWithKafka('Co-partitioned input topics on real Kafka', () => {
       applicationId: uniqueName('copartitioned'),
       brokers,
       sessionTimeoutMs: 10_000,
+      changelogReplicationFactor: 1,
     })
     const merge = app.processor('merge', (ctx: ProcessorContext<string, string | null>) => ({
       process(record: StreamRecord<string, string | null>) {
