@@ -50,6 +50,8 @@ describe('Streams App configuration', () => {
     ['commitMaxRecords', 0],
     ['commitMaxRecords', 2.5],
     ['sessionTimeoutMs', -5],
+    ['changelogReplicationFactor', 0],
+    ['changelogReplicationFactor', 1.5],
   ])('rejects %s: %s', (option, value) => {
     expect(() => createStreamsApp({ applicationId: 'commit', [option]: value })).toThrow(
       new RegExp(`${option} must be a positive`),

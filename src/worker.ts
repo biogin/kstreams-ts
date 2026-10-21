@@ -2,8 +2,9 @@
 // consumer (ADR-0007). With `workers: 0` the Streams App runs one Worker in the main thread.
 //
 // The commit cycle (at-least-once): read records into a batch until the commit interval runs out
-// or the batch is full, process each record in its Task, then produce the batch's outputs, wait
-// for the broker to acknowledge them, and only then commit the consumed offsets.
+// or the batch is full, process each record in its Task, then produce the batch's outputs and
+// Changelog records, wait for the broker to acknowledge them, and only then commit the consumed
+// offsets.
 
 import {
   Consumer,
@@ -15,6 +16,7 @@ import {
   ProduceAcks,
   Producer,
 } from '@platformatic/kafka'
+import { ensureChangelogs } from './internal-topics.js'
 import type { ProcessorGraph, SerializedRecord } from './processor-graph.js'
 import { createTask, type Task } from './task.js'
 
@@ -26,6 +28,8 @@ export interface WorkerOptions {
   commitIntervalMs: number
   commitMaxRecords: number
   sessionTimeoutMs: number
+  /** The replication factor of the Changelog topics the Worker creates. */
+  changelogReplicationFactor: number
   /** The state directory State Stores are kept under, if any. */
   stateDir: string | undefined
   /** Called once if the Worker stops because of an error; it has closed its clients by then. */
@@ -75,6 +79,11 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
 
   let stream: MessagesStream<Bytes, Bytes, Bytes, Bytes>
   try {
+    await ensureChangelogs(graph, {
+      brokers,
+      clientId,
+      replicationFactor: options.changelogReplicationFactor,
+    })
     stream = await consumer.consume({
       topics: [...graph.sources.keys()],
       // Resume from the committed offsets; a new application starts at the beginning.
@@ -134,7 +143,7 @@ class CommitCycle {
 
   /** The first error a Task raised. Stops the Worker (fail-fast). */
   #failure: { error: unknown } | undefined
-  // The current batch.
+  // The current batch. Outputs and Changelog records, in the order they were written.
   #outputs: MessageToProduce<Bytes, Bytes, Bytes, Bytes>[] = []
   #work: Promise<void>[] = []
   /** The last record read from each partition, by `topic:partition`. */
@@ -227,24 +236,25 @@ class CommitCycle {
     if (task === undefined) {
       task = createTask(
         this.#graph,
-        (topic, record) => {
-          this.#outputs.push({
-            topic,
-            ...(record.key === null ? {} : { key: toBuffer(record.key) }),
-            // The client writes a null value as a tombstone.
-            value: (record.value === null ? null : toBuffer(record.value)) as Bytes,
-            timestamp: BigInt(record.timestamp),
-          })
-        },
+        (topic, record) => this.#outputs.push(toMessage(topic, record)),
         Date.now,
-        { task: partition, stateDir: this.#options.stateDir },
+        {
+          task: partition,
+          stateDir: this.#options.stateDir,
+          // A Task's State Stores are logged to the Changelog partition of the same number.
+          changelog: (topic, record) =>
+            this.#outputs.push({ ...toMessage(topic, record), partition }),
+        },
       )
       this.#tasks.set(partition, task)
     }
     return task
   }
 
-  /** Finishes the batch: waits for its processing, produces its outputs, commits its offsets. */
+  /**
+   * Finishes the batch: waits for its processing, produces its outputs and Changelog records,
+   * commits its offsets.
+   */
   async #commit(): Promise<void> {
     if (this.#failure === undefined) {
       for (const task of this.#tasks.values()) this.#track(task.fireWallClockTimers())
@@ -269,6 +279,19 @@ class CommitCycle {
         })),
       })
     }
+  }
+}
+
+function toMessage(
+  topic: string,
+  record: SerializedRecord,
+): MessageToProduce<Bytes, Bytes, Bytes, Bytes> {
+  return {
+    topic,
+    ...(record.key === null ? {} : { key: toBuffer(record.key) }),
+    // The client writes a null value as a tombstone.
+    value: (record.value === null ? null : toBuffer(record.value)) as Bytes,
+    timestamp: BigInt(record.timestamp),
   }
 }
 

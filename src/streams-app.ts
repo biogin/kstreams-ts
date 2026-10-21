@@ -59,6 +59,11 @@ export interface StreamsAppConfig {
    * its Tasks to other members, in milliseconds. Defaults to 45000.
    */
   sessionTimeoutMs?: number
+  /**
+   * The replication factor of the Changelog topics the app creates, one per State Store, named
+   * `<applicationId>-<store>-changelog`. Defaults to 3; use 1 with a single-broker cluster.
+   */
+  changelogReplicationFactor?: number
 }
 
 /** The processing contract an application runs under. */
@@ -359,6 +364,7 @@ interface RuntimeSettings {
   commitIntervalMs: number
   commitMaxRecords: number
   sessionTimeoutMs: number
+  changelogReplicationFactor: number
   stateDir: string | undefined
 }
 
@@ -383,6 +389,11 @@ function runtimeSettings(config: StreamsAppConfig): RuntimeSettings {
     commitIntervalMs: positive('commitIntervalMs', config.commitIntervalMs ?? 100),
     commitMaxRecords: positive('commitMaxRecords', config.commitMaxRecords ?? 1000, true),
     sessionTimeoutMs: positive('sessionTimeoutMs', config.sessionTimeoutMs ?? 45_000),
+    changelogReplicationFactor: positive(
+      'changelogReplicationFactor',
+      config.changelogReplicationFactor ?? 3,
+      true,
+    ),
     stateDir: config.stateDir,
   }
 }

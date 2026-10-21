@@ -28,6 +28,11 @@ export interface TaskOptions {
   task?: number
   /** The configured state directory. Without one, State Stores get no directory. */
   stateDir?: string | undefined
+  /**
+   * Receives every State Store write as a record for the store's Changelog topic (the Task's
+   * partition of it), timestamped with the wall-clock time. Without one, writes aren't logged.
+   */
+  changelog?: RecordCollector | undefined
 }
 
 export interface Task {
@@ -95,7 +100,7 @@ export function createTask(
   graph: ProcessorGraph,
   collect: RecordCollector,
   wallClockTime: () => number = Date.now,
-  { task = 0, stateDir }: TaskOptions = {},
+  { task = 0, stateDir, changelog }: TaskOptions = {},
 ): Task {
   // Async Processor calls of the current record that have not settled yet.
   const inFlight = new Set<Promise<void>>()
@@ -174,7 +179,11 @@ export function createTask(
     const directory =
       stateDir === undefined ? undefined : taskDirectory(stateDir, graph.applicationId, task)
     const opened = supplier({ name, applicationId: graph.applicationId, task, directory })
-    stores.set(name, keyValueStore(opened, serdes, { topic: changelogTopic }, keyEncoding))
+    const log =
+      changelog &&
+      ((key: Uint8Array, value: Uint8Array | null) =>
+        changelog(changelogTopic, { key, value, timestamp: wallClockTime() }))
+    stores.set(name, keyValueStore(opened, serdes, { topic: changelogTopic }, keyEncoding, log))
   }
   const store = (ref: string | NamedStore<unknown, unknown>): KeyValueStore<unknown, unknown> => {
     const name = typeof ref === 'string' ? ref : ref.name
