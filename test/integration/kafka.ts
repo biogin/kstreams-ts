@@ -85,47 +85,22 @@ export function createKafka() {
       count: number,
       { timeoutMs = 20_000, settleMs = 500 } = {},
     ): Promise<TestRecord[]> {
-      const consumer = new Consumer({
-        clientId: uniqueName('test-consumer'),
-        groupId: uniqueName('test-group'),
-        bootstrapBrokers: brokers,
-        autocommit: false,
-        isolationLevel: FetchIsolationLevels.READ_COMMITTED,
-        sessionTimeout: 10_000,
-        heartbeatInterval: 1_000,
-        maxWaitTime: 100,
-      })
-      const records: TestRecord[] = []
-      try {
-        const stream = await consumer.consume({ topics: [topic], mode: 'earliest' })
-        await new Promise<void>((resolve, reject) => {
-          let settle: NodeJS.Timeout | undefined
-          const timeout = setTimeout(
-            () =>
-              reject(
-                new Error(`Read ${records.length} of ${count} records from "${topic}" in time`),
-              ),
-            timeoutMs,
-          )
-          stream.on('error', reject)
-          stream.on('data', (message: Message) => {
-            records.push({
-              key: message.key === undefined ? null : message.key.toString(),
-              value: message.value === undefined ? null : message.value.toString(),
-              timestamp: Number(message.timestamp),
-              partition: message.partition,
-            })
-            if (records.length === count && settle === undefined) {
-              clearTimeout(timeout)
-              settle = setTimeout(resolve, settleMs)
-            }
-          })
-        })
-        await stream.close()
-      } finally {
-        await consumer.close(true)
-      }
-      return records
+      let seen = 0
+      return readTopic(topic, () => ++seen === count, { timeoutMs, settleMs })
+    },
+
+    /**
+     * Reads `topic` from the beginning (read_committed), calling `done` with each record, until it
+     * returns true. Resolves with every record read (duplicates included); rejects after
+     * `timeoutMs`. Use it when the number of output records is not known, e.g. at-least-once
+     * after a crash.
+     */
+    async consumeUntil(
+      topic: string,
+      done: (record: TestRecord) => boolean,
+      { timeoutMs = 20_000 } = {},
+    ): Promise<TestRecord[]> {
+      return readTopic(topic, done, { timeoutMs, settleMs: 0 })
     },
 
     /** The committed offset of every partition of `topic` for consumer group `groupId`. */
@@ -154,6 +129,52 @@ export function createKafka() {
       }
     },
   }
+}
+
+async function readTopic(
+  topic: string,
+  done: (record: TestRecord) => boolean,
+  { timeoutMs, settleMs }: { timeoutMs: number; settleMs: number },
+): Promise<TestRecord[]> {
+  const consumer = new Consumer({
+    clientId: uniqueName('test-consumer'),
+    groupId: uniqueName('test-group'),
+    bootstrapBrokers: brokers,
+    autocommit: false,
+    isolationLevel: FetchIsolationLevels.READ_COMMITTED,
+    sessionTimeout: 10_000,
+    heartbeatInterval: 1_000,
+    maxWaitTime: 100,
+  })
+  const records: TestRecord[] = []
+  try {
+    const stream = await consumer.consume({ topics: [topic], mode: 'earliest' })
+    await new Promise<void>((resolve, reject) => {
+      let settle: NodeJS.Timeout | undefined
+      const timeout = setTimeout(
+        () => reject(new Error(`Read only ${records.length} records from "${topic}" in time`)),
+        timeoutMs,
+      )
+      stream.on('error', reject)
+      stream.on('data', (message: Message) => {
+        const record: TestRecord = {
+          key: message.key === undefined ? null : message.key.toString(),
+          value: message.value === undefined ? null : message.value.toString(),
+          timestamp: Number(message.timestamp),
+          partition: message.partition,
+        }
+        records.push(record)
+        if (settle === undefined && done(record)) {
+          clearTimeout(timeout)
+          settle = setTimeout(resolve, settleMs)
+        }
+      })
+    })
+    await stream.close()
+  } finally {
+    await consumer.close(true)
+  }
+  return records
 }
 
 export function delay(ms: number): Promise<void> {
