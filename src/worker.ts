@@ -1,10 +1,13 @@
 // Internal: a Worker, one consumer-group member that owns its Tasks, its producer and its
 // consumer (ADR-0007). With `workers: 0` the Streams App runs one Worker in the main thread.
 //
-// The commit cycle (at-least-once): read records into a batch until the commit interval runs out
-// or the batch is full, process each record in its Task, then produce the batch's outputs and
-// Changelog records, wait for the broker to acknowledge them, and only then commit the consumed
-// offsets.
+// The commit cycle: read records into a batch until the commit interval runs out or the batch is
+// full, and process each record in its Task.
+// - At-least-once: then produce the batch's outputs and Changelog records, wait for the broker to
+//   acknowledge them, and only then commit the consumed offsets.
+// - Exactly-once: outputs go into the Worker's open Kafka transaction as they are produced; at the
+//   end of the batch the consumed offsets (the last record per partition) join the transaction
+//   and it commits. A failure aborts it, so `read_committed` readers never see the batch.
 
 import {
   Consumer,
@@ -26,6 +29,11 @@ export interface WorkerOptions {
   brokers: string[]
   /** Identifies this Worker's clients to the broker. */
   clientId: string
+  /**
+   * The Worker's transactional ID under exactly-once; at-least-once without one. Must stay the
+   * same across restarts, so the new producer fences the old one.
+   */
+  transactionalId: string | undefined
   commitIntervalMs: number
   commitMaxRecords: number
   sessionTimeoutMs: number
@@ -45,16 +53,22 @@ export interface Worker {
   stop(): Promise<void>
 }
 
+/** How much longer than the commit interval a transaction may stay open. */
+const TRANSACTION_TIMEOUT_MARGIN_MS = 10_000
+
 /** Bytes, as the Kafka client wants them. */
 type Bytes = Buffer
 type ConsumedMessage = Message<Bytes, Bytes, Bytes, Bytes>
+type Output = MessageToProduce<Bytes, Bytes, Bytes, Bytes>
+/** The client doesn't export its transaction type. */
+type Transaction = Awaited<ReturnType<Producer<Bytes, Bytes, Bytes, Bytes>['beginTransaction']>>
 
 /**
  * Joins the consumer group (the Application ID) and starts the commit cycle. Resolves once the
  * Worker has joined; rejects (after closing its clients) if it could not.
  */
 export async function startWorker(graph: ProcessorGraph, options: WorkerOptions): Promise<Worker> {
-  const { applicationId, brokers, clientId } = options
+  const { applicationId, brokers, clientId, transactionalId } = options
   const consumer = new Consumer<Bytes, Bytes, Bytes, Bytes>({
     clientId,
     groupId: applicationId,
@@ -72,6 +86,18 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
     bootstrapBrokers: brokers,
     idempotent: true,
     acks: ProduceAcks.ALL,
+    ...(transactionalId === undefined
+      ? {}
+      : {
+          transactionalId,
+          // The client also sends this as the transaction timeout, after which the broker aborts
+          // an open transaction. It must outlast a batch (the client default is 5 s).
+          timeout: options.commitIntervalMs + TRANSACTION_TIMEOUT_MARGIN_MS,
+          // Without these the client asks the broker for producer ID 0 / epoch 0, which the broker
+          // rejects as fenced once the transactional ID was used before (any restart).
+          producerId: -1n,
+          producerEpoch: -1,
+        }),
     // Keyed records go where Java clients would put them (murmur2), so Co-partitioned topics
     // written by other producers line up; records without a key are spread round-robin.
     partitioner: (message, key) =>
@@ -100,7 +126,15 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
     throw error
   }
 
-  const cycle = new CommitCycle(graph, options, consumer, producer, stream)
+  const cycle = new CommitCycle(
+    graph,
+    options,
+    (fail) =>
+      transactionalId === undefined
+        ? new AtLeastOnceCommitter(consumer, producer)
+        : new TransactionalCommitter(consumer, producer, fail),
+    stream,
+  )
   const done = cycle.run().then(
     () => close(),
     async (error: unknown) => {
@@ -130,25 +164,24 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
 }
 
 const TIME_UP = Symbol('time up')
-const STOP = Symbol('stop')
+const INTERRUPTED = Symbol('interrupted')
 
 class CommitCycle {
   readonly #graph: ProcessorGraph
   readonly #options: WorkerOptions
-  readonly #consumer: Consumer<Bytes, Bytes, Bytes, Bytes>
-  readonly #producer: Producer<Bytes, Bytes, Bytes, Bytes>
+  readonly #committer: BatchCommitter
   readonly #messages: AsyncIterator<ConsumedMessage>
   /** One Task per partition number, shared by all the Co-partitioned input topics. */
   readonly #tasks = new Map<number, Task>()
 
   #stopRequested = false
-  readonly #stop: Promise<typeof STOP>
-  #wakeOnStop: () => void = () => {}
+  /** Settles when a stop is requested or the batch fails, ending the batch early. */
+  readonly #interrupted: Promise<typeof INTERRUPTED>
+  #interrupt: () => void = () => {}
 
-  /** The first error a Task raised. Stops the Worker (fail-fast). */
+  /** The first error a Task or a send raised. Stops the Worker (fail-fast). */
   #failure: { error: unknown } | undefined
-  // The current batch. Outputs and Changelog records, in the order they were written.
-  #outputs: MessageToProduce<Bytes, Bytes, Bytes, Bytes>[] = []
+  // The current batch.
   #work: Promise<void>[] = []
   /** The last record read from each partition, by `topic:partition`. */
   #lastRead = new Map<string, ConsumedMessage>()
@@ -156,23 +189,27 @@ class CommitCycle {
   constructor(
     graph: ProcessorGraph,
     options: WorkerOptions,
-    consumer: Consumer<Bytes, Bytes, Bytes, Bytes>,
-    producer: Producer<Bytes, Bytes, Bytes, Bytes>,
+    createCommitter: (fail: (error: unknown) => void) => BatchCommitter,
     stream: MessagesStream<Bytes, Bytes, Bytes, Bytes>,
   ) {
     this.#graph = graph
     this.#options = options
-    this.#consumer = consumer
-    this.#producer = producer
+    this.#committer = createCommitter((error) => this.#fail(error))
     this.#messages = stream[Symbol.asyncIterator]()
-    this.#stop = new Promise((resolve) => {
-      this.#wakeOnStop = () => resolve(STOP)
+    this.#interrupted = new Promise((resolve) => {
+      this.#interrupt = () => resolve(INTERRUPTED)
     })
   }
 
   requestStop(): void {
     this.#stopRequested = true
-    this.#wakeOnStop()
+    this.#interrupt()
+  }
+
+  /** Remembers the first failure and ends the batch, which then fails (fail-fast). */
+  #fail(error: unknown): void {
+    this.#failure ??= { error }
+    this.#interrupt()
   }
 
   async run(): Promise<void> {
@@ -183,6 +220,10 @@ class CommitCycle {
         next = (await this.#readBatch(next)).next
         await this.#commit()
       }
+    } catch (error) {
+      // The error is what the Worker reports, not a failure to abort.
+      await this.#committer.abort().catch(() => {})
+      throw error
     } finally {
       next.catch(() => {})
     }
@@ -203,8 +244,8 @@ class CommitCycle {
     let next = pending
     try {
       for (let count = 0; count < commitMaxRecords; count++) {
-        const result = await Promise.race([next, timeUp, this.#stop])
-        if (result === TIME_UP || result === STOP) break
+        const result = await Promise.race([next, timeUp, this.#interrupted])
+        if (result === TIME_UP || result === INTERRUPTED) break
         if (result.done) throw new Error('The consumer stopped delivering records')
         next = this.#messages.next()
         this.#process(result.value)
@@ -228,11 +269,7 @@ class CommitCycle {
 
   /** Keeps a Task's work for the commit, remembering the first failure. */
   #track(work: Promise<void>): void {
-    this.#work.push(
-      work.catch((error: unknown) => {
-        this.#failure ??= { error }
-      }),
-    )
+    this.#work.push(work.catch((error: unknown) => this.#fail(error)))
   }
 
   #task(partition: number): Task {
@@ -240,14 +277,14 @@ class CommitCycle {
     if (task === undefined) {
       task = createTask(
         this.#graph,
-        (topic, record) => this.#outputs.push(toMessage(topic, record)),
+        (topic, record) => this.#committer.produce(toMessage(topic, record)),
         Date.now,
         {
           task: partition,
           stateDir: this.#options.stateDir,
           // A Task's State Stores are logged to the Changelog partition of the same number.
           changelog: (topic, record) =>
-            this.#outputs.push({ ...toMessage(topic, record), partition }),
+            this.#committer.produce({ ...toMessage(topic, record), partition }),
         },
       )
       this.#tasks.set(partition, task)
@@ -256,8 +293,8 @@ class CommitCycle {
   }
 
   /**
-   * Finishes the batch: waits for its processing, produces its outputs and Changelog records,
-   * commits its offsets.
+   * Finishes the batch: waits for its processing, then commits its outputs, Changelog records and
+   * offsets.
    */
   async #commit(): Promise<void> {
     if (this.#failure === undefined) {
@@ -267,12 +304,47 @@ class CommitCycle {
     this.#work = []
     if (this.#failure !== undefined) throw this.#failure.error
 
+    const lastRead = [...this.#lastRead.values()]
+    this.#lastRead = new Map()
+    await this.#committer.commit(lastRead)
+  }
+}
+
+/** Commits a batch under one Delivery Guarantee. */
+interface BatchCommitter {
+  /** Takes an output of the current batch. */
+  produce(output: Output): void
+  /**
+   * Commits the current batch: its outputs, and the offsets after `lastRead` (the last record
+   * read from each partition). Rejects if any part of it failed.
+   */
+  commit(lastRead: ConsumedMessage[]): Promise<void>
+  /** Gives up on the current batch after a failure. */
+  abort(): Promise<void>
+}
+
+/** Produces the outputs, waits for the broker to acknowledge them, then commits the offsets. */
+class AtLeastOnceCommitter implements BatchCommitter {
+  readonly #consumer: Consumer<Bytes, Bytes, Bytes, Bytes>
+  readonly #producer: Producer<Bytes, Bytes, Bytes, Bytes>
+  #outputs: Output[] = []
+
+  constructor(
+    consumer: Consumer<Bytes, Bytes, Bytes, Bytes>,
+    producer: Producer<Bytes, Bytes, Bytes, Bytes>,
+  ) {
+    this.#consumer = consumer
+    this.#producer = producer
+  }
+
+  produce(output: Output): void {
+    this.#outputs.push(output)
+  }
+
+  async commit(lastRead: ConsumedMessage[]): Promise<void> {
     const outputs = this.#outputs
     this.#outputs = []
     if (outputs.length > 0) await this.#producer.send({ messages: outputs })
-
-    const lastRead = [...this.#lastRead.values()]
-    this.#lastRead = new Map()
     if (lastRead.length > 0) {
       await this.#consumer.commit({
         offsets: lastRead.map(({ topic, partition, offset, leaderEpoch }) => ({
@@ -283,6 +355,119 @@ class CommitCycle {
         })),
       })
     }
+  }
+
+  async abort(): Promise<void> {
+    this.#outputs = []
+  }
+}
+
+/**
+ * Sends the outputs into a Kafka transaction as they come, then adds the consumed offsets to it
+ * and commits it (ADR-0002, ADR-0008). A transaction is only begun once there is something to
+ * send or commit: the broker rejects ending an empty one.
+ */
+class TransactionalCommitter implements BatchCommitter {
+  readonly #consumer: Consumer<Bytes, Bytes, Bytes, Bytes>
+  readonly #producer: Producer<Bytes, Bytes, Bytes, Bytes>
+  #transaction: Transaction | undefined
+  /** Outputs waiting for the next send. */
+  #pending: Output[] = []
+  /** The chain of sends: one at a time, so outputs keep their order. */
+  #sending: Promise<void> = Promise.resolve()
+  #sendScheduled = false
+  /** The first error a send raised. Fails the batch. */
+  #sendFailure: { error: unknown } | undefined
+  /** Reports a send error right away, so the batch ends early. */
+  readonly #fail: (error: unknown) => void
+
+  constructor(
+    consumer: Consumer<Bytes, Bytes, Bytes, Bytes>,
+    producer: Producer<Bytes, Bytes, Bytes, Bytes>,
+    fail: (error: unknown) => void,
+  ) {
+    this.#consumer = consumer
+    this.#producer = producer
+    this.#fail = fail
+  }
+
+  produce(output: Output): void {
+    this.#pending.push(output)
+    if (this.#sendScheduled) return
+    // Outputs produced while a send is in flight go out together in the next one.
+    this.#sendScheduled = true
+    this.#sending = this.#sending.then(() => this.#send())
+  }
+
+  async #send(): Promise<void> {
+    this.#sendScheduled = false
+    const messages = this.#pending
+    this.#pending = []
+    if (messages.length === 0 || this.#sendFailure !== undefined) return
+    try {
+      const transaction = await this.#begin()
+      await transaction.send({ messages })
+    } catch (error) {
+      this.#sendFailure = { error }
+      this.#fail(error)
+    }
+  }
+
+  async #begin(): Promise<Transaction> {
+    this.#transaction ??= await this.#producer.beginTransaction()
+    return this.#transaction
+  }
+
+  async commit(lastRead: ConsumedMessage[]): Promise<void> {
+    await this.#sending
+    if (this.#sendFailure !== undefined) throw this.#sendFailure.error
+    if (lastRead.length > 0) {
+      const transaction = await this.#begin()
+      await transaction.addConsumer(this.#consumer)
+      // One offset per partition, and one at a time: the client merges concurrent offset commits.
+      for (const message of lastRead) await transaction.addOffset(this.#withCurrentGroup(message))
+    }
+    const transaction = this.#transaction
+    this.#transaction = undefined
+    await transaction?.commit()
+  }
+
+  /**
+   * `message` with the consumer group's current generation instead of the one it was fetched
+   * under, which a rebalance during the batch makes stale. Only valid for a partition this Worker
+   * still owns; a revoked partition fails the batch (handling revokes is ticket 28, ADR-0006).
+   */
+  #withCurrentGroup(message: ConsumedMessage): ConsumedMessage {
+    const { topic, partition } = message
+    const consumer = this.#consumer
+    const owned = consumer.assignments?.some(
+      (assignment) => assignment.topic === topic && assignment.partitions.includes(partition),
+    )
+    if (!owned) {
+      throw new Error(
+        `Partition ${topic}-${partition} was revoked during the batch; aborting its transaction`,
+      )
+    }
+    return {
+      ...message,
+      metadata: {
+        ...message.metadata,
+        consumer: {
+          groupId: consumer.groupId,
+          memberId: consumer.memberId,
+          generationId: consumer.generationId,
+          coordinatorId: consumer.coordinatorId,
+        },
+      },
+    } as ConsumedMessage
+  }
+
+  async abort(): Promise<void> {
+    await this.#sending
+    this.#pending = []
+    const transaction = this.#transaction
+    this.#transaction = undefined
+    await transaction?.abort()
   }
 }
 

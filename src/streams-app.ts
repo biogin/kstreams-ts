@@ -37,8 +37,10 @@ export interface StreamsAppConfig {
    */
   brokers?: string[]
   /**
-   * The Delivery Guarantee. Defaults to `'at-least-once'`. `'exactly-once'` is not implemented
-   * yet and is rejected.
+   * The Delivery Guarantee. Defaults to `'at-least-once'`. Under `'exactly-once'` each batch's
+   * outputs and consumed offsets commit together in one Kafka transaction, so `read_committed`
+   * readers never see the outputs of a failed batch. Exactly-once with State Stores is not
+   * implemented yet: such an app refuses to start.
    */
   guarantee?: DeliveryGuarantee
   /**
@@ -360,6 +362,7 @@ export function createStreamsApp(config: StreamsAppConfig): StreamsApp {
 
 interface RuntimeSettings {
   applicationId: string
+  guarantee: DeliveryGuarantee
   brokers: string[] | undefined
   commitIntervalMs: number
   commitMaxRecords: number
@@ -370,10 +373,7 @@ interface RuntimeSettings {
 
 function runtimeSettings(config: StreamsAppConfig): RuntimeSettings {
   const { guarantee = 'at-least-once', workers = 0, brokers } = config
-  if (guarantee === 'exactly-once') {
-    throw new Error('guarantee: exactly-once is not implemented yet; use at-least-once')
-  }
-  if (guarantee !== 'at-least-once') {
+  if (guarantee !== 'at-least-once' && guarantee !== 'exactly-once') {
     throw new Error(`Unknown Delivery Guarantee ${JSON.stringify(guarantee)}`)
   }
   if (!(Number.isInteger(workers) && workers >= 0)) {
@@ -385,6 +385,7 @@ function runtimeSettings(config: StreamsAppConfig): RuntimeSettings {
   }
   return {
     applicationId: config.applicationId,
+    guarantee,
     brokers,
     commitIntervalMs: positive('commitIntervalMs', config.commitIntervalMs ?? 100),
     commitMaxRecords: positive('commitMaxRecords', config.commitMaxRecords ?? 1000, true),
@@ -425,7 +426,7 @@ class Runtime {
   }
 
   async start(): Promise<void> {
-    const { applicationId, brokers } = this.#settings
+    const { applicationId, brokers, guarantee } = this.#settings
     if (this.#state !== 'created' || this.#worker !== undefined) {
       throw new Error(`Streams App "${applicationId}" cannot start: it is ${this.#state}`)
     }
@@ -435,10 +436,18 @@ class Runtime {
     if (this.#graph.sources.size === 0) {
       throw new Error(`Streams App "${applicationId}" reads no topic: declare a Stream first`)
     }
+    if (guarantee === 'exactly-once' && this.#graph.stores.size > 0) {
+      throw new Error(
+        `Streams App "${applicationId}": exactly-once with State Stores is not implemented yet; use at-least-once`,
+      )
+    }
+    const workerId = `${applicationId}-worker-0`
     const worker = startWorker(this.#graph, {
       ...this.#settings,
       brokers,
-      clientId: `${applicationId}-worker-0`,
+      clientId: workerId,
+      // Stable across restarts, so a restarted Worker fences its predecessor's producer.
+      transactionalId: guarantee === 'exactly-once' ? workerId : undefined,
       onError: (error) => this.#fail(error),
     })
     this.#worker = worker.catch(() => undefined)
