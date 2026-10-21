@@ -19,11 +19,31 @@
 //   do the Tasks commit their store transactions and write their Checkpoints, with the Changelog
 //   offsets of the transaction's sends. A failure aborts the Kafka transaction and rolls back the
 //   store transactions, so neither `read_committed` readers nor the stores keep the batch.
+//
+// Rebalances (ADR-0006): the client only reports them after the fact (see ownership.ts). A
+// rebalance that loses partitions ends the batch. Records still buffered for lost partitions are
+// dropped, and so are records fetched during a partition's earlier ownership, and records the
+// client delivers again (after a rebalance it rewinds every partition it keeps to its committed
+// offset).
+// - Exactly-once: a batch with records of a lost partition aborts: Kafka abort, then SQLite
+//   rollback. Every Task is then closed, since a rollback doesn't undo Stream Time, timers or
+//   Processor state, and is created again (restored from its Checkpoint) when its records come
+//   back: the Worker reads every partition again from its committed offset. A batch without such
+//   records commits, with the consumer's current group generation.
+// - At-least-once: the batch commits its outputs, and the offsets of the partitions still owned;
+//   the new owner of a lost partition processes its records again.
+// Either way the Tasks of lost partitions are closed; one that comes back is a new Task.
+//
+// A graceful stop ends the batch, commits it, closes the Tasks and leaves the group. If that takes
+// longer than the shutdown timeout, the batch is given up (under exactly-once, aborted) and the
+// Worker closes the Tasks and leaves the group anyway.
 
 import {
+  type ConsumeOptions,
   Consumer,
   compatibilityPartitioner,
   FetchIsolationLevels,
+  findErrorBy,
   type Message,
   type MessagesStream,
   type MessageToProduce,
@@ -32,6 +52,7 @@ import {
 } from '@platformatic/kafka'
 import { checkCoPartitioned } from './co-partitioning.js'
 import { ensureChangelogs } from './internal-topics.js'
+import { Ownership } from './ownership.js'
 import type { ProcessorGraph, SerializedRecord } from './processor-graph.js'
 import { createChangelogReader, type KafkaChangelogReader, restoreStores } from './restore.js'
 import { type ChangelogOffsets, createTask, type Task } from './task.js'
@@ -49,6 +70,8 @@ export interface WorkerOptions {
   commitIntervalMs: number
   commitMaxRecords: number
   sessionTimeoutMs: number
+  /** How long `stop()` may take to commit the current batch before it gives the batch up. */
+  shutdownTimeoutMs: number
   /** The replication factor of the Changelog topics the Worker creates. */
   changelogReplicationFactor: number
   /** The state directory State Stores are kept under, if any. */
@@ -59,8 +82,10 @@ export interface WorkerOptions {
 
 export interface Worker {
   /**
-   * Finishes the current batch (processing, producing and committing it), then leaves the
-   * consumer group and closes the Worker's clients. Rejects if the Worker stopped with an error.
+   * Finishes the current batch (processing, producing and committing it), closes the Tasks, then
+   * leaves the consumer group and closes the Worker's clients. If that takes longer than the
+   * shutdown timeout, gives the batch up instead (under exactly-once, aborts it), and still closes
+   * the Tasks and leaves the group. Rejects if the Worker stopped with an error.
    */
   stop(): Promise<void>
 }
@@ -72,6 +97,7 @@ const TRANSACTION_TIMEOUT_MARGIN_MS = 10_000
 type Bytes = Buffer
 type ConsumedMessage = Message<Bytes, Bytes, Bytes, Bytes>
 type Output = MessageToProduce<Bytes, Bytes, Bytes, Bytes>
+type Stream = MessagesStream<Bytes, Bytes, Bytes, Bytes>
 /** The client doesn't export its transaction type. */
 type Transaction = Awaited<ReturnType<Producer<Bytes, Bytes, Bytes, Bytes>['beginTransaction']>>
 
@@ -123,7 +149,14 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
       : createChangelogReader({ brokers, clientId: `${clientId}-restore` })
 
   const topics = [...graph.sources.keys()]
-  let stream: MessagesStream<Bytes, Bytes, Bytes, Bytes>
+  const consumeOptions: ConsumeOptions<Bytes, Bytes, Bytes, Bytes> = {
+    topics,
+    // Resume from the committed offsets; a new application starts at the beginning.
+    mode: 'committed',
+    fallbackMode: 'earliest',
+    autocommit: false,
+  }
+  let stream: Stream
   try {
     // Checked before joining the group, so a misconfigured app never takes any Task.
     await checkCoPartitioned(consumer, applicationId, topics)
@@ -136,28 +169,24 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
     // Changelog is restored: the broker aborts (or completes) a transaction it left open, e.g.
     // after a crash, so neither waits for that transaction's timeout.
     if (transactionalId !== undefined) await (await producer.beginTransaction()).cancel()
-    stream = await consumer.consume({
-      topics,
-      // Resume from the committed offsets; a new application starts at the beginning.
-      mode: 'committed',
-      fallbackMode: 'earliest',
-      autocommit: false,
-    })
+    stream = await consumer.consume(consumeOptions)
   } catch (error) {
     await Promise.allSettled([closeQuietly(consumer, producer), restorer?.close()])
     throw error
   }
 
-  const cycle = new CommitCycle(
-    graph,
-    options,
-    (fail) =>
+  const cycle = new CommitCycle(graph, options, {
+    consumer,
+    createCommitter: (fail, owns) =>
       transactionalId === undefined
         ? new AtLeastOnceCommitter(consumer, producer)
-        : new TransactionalCommitter(consumer, producer, fail),
+        : new TransactionalCommitter(consumer, producer, fail, owns),
     stream,
+    // While a stream is open, opening another joins no group: it starts from the committed
+    // offsets of the partitions the consumer has.
+    openStream: () => consumer.consume(consumeOptions),
     restorer,
-  )
+  })
   const done = cycle.run().then(
     () => close(),
     async (error: unknown) => {
@@ -171,7 +200,7 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
 
   async function close(force = false): Promise<void> {
     try {
-      await stream.close()
+      await cycle.closeStream()
     } finally {
       // Closing the consumer leaves the group, so its Tasks move to other members right away.
       await Promise.allSettled([closeQuietly(consumer, producer, force), restorer?.close()])
@@ -181,7 +210,17 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
   return {
     stop() {
       cycle.requestStop()
-      return done
+      return new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          // The batch didn't commit in time (e.g. a Processor or a Restore is still busy): give
+          // it up, and leave the group without waiting for it.
+          cycle
+            .abandon()
+            .then(() => close(true))
+            .then(resolve, reject)
+        }, options.shutdownTimeoutMs)
+        done.then(resolve, reject).finally(() => clearTimeout(timer))
+      })
     },
   }
 }
@@ -189,20 +228,59 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
 const TIME_UP = Symbol('time up')
 const INTERRUPTED = Symbol('interrupted')
 
+/** Thrown when a batch would commit the offset of a partition the Worker no longer owns. */
+class PartitionRevokedError extends Error {}
+
+/**
+ * Whether `error` means the group moved on (a rebalance) while the batch was committing, so the
+ * batch can be given up and the Worker go on.
+ */
+function isRebalanceError(error: unknown): boolean {
+  if (error instanceof PartitionRevokedError) return true
+  return error instanceof Error && findErrorBy(error, 'needsRejoin', true) !== null
+}
+
+function partitionKey(topic: string, partition: number): string {
+  return `${topic}:${partition}`
+}
+
+interface CommitCycleClients {
+  consumer: Consumer<Bytes, Bytes, Bytes, Bytes>
+  createCommitter(
+    fail: (error: unknown) => void,
+    owns: (topic: string, partition: number) => boolean,
+  ): BatchCommitter
+  stream: Stream
+  /** Opens another stream of the same topics, from the committed offsets. */
+  openStream(): Promise<Stream>
+  /** Reads the Changelogs of a new Task's State Stores; undefined without State Stores. */
+  restorer: KafkaChangelogReader | undefined
+}
+
 class CommitCycle {
   readonly #graph: ProcessorGraph
   readonly #options: WorkerOptions
+  readonly #exactlyOnce: boolean
   readonly #committer: BatchCommitter
-  readonly #messages: AsyncIterator<ConsumedMessage>
+  readonly #ownership: Ownership
+  readonly #openStream: () => Promise<Stream>
+  #stream: Stream
+  #messages: AsyncIterator<ConsumedMessage>
+  /** The read pending on `#messages`. */
+  #next: Promise<IteratorResult<ConsumedMessage>> = new Promise(() => {})
   /** Reads the Changelogs of a new Task's State Stores; undefined without State Stores. */
   readonly #restorer: KafkaChangelogReader | undefined
   /** One Task per partition number, shared by all the Co-partitioned input topics. */
   readonly #tasks = new Map<number, Task>()
 
   #stopRequested = false
+  /** Set once a stop gave the batch up: nothing is committed after that. */
+  #abandoned = false
   /** Settles when a stop is requested or the batch fails, ending the batch early. */
   readonly #interrupted: Promise<typeof INTERRUPTED>
   #interrupt: () => void = () => {}
+  /** Ends the current batch early, when partitions are lost. */
+  #endBatch: () => void = () => {}
 
   /** The first error a Task or a send raised. Stops the Worker (fail-fast). */
   #failure: { error: unknown } | undefined
@@ -210,21 +288,32 @@ class CommitCycle {
   #work: Promise<void>[] = []
   /** The last record read from each partition, by `topic:partition`. */
   #lastRead = new Map<string, ConsumedMessage>()
-  /** A record for a new Task, which ended the batch it arrived in; the next batch starts with it. */
+  /**
+   * A record that ended the batch it arrived in (for a new Task, or after partitions were lost);
+   * the next batch starts with it.
+   */
   #held: ConsumedMessage | undefined
+  /**
+   * The offset after the last record processed, by `topic:partition`. A record before it was
+   * processed already: the client delivers it again after a rebalance.
+   */
+  #position = new Map<string, bigint>()
+  /** The offset after the last record committed, by `topic:partition`. */
+  #committedPosition = new Map<string, bigint>()
 
-  constructor(
-    graph: ProcessorGraph,
-    options: WorkerOptions,
-    createCommitter: (fail: (error: unknown) => void) => BatchCommitter,
-    stream: MessagesStream<Bytes, Bytes, Bytes, Bytes>,
-    restorer: KafkaChangelogReader | undefined,
-  ) {
+  constructor(graph: ProcessorGraph, options: WorkerOptions, clients: CommitCycleClients) {
     this.#graph = graph
-    this.#restorer = restorer
     this.#options = options
-    this.#committer = createCommitter((error) => this.#fail(error))
-    this.#messages = stream[Symbol.asyncIterator]()
+    this.#exactlyOnce = options.transactionalId !== undefined
+    this.#restorer = clients.restorer
+    this.#openStream = clients.openStream
+    this.#stream = clients.stream
+    this.#messages = clients.stream[Symbol.asyncIterator]()
+    this.#ownership = new Ownership(clients.consumer, () => this.#endBatch())
+    this.#committer = clients.createCommitter(
+      (error) => this.#fail(error),
+      (topic, partition) => this.#ownership.owns(topic, partition),
+    )
     this.#interrupted = new Promise((resolve) => {
       this.#interrupt = () => resolve(INTERRUPTED)
     })
@@ -235,6 +324,22 @@ class CommitCycle {
     this.#interrupt()
   }
 
+  /**
+   * Gives the current batch up, for a stop that ran out of time: aborts it, rolls back and closes
+   * the Tasks. Whatever the cycle is still waiting for commits nothing after that.
+   */
+  async abandon(): Promise<void> {
+    this.#abandoned = true
+    this.requestStop()
+    await this.#committer.abort().catch(() => {})
+    this.#closeTasks()
+  }
+
+  /** Closes the stream the cycle reads. */
+  async closeStream(): Promise<void> {
+    await this.#stream.close()
+  }
+
   /** Remembers the first failure and ends the batch, which then fails (fail-fast). */
   #fail(error: unknown): void {
     this.#failure ??= { error }
@@ -242,63 +347,52 @@ class CommitCycle {
   }
 
   async run(): Promise<void> {
-    let next = this.#messages.next()
-    // The read still pending when the cycle ends settles once the stream closes.
+    this.#next = this.#messages.next()
     try {
       while (!this.#stopRequested) {
-        next = (await this.#readBatch(next)).next
+        await this.#readBatch()
         await this.#commit()
       }
     } catch (error) {
+      // After a stop gave up, what was still running fails against closed stores and clients.
+      if (this.#abandoned) return
       // The error is what the Worker reports, not a failure to abort. A Kafka abort rolls back
       // the store transactions too; their writes' Changelog records are aborted with it.
       await this.#committer.abort().catch(() => {})
-      this.#rollbackTasks()
       throw error
     } finally {
-      next.catch(() => {})
+      // The read still pending when the cycle ends settles once the stream closes.
+      this.#next.catch(() => {})
+      // After a failure the stores are left without a new Checkpoint (at-least-once: any).
       this.#closeTasks()
+      this.#ownership.close()
     }
   }
 
-  #rollbackTasks(): void {
-    for (const task of this.#tasks.values()) {
-      try {
-        task.rollback()
-      } catch {
-        // Rolling back the others matters more; closing an uncommitted store rolls it back too.
-      }
-    }
-  }
-
-  /**
-   * Closes every Task's State Stores. After a failure they are left without a new Checkpoint
-   * (under at-least-once, without any).
-   */
+  /** Rolls back and closes every Task. */
   #closeTasks(): void {
-    for (const task of this.#tasks.values()) {
-      try {
-        task.close()
-      } catch {
-        // Closing the others matters more; an unclosed store is unclean anyway.
-      }
-    }
+    for (const task of this.#tasks.values()) closeTask(task)
     this.#tasks.clear()
   }
 
   /**
    * Reads and processes records until the commit interval runs out, the batch is full, a Task
-   * fails or a stop is requested. Returns the read that is still pending.
+   * fails, partitions are lost or a stop is requested.
    */
-  async #readBatch(
-    pending: Promise<IteratorResult<ConsumedMessage>>,
-  ): Promise<{ next: Promise<IteratorResult<ConsumedMessage>> }> {
+  async #readBatch(): Promise<void> {
     const { commitIntervalMs, commitMaxRecords } = this.#options
+    const ownership = this.#ownership
+    // Lost partitions are dealt with first, by committing (or aborting) the batch so far.
+    if (ownership.lostPending) return
     let count = 0
     const held = this.#held
     this.#held = undefined
-    if (held !== undefined) {
+    if (held !== undefined && this.#accepts(held)) {
       await this.#restored(held.partition)
+      if (ownership.lostPending) {
+        this.#held = held
+        return
+      }
       this.#process(held)
       count++
     }
@@ -306,14 +400,21 @@ class CommitCycle {
     const timeUp = new Promise<typeof TIME_UP>((resolve) => {
       timer = setTimeout(() => resolve(TIME_UP), commitIntervalMs)
     })
-    let next = pending
+    const lost = new Promise<typeof INTERRUPTED>((resolve) => {
+      this.#endBatch = () => resolve(INTERRUPTED)
+    })
     try {
-      for (; count < commitMaxRecords && this.#failure === undefined; count++) {
-        const result = await Promise.race([next, timeUp, this.#interrupted])
+      while (count < commitMaxRecords && this.#failure === undefined) {
+        const result = await Promise.race([this.#next, timeUp, this.#interrupted, lost])
         if (result === TIME_UP || result === INTERRUPTED) break
         if (result.done) throw new Error('The consumer stopped delivering records')
-        next = this.#messages.next()
+        this.#next = this.#messages.next()
         const message = result.value
+        if (ownership.lostPending) {
+          this.#held = message
+          break
+        }
+        if (!this.#accepts(message)) continue
         if (this.#needsRestore(message.partition)) {
           // Restore only between batches: nothing of this batch may be produced or written yet.
           if (count > 0) {
@@ -321,13 +422,29 @@ class CommitCycle {
             break
           }
           await this.#restored(message.partition)
+          if (ownership.lostPending) {
+            this.#held = message
+            break
+          }
         }
         this.#process(message)
+        count++
       }
     } finally {
       clearTimeout(timer)
+      this.#endBatch = () => {}
     }
-    return { next }
+  }
+
+  /**
+   * Whether to process `message`: it was fetched while its partition is owned (not left over
+   * from a revoked or an earlier ownership), and wasn't processed already.
+   */
+  #accepts(message: ConsumedMessage): boolean {
+    const position = this.#position.get(partitionKey(message.topic, message.partition))
+    return (
+      this.#ownership.current(message) && (position === undefined || message.offset >= position)
+    )
   }
 
   /** Whether a record for `partition` creates a Task whose State Stores must be restored. */
@@ -347,7 +464,9 @@ class CommitCycle {
       timestamp: Number(message.timestamp),
     }
     this.#track(this.#task(message.partition).process(message.topic, record))
-    this.#lastRead.set(`${message.topic}:${message.partition}`, message)
+    const key = partitionKey(message.topic, message.partition)
+    this.#lastRead.set(key, message)
+    this.#position.set(key, message.offset + 1n)
   }
 
   /** Keeps a Task's work for the commit, remembering the first failure. */
@@ -366,7 +485,7 @@ class CommitCycle {
           task: partition,
           stateDir: this.#options.stateDir,
           // Exactly-once: store transactions as long as the Kafka transaction.
-          storeTransactions: this.#options.transactionalId !== undefined,
+          storeTransactions: this.#exactlyOnce,
           // A Task's State Stores are logged to the Changelog partition of the same number.
           changelog: (topic, record) =>
             this.#committer.produce({ ...toMessage(topic, record), partition }),
@@ -385,11 +504,15 @@ class CommitCycle {
 
   /**
    * Finishes the batch: waits for its processing, then commits its outputs, Changelog records and
-   * offsets, then the Tasks' store transactions, then their Checkpoints.
+   * offsets, then the Tasks' store transactions, then their Checkpoints. Deals with the partitions
+   * lost since the last commit (see the top of this file).
    */
   async #commit(): Promise<void> {
+    const lost = this.#ownership.takeLost()
     if (this.#failure === undefined) {
-      for (const task of this.#tasks.values()) this.#track(task.fireWallClockTimers())
+      for (const [partition, task] of this.#tasks) {
+        if (!lost.has(partition)) this.#track(task.fireWallClockTimers())
+      }
     }
     await Promise.all(this.#work)
     this.#work = []
@@ -397,18 +520,113 @@ class CommitCycle {
 
     const lastRead = [...this.#lastRead.values()]
     this.#lastRead = new Map()
-    const produced = await this.#committer.commit(lastRead)
+    // Exactly-once: a transaction with records of a lost partition must not commit (ADR-0006).
+    if (this.#exactlyOnce && lastRead.some(({ partition }) => lost.has(partition))) {
+      await this.#abortBatch(lost)
+      return
+    }
+    const committing = this.#exactlyOnce
+      ? lastRead
+      : lastRead.filter(({ topic, partition }) => this.#ownership.owns(topic, partition))
+    let result: CommitResult
+    try {
+      result = await this.#committer.commit(committing)
+    } catch (error) {
+      // Exactly-once: partitions were lost while the batch was committing.
+      if (!this.#exactlyOnce || this.#abandoned || !isRebalanceError(error)) throw error
+      await this.#abortBatch(new Set([...lost, ...this.#ownership.takeLost()]))
+      return
+    }
+    // A stop that gave up has closed (and rolled back) the stores: no Checkpoint for them.
+    if (this.#abandoned) return
     // Only once the batch is committed: a store must not get ahead of its Changelog (ADR-0002),
     // nor a Checkpoint ahead of its store.
     for (const task of this.#tasks.values()) task.commit()
     for (const [partition, task] of this.#tasks) {
-      task.checkpoint(produced.get(partition) ?? new Map())
+      task.checkpoint(result.produced.get(partition) ?? new Map())
     }
+    for (const message of committing) {
+      const key = partitionKey(message.topic, message.partition)
+      if (result.offsetsCommitted) {
+        this.#committedPosition.set(key, message.offset + 1n)
+      } else if (!this.#lastRead.has(key)) {
+        // At-least-once, a rebalance got in the way: the next batch commits them.
+        this.#lastRead.set(key, message)
+      }
+    }
+    this.#forget(lost)
+  }
+
+  /**
+   * Exactly-once: aborts the batch, closes every Task and reads every partition again from its
+   * committed offset.
+   */
+  async #abortBatch(lost: ReadonlySet<number>): Promise<void> {
+    await this.#committer.abort()
+    // Rolled back, a Task would still have the batch's Stream Time, timers and Processor state.
+    this.#closeTasks()
+    this.#held = undefined
+    this.#position = new Map(this.#committedPosition)
+    this.#forget(lost)
+    if (!this.#stopRequested) await this.#rewind()
+  }
+
+  /** Closes the Tasks of the `lost` partitions and forgets how far they were read. */
+  #forget(lost: ReadonlySet<number>): void {
+    if (lost.size === 0) return
+    for (const partition of lost) {
+      const task = this.#tasks.get(partition)
+      if (task !== undefined) closeTask(task)
+      this.#tasks.delete(partition)
+    }
+    for (const positions of [this.#position, this.#committedPosition]) {
+      for (const key of positions.keys()) {
+        if (lost.has(Number(key.slice(key.lastIndexOf(':') + 1)))) positions.delete(key)
+      }
+    }
+  }
+
+  /**
+   * Reads every owned partition again from its committed offset, with a new stream: the records
+   * of an aborted batch must come again, and the client only rewinds on a rebalance.
+   */
+  async #rewind(): Promise<void> {
+    const previous = this.#stream
+    this.#stream = await this.#openStream()
+    this.#next.catch(() => {})
+    this.#messages = this.#stream[Symbol.asyncIterator]()
+    this.#next = this.#messages.next()
+    await previous.close().catch(() => {})
+  }
+}
+
+/** Rolls back and closes `task`. Errors are ignored: closing the others matters more. */
+function closeTask(task: Task): void {
+  try {
+    task.rollback()
+  } catch {
+    // Closing an uncommitted store rolls it back too.
+  }
+  try {
+    task.close()
+  } catch {
+    // An unclosed store is unclean anyway.
   }
 }
 
 /** The offset after the last record a batch produced, by partition, then by topic. */
 type ProducedOffsets = ReadonlyMap<number, ChangelogOffsets>
+
+interface CommitResult {
+  /**
+   * The offset after the last output in each partition that outputs given an explicit partition
+   * (the Changelog records) went to. An offset may be lower than that, never higher: replaying a
+   * Changelog from too early is harmless.
+   */
+  produced: ProducedOffsets
+  /** False if the outputs committed but the offsets didn't, because of a rebalance. */
+  offsetsCommitted: boolean
+}
 
 /** Commits a batch under one Delivery Guarantee. */
 interface BatchCommitter {
@@ -416,13 +634,11 @@ interface BatchCommitter {
   produce(output: Output): void
   /**
    * Commits the current batch: its outputs, and the offsets after `lastRead` (the last record
-   * read from each partition). Rejects if any part of it failed. Resolves to the offset after the
-   * last output in each partition that outputs given an explicit partition (the Changelog records)
-   * went to. An offset may be lower than that, never higher: replaying a Changelog from too early
-   * is harmless.
+   * read from each partition). Rejects if any part of it failed, except that at-least-once may
+   * leave the offsets uncommitted after a rebalance.
    */
-  commit(lastRead: ConsumedMessage[]): Promise<ProducedOffsets>
-  /** Gives up on the current batch after a failure. */
+  commit(lastRead: ConsumedMessage[]): Promise<CommitResult>
+  /** Gives up on the current batch. */
   abort(): Promise<void>
 }
 
@@ -444,7 +660,7 @@ class AtLeastOnceCommitter implements BatchCommitter {
     this.#outputs.push(output)
   }
 
-  async commit(lastRead: ConsumedMessage[]): Promise<ProducedOffsets> {
+  async commit(lastRead: ConsumedMessage[]): Promise<CommitResult> {
     const outputs = this.#outputs
     this.#outputs = []
     let produced: ProducedOffsets = new Map()
@@ -453,16 +669,22 @@ class AtLeastOnceCommitter implements BatchCommitter {
       produced = producedOffsets(outputs, result.offsets ?? [])
     }
     if (lastRead.length > 0) {
-      await this.#consumer.commit({
-        offsets: lastRead.map(({ topic, partition, offset, leaderEpoch }) => ({
-          topic,
-          partition,
-          offset: offset + 1n,
-          leaderEpoch,
-        })),
-      })
+      try {
+        // After a rebalance error the client joins the group again and retries by itself.
+        await this.#consumer.commit({
+          offsets: lastRead.map(({ topic, partition, offset, leaderEpoch }) => ({
+            topic,
+            partition,
+            offset: offset + 1n,
+            leaderEpoch,
+          })),
+        })
+      } catch (error) {
+        if (!isRebalanceError(error)) throw error
+        return { produced, offsetsCommitted: false }
+      }
     }
-    return produced
+    return { produced, offsetsCommitted: true }
   }
 
   async abort(): Promise<void> {
@@ -490,15 +712,19 @@ class TransactionalCommitter implements BatchCommitter {
   readonly #fail: (error: unknown) => void
   /** The offsets after the Changelog records sent into the open transaction. */
   #produced = new Map<number, Map<string, bigint>>()
+  /** Whether the Worker owns `topic:partition` now. */
+  readonly #owns: (topic: string, partition: number) => boolean
 
   constructor(
     consumer: Consumer<Bytes, Bytes, Bytes, Bytes>,
     producer: Producer<Bytes, Bytes, Bytes, Bytes>,
     fail: (error: unknown) => void,
+    owns: (topic: string, partition: number) => boolean,
   ) {
     this.#consumer = consumer
     this.#producer = producer
     this.#fail = fail
+    this.#owns = owns
   }
 
   produce(output: Output): void {
@@ -529,7 +755,7 @@ class TransactionalCommitter implements BatchCommitter {
     return this.#transaction
   }
 
-  async commit(lastRead: ConsumedMessage[]): Promise<ProducedOffsets> {
+  async commit(lastRead: ConsumedMessage[]): Promise<CommitResult> {
     await this.#sending
     if (this.#sendFailure !== undefined) throw this.#sendFailure.error
     if (lastRead.length > 0) {
@@ -543,22 +769,19 @@ class TransactionalCommitter implements BatchCommitter {
     this.#transaction = undefined
     this.#produced = new Map()
     await transaction?.commit()
-    return produced
+    return { produced, offsetsCommitted: true }
   }
 
   /**
    * `message` with the consumer group's current generation instead of the one it was fetched
-   * under, which a rebalance during the batch makes stale. Only valid for a partition this Worker
-   * still owns; a revoked partition fails the batch (handling revokes is ticket 28, ADR-0006).
+   * under, which a rebalance during the batch makes stale (as Java's `groupMetadata()`). Only
+   * valid for a partition the Worker still owns; for a lost one the batch aborts (ADR-0006).
    */
   #withCurrentGroup(message: ConsumedMessage): ConsumedMessage {
     const { topic, partition } = message
     const consumer = this.#consumer
-    const owned = consumer.assignments?.some(
-      (assignment) => assignment.topic === topic && assignment.partitions.includes(partition),
-    )
-    if (!owned) {
-      throw new Error(
+    if (!this.#owns(topic, partition)) {
+      throw new PartitionRevokedError(
         `Partition ${topic}-${partition} was revoked during the batch; aborting its transaction`,
       )
     }

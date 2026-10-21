@@ -50,6 +50,8 @@ describe('Streams App configuration', () => {
     ['commitMaxRecords', 0],
     ['commitMaxRecords', 2.5],
     ['sessionTimeoutMs', -5],
+    ['shutdownTimeoutMs', 0],
+    ['shutdownTimeoutMs', Number.NaN],
     ['changelogReplicationFactor', 0],
     ['changelogReplicationFactor', 1.5],
   ])('rejects %s: %s', (option, value) => {

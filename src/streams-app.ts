@@ -65,6 +65,13 @@ export interface StreamsAppConfig {
    */
   sessionTimeoutMs?: number
   /**
+   * How long `stop()` may take to finish and commit the current batch, in milliseconds. When it
+   * runs out, the batch is given up instead (under exactly-once, its transaction is aborted, so
+   * it is processed again after a restart) and the app still closes its State Stores and leaves
+   * the consumer group. Defaults to 30000.
+   */
+  shutdownTimeoutMs?: number
+  /**
    * The replication factor of the Changelog topics the app creates, one per State Store, named
    * `<applicationId>-<store>-changelog`. Defaults to 3; use 1 with a single-broker cluster.
    */
@@ -104,8 +111,10 @@ export interface StreamsApp {
    */
   start(): Promise<void>
   /**
-   * Stops gracefully: finishes and commits the current batch, then leaves the consumer group, so
-   * its Tasks move to other processes right away. Resolves once the app is `stopped`. If the app
+   * Stops gracefully: finishes and commits the current batch, closes the State Stores, then leaves
+   * the consumer group, so its Tasks move to other processes right away. If that takes longer
+   * than `shutdownTimeoutMs`, the batch is given up instead (see there) and the app still leaves
+   * the group. Resolves once the app is `stopped`. If the app
    * stopped on its own because of an error (state `error`), rejects with that error.
    */
   stop(): Promise<void>
@@ -370,6 +379,7 @@ interface RuntimeSettings {
   commitIntervalMs: number
   commitMaxRecords: number
   sessionTimeoutMs: number
+  shutdownTimeoutMs: number
   changelogReplicationFactor: number
   stateDir: string | undefined
 }
@@ -393,6 +403,7 @@ function runtimeSettings(config: StreamsAppConfig): RuntimeSettings {
     commitIntervalMs: positive('commitIntervalMs', config.commitIntervalMs ?? 100),
     commitMaxRecords: positive('commitMaxRecords', config.commitMaxRecords ?? 1000, true),
     sessionTimeoutMs: positive('sessionTimeoutMs', config.sessionTimeoutMs ?? 45_000),
+    shutdownTimeoutMs: positive('shutdownTimeoutMs', config.shutdownTimeoutMs ?? 30_000),
     changelogReplicationFactor: positive(
       'changelogReplicationFactor',
       config.changelogReplicationFactor ?? 3,
