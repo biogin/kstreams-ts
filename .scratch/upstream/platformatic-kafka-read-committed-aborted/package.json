@@ -1,0 +1,11 @@
+{
+  "name": "platformatic-kafka-read-committed-repro",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "repro": "node repro.mjs"
+  },
+  "dependencies": {
+    "@platformatic/kafka": "2.14.0"
+  }
+}
