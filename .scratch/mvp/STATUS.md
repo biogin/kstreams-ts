@@ -15,8 +15,7 @@ Integration branch: `mvp`. Plan for this run: stop at milestone M3, then code re
 ## Open items for the code review / fix pass
 
 - **Flaky integration tests** under broker load: `at-least-once-crash.test.ts` (once read 0 records), `passthrough.test.ts` "leaves the group on stop and resumes from the committed offsets on restart" (timeout), plus unnamed one-off timeouts. Make waits condition-based and robust.
-- **Input consumer and platformatic/kafka#467:** `consume()` with read_committed can deliver aborted records. Apply an aborted-transaction filter to the main input path, as Restore does.
-- **`src/restore.ts` filter** carries state across fetch responses. Java's `CompletedFetch` is stateless per response (see the Root cause and Suggested fix sections of `.scratch/upstream/platformatic-kafka-read-committed-aborted/issue.md`); re-check and simplify to match.
+- ~~**Input consumer and platformatic/kafka#467**~~ and ~~**`src/restore.ts` filter**~~: fixed on `fix/aborted-txn-filter`. `src/read-committed.ts` (`ReadCommittedConsumer`) sends Fetch as read_committed at the protocol level but bypasses the client's filter, and filters each response with Java's stateless `CompletedFetch` algorithm. Both Restore and the Worker's input `consume()` use it.
 - Ticket 29 later: transactional IDs are per Worker number, not per process (needs a stable instance identity).
 
 ## Not in this run (later session)
