@@ -6,6 +6,10 @@
 //
 //   export default function (params: MyParams): StreamsApp { ... }
 //
+// An app with worker threads must instead export the app itself (ADR-0013); it reads its params
+// from the KSTREAMS_APP_PARAMS environment variable (see fixtures/workers-count-app.ts). Worker
+// threads inherit the child's `--import` of ts-resolve.ts, so they can run the sources too.
+//
 // Give the app a short `sessionTimeoutMs` (the broker's minimum is 6 s): a SIGKILLed Worker never
 // leaves its consumer group, so its partitions move to the restarted one only after its session
 // times out. Use a unique Application ID and topic names per test (the broker is shared).

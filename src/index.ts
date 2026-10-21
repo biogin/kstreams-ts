@@ -36,6 +36,7 @@ export {
   type StreamsAppConfig,
   type Table,
   type WindowedStream,
+  type WorkersConfig,
 } from './streams-app.js'
 export { AsyncNotAllowedError } from './sync-dsl.js'
 export {

@@ -17,6 +17,7 @@ import {
   windowOf,
 } from './windows.js'
 import { startWorker, type Worker } from './worker.js'
+import { startWorkerThread } from './worker-thread.js'
 
 export interface StreamsAppConfig {
   /**
@@ -47,11 +48,15 @@ export interface StreamsAppConfig {
    */
   guarantee?: DeliveryGuarantee
   /**
-   * Number of Workers (worker threads) per process, each its own consumer-group member. `0` (the
-   * default) runs everything in the main thread. Values above 0 are not implemented yet and are
-   * rejected.
+   * The Workers this process runs, each its own consumer-group member with its own consumer,
+   * producer and State Stores. `0` (the default) runs one Worker in the main thread.
+   *
+   * More Workers run in worker threads, which can't be handed the app's functions, so each one
+   * rebuilds the app from its App Module: the module that exports this Streams App as its default
+   * export, without side effects (it must not call `start`). Name it in the module itself:
+   * `workers: { count: 4, module: import.meta.url }`, and start the app from another file.
    */
-  workers?: number
+  workers?: number | WorkersConfig
   /**
    * How long a Worker collects records into a batch before it produces the outputs and commits
    * the batch, in milliseconds. Defaults to 100.
@@ -86,6 +91,17 @@ export interface StreamsAppConfig {
   autoCreateInternalTopics?: boolean
 }
 
+/** Worker threads, and the App Module each of them rebuilds the Streams App from. */
+export interface WorkersConfig {
+  /** The number of Workers (worker threads); `0` runs one Worker in the main thread instead. */
+  count: number
+  /**
+   * The URL of the App Module, usually `import.meta.url` in the module that defines the app. Its
+   * default export must be this Streams App.
+   */
+  module: string | URL
+}
+
 /** The processing contract an application runs under. */
 export type DeliveryGuarantee = 'at-least-once' | 'exactly-once'
 
@@ -110,20 +126,22 @@ export interface StreamsApp {
   /** The Application State. */
   readonly state: ApplicationState
   /**
-   * Connects to Kafka and starts processing: joins the consumer group (named after the
-   * Application ID) and resumes from its committed offsets, or reads input topics from the
-   * beginning the first time. Resolves once the app is running. Rejects if the app has no brokers
-   * or reads no topic, was started before, or can't connect (the app then goes to `error`).
+   * Connects to Kafka and starts processing: starts the Workers, each of which joins the consumer
+   * group (named after the Application ID) and resumes from its committed offsets, or reads input
+   * topics from the beginning the first time. Resolves once every Worker is running. Rejects if the
+   * app has no brokers or reads no topic, was started before, or a Worker can't start (the app
+   * then goes to `error` and stops the other Workers).
    *
    * Define the whole app before starting it.
    */
   start(): Promise<void>
   /**
-   * Stops gracefully: finishes and commits the current batch, closes the State Stores, then leaves
-   * the consumer group, so its Tasks move to other processes right away. If that takes longer
-   * than `shutdownTimeoutMs`, the batch is given up instead (see there) and the app still leaves
-   * the group. Resolves once the app is `stopped`. If the app
-   * stopped on its own because of an error (state `error`), rejects with that error.
+   * Stops every Worker gracefully: each finishes and commits its current batch, closes its State
+   * Stores, then leaves the consumer group, so its Tasks move to other members right away. If that
+   * takes longer than `shutdownTimeoutMs`, the batch is given up instead (see there) and the
+   * Worker still leaves the group. Resolves once the app is `stopped`. If the app stopped on its
+   * own because of an error (state `error`: a Worker failed, and the others were stopped), rejects
+   * with that error.
    */
   stop(): Promise<void>
   /**
@@ -377,7 +395,37 @@ export function createStreamsApp(config: StreamsAppConfig): StreamsApp {
     },
   }
   graphs.set(app, graph)
+  runtimes.set(app, runtime)
   return app
+}
+
+/**
+ * Internal, for worker threads: starts Worker `workerNumber` of `app`, the default export of the
+ * App Module `appModule`, which must be the Streams App `applicationId`.
+ */
+export async function startWorkerOf(
+  app: unknown,
+  { appModule, applicationId, workerNumber, onError }: WorkerOfOptions,
+): Promise<Worker> {
+  const runtime = runtimes.get(app as StreamsApp)
+  if (runtime === undefined) {
+    throw new Error(
+      `App Module ${appModule} must export the Streams App as its default export, without side effects`,
+    )
+  }
+  if ((app as StreamsApp).applicationId !== applicationId) {
+    throw new Error(
+      `App Module ${appModule} exports Streams App "${(app as StreamsApp).applicationId}", not "${applicationId}"`,
+    )
+  }
+  return runtime.startWorker(workerNumber, onError)
+}
+
+export interface WorkerOfOptions {
+  appModule: string
+  applicationId: string
+  workerNumber: number
+  onError(error: unknown): void
 }
 
 interface RuntimeSettings {
@@ -391,17 +439,18 @@ interface RuntimeSettings {
   changelogReplicationFactor: number
   autoCreateInternalTopics: boolean
   stateDir: string | undefined
+  /** The number of worker threads; 0 runs one Worker in the main thread. */
+  workers: number
+  /** The App Module worker threads rebuild the app from; set when `workers > 0`. */
+  appModule: URL | undefined
 }
 
 function runtimeSettings(config: StreamsAppConfig): RuntimeSettings {
-  const { guarantee = 'at-least-once', workers = 0, brokers } = config
+  const { guarantee = 'at-least-once', brokers } = config
   if (guarantee !== 'at-least-once' && guarantee !== 'exactly-once') {
     throw new Error(`Unknown Delivery Guarantee ${JSON.stringify(guarantee)}`)
   }
-  if (!(Number.isInteger(workers) && workers >= 0)) {
-    throw new Error(`workers must be a whole number (0 or more), got ${workers}`)
-  }
-  if (workers > 0) throw new Error('workers > 0 is not implemented yet; use workers: 0')
+  const { workers, appModule } = workersSettings(config.workers ?? 0)
   if (brokers !== undefined && brokers.length === 0) {
     throw new Error('brokers must list at least one broker (host:port)')
   }
@@ -420,7 +469,32 @@ function runtimeSettings(config: StreamsAppConfig): RuntimeSettings {
     ),
     autoCreateInternalTopics: config.autoCreateInternalTopics ?? true,
     stateDir: config.stateDir,
+    workers,
+    appModule,
   }
+}
+
+function workersSettings(config: number | WorkersConfig): {
+  workers: number
+  appModule: URL | undefined
+} {
+  const { count, module } =
+    typeof config === 'number' ? { count: config, module: undefined } : config
+  if (!(Number.isInteger(count) && count >= 0)) {
+    throw new Error(`workers must be a whole number (0 or more), got ${count}`)
+  }
+  if (count === 0) return { workers: 0, appModule: undefined }
+  if (module === undefined) {
+    throw new Error(
+      `workers > 0 needs an App Module: use workers: { count: ${count}, module: import.meta.url } in the module that exports the Streams App`,
+    )
+  }
+  if (!URL.canParse(String(module))) {
+    throw new Error(
+      `The App Module must be a URL such as import.meta.url, got ${JSON.stringify(String(module))}`,
+    )
+  }
+  return { workers: count, appModule: new URL(String(module)) }
 }
 
 function positive(option: string, value: number, whole = false): number {
@@ -430,13 +504,18 @@ function positive(option: string, value: number, whole = false): number {
   return value
 }
 
-/** Runs a Streams App on Kafka and tracks its Application State. */
+/**
+ * Runs a Streams App on Kafka and tracks its Application State, which sums up its Workers': it is
+ * running once every Worker is, and goes to `error` when one fails, which stops the others.
+ */
 class Runtime {
   readonly #graph: ProcessorGraph
   readonly #settings: RuntimeSettings
   #state: ApplicationState = 'created'
-  #worker: Promise<Worker | undefined> | undefined
+  /** One per Worker, settled once it is running (undefined if it failed to start). */
+  #workers: Promise<Worker | undefined>[] | undefined
   #stopped: Promise<void> | undefined
+  #workersStopped: Promise<void> | undefined
   /** The error that put the app in the `error` state. */
   #failure: { error: unknown } | undefined
 
@@ -450,33 +529,59 @@ class Runtime {
   }
 
   async start(): Promise<void> {
-    const { applicationId, brokers, guarantee } = this.#settings
-    if (this.#state !== 'created' || this.#worker !== undefined) {
+    const { applicationId, workers, appModule, shutdownTimeoutMs } = this.#settings
+    if (this.#state !== 'created' || this.#workers !== undefined) {
       throw new Error(`Streams App "${applicationId}" cannot start: it is ${this.#state}`)
     }
+    this.#checkStartable()
+    const onError = (error: unknown) => this.#fail(error)
+    const starting =
+      appModule === undefined
+        ? [this.startWorker(0, onError)]
+        : Array.from({ length: workers }, (_, workerNumber) =>
+            startWorkerThread({
+              appModule,
+              applicationId,
+              workerNumber,
+              shutdownTimeoutMs,
+              onError,
+            }),
+          )
+    this.#workers = starting.map((worker) => worker.catch(() => undefined))
+    const started = await Promise.allSettled(starting)
+    const failed = started.find((result) => result.status === 'rejected')
+    if (failed !== undefined) {
+      this.#fail(failed.reason)
+      throw failed.reason
+    }
+    if (this.#state === 'created') this.#state = 'running'
+  }
+
+  /** Starts Worker `workerNumber` in this thread. */
+  startWorker(workerNumber: number, onError: (error: unknown) => void): Promise<Worker> {
+    const brokers = this.#checkStartable()
+    const { applicationId, guarantee } = this.#settings
+    const workerId = `${applicationId}-worker-${workerNumber}`
+    return startWorker(this.#graph, {
+      ...this.#settings,
+      brokers,
+      clientId: workerId,
+      // Stable across restarts, so a restarted Worker fences its predecessor's producer.
+      transactionalId: guarantee === 'exactly-once' ? workerId : undefined,
+      onError,
+    })
+  }
+
+  /** Throws if the app can't start; returns its brokers. */
+  #checkStartable(): string[] {
+    const { applicationId, brokers } = this.#settings
     if (brokers === undefined) {
       throw new Error(`Streams App "${applicationId}" has no brokers to connect to`)
     }
     if (this.#graph.sources.size === 0) {
       throw new Error(`Streams App "${applicationId}" reads no topic: declare a Stream first`)
     }
-    const workerId = `${applicationId}-worker-0`
-    const worker = startWorker(this.#graph, {
-      ...this.#settings,
-      brokers,
-      clientId: workerId,
-      // Stable across restarts, so a restarted Worker fences its predecessor's producer.
-      transactionalId: guarantee === 'exactly-once' ? workerId : undefined,
-      onError: (error) => this.#fail(error),
-    })
-    this.#worker = worker.catch(() => undefined)
-    try {
-      await worker
-    } catch (error) {
-      this.#fail(error)
-      throw error
-    }
-    if (this.#state === 'created') this.#state = 'running'
+    return brokers
   }
 
   stop(): Promise<void> {
@@ -485,26 +590,38 @@ class Runtime {
   }
 
   async #stop(): Promise<void> {
-    if (this.#state === 'created' && this.#worker === undefined) {
+    if (this.#state === 'created' && this.#workers === undefined) {
       this.#state = 'stopped'
       return
     }
     if (this.#state !== 'error') this.#state = 'stopping'
-    const worker = await this.#worker
-    try {
-      await worker?.stop()
-    } catch (error) {
-      this.#fail(error)
-    }
+    await this.#stopWorkers()
     if (this.#failure !== undefined) {
       throw this.#failure.error
     }
     this.#state = 'stopped'
   }
 
+  /** Stops every Worker (each once it has started), all at the same time. */
+  #stopWorkers(): Promise<void> {
+    this.#workersStopped ??= Promise.all(
+      (this.#workers ?? []).map(async (starting) => {
+        const worker = await starting
+        try {
+          await worker?.stop()
+        } catch (error) {
+          this.#fail(error)
+        }
+      }),
+    ).then(() => {})
+    return this.#workersStopped
+  }
+
   #fail(error: unknown): void {
     this.#failure ??= { error }
     this.#state = 'error'
+    // One Worker failed: stop the others, so the app doesn't keep running with part of its Tasks.
+    void this.#stopWorkers()
   }
 }
 
@@ -530,6 +647,7 @@ function addStore(
 }
 
 const graphs = new WeakMap<StreamsApp, ProcessorGraph>()
+const runtimes = new WeakMap<StreamsApp, Runtime>()
 
 // Record types are erased once a Processor is registered; `Stream.process` restores them.
 // biome-ignore lint/suspicious/noExplicitAny: type erasure, see above

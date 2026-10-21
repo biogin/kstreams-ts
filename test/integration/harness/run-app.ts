@@ -13,8 +13,12 @@ const moduleUrl = process.env.KSTREAMS_APP_MODULE
 const params: unknown = JSON.parse(process.env.KSTREAMS_APP_PARAMS ?? '{}')
 if (moduleUrl === undefined) throw new Error('KSTREAMS_APP_MODULE is not set')
 
-const appModule = (await import(moduleUrl)) as { default: (params: unknown) => StreamsApp }
-const app = appModule.default(params)
+// The default export builds the app from the params, or is the app (an App Module for worker
+// threads, which reads the params from KSTREAMS_APP_PARAMS itself).
+const appModule = (await import(moduleUrl)) as {
+  default: StreamsApp | ((params: unknown) => StreamsApp)
+}
+const app = typeof appModule.default === 'function' ? appModule.default(params) : appModule.default
 
 async function stopAndExit(): Promise<never> {
   try {

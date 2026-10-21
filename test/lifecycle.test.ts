@@ -32,16 +32,47 @@ describe('Streams App configuration', () => {
     )
   })
 
-  it('rejects workers > 0 as not implemented yet', () => {
+  it('needs an App Module for workers > 0', () => {
     expect(() => createStreamsApp({ applicationId: 'workers', workers: 2 })).toThrow(
-      /workers > 0 is not implemented yet/,
+      /workers > 0 needs an App Module: use workers: \{ count: 2, module: import\.meta\.url \}/,
     )
+    // biome-ignore lint/suspicious/noExplicitAny: simulates an untyped caller
+    const withoutModule: any = { count: 2 }
+    expect(() => createStreamsApp({ applicationId: 'workers', workers: withoutModule })).toThrow(
+      /workers > 0 needs an App Module/,
+    )
+  })
+
+  it('accepts workers with an App Module URL', () => {
+    for (const module of [import.meta.url, new URL(import.meta.url)]) {
+      expect(() =>
+        createStreamsApp({ applicationId: 'workers', workers: { count: 2, module } }),
+      ).not.toThrow()
+    }
+    expect(() =>
+      createStreamsApp({
+        applicationId: 'workers',
+        workers: { count: 0, module: import.meta.url },
+      }),
+    ).not.toThrow()
+  })
+
+  it('rejects an App Module that is not a URL', () => {
+    expect(() =>
+      createStreamsApp({ applicationId: 'workers', workers: { count: 2, module: './app.js' } }),
+    ).toThrow(/App Module must be a URL such as import\.meta\.url, got "\.\/app\.js"/)
   })
 
   it.each([-1, 1.5, Number.NaN])('rejects workers: %s', (workers) => {
     expect(() => createStreamsApp({ applicationId: 'workers', workers })).toThrow(
       /workers must be a whole number/,
     )
+    expect(() =>
+      createStreamsApp({
+        applicationId: 'workers',
+        workers: { count: workers, module: import.meta.url },
+      }),
+    ).toThrow(/workers must be a whole number/)
   })
 
   it.each([
