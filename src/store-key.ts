@@ -29,7 +29,11 @@ export type OrderedValue = null | boolean | number | string | Uint8Array | reado
 
 /** The Serde bytes of a key that has no ordered encoding; ordered as bytes. */
 export class SerializedKey {
-  constructor(readonly bytes: Uint8Array) {}
+  readonly bytes: Uint8Array
+
+  constructor(bytes: Uint8Array) {
+    this.bytes = bytes
+  }
 }
 
 export type KeyPart = OrderedValue | SerializedKey
