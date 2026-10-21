@@ -25,6 +25,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:crash": "vitest run --config vitest.crash.config.ts",
     "kafka": "scripts/kafka-local.sh"
   },
   "dependencies": {

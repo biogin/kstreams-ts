@@ -27,6 +27,24 @@ KSTREAMS_KAFKA_BROKERS=localhost:9092 npm run test:integration
 npm run kafka -- stop
 ```
 
+### Crash test suite
+
+The crash test suite ([ADR-0011](./docs/adr/0011-crash-test-suite-backs-exactly-once.md)) is the evidence behind the exactly-once claim. It runs separately from the integration tests (it is slow and randomized, meant for nightly runs). Each iteration runs a stateful exactly-once app (`count()` and `aggregate()` on SQLite State Stores, several partitions) as one Worker in a child process, SIGKILLs and restarts it at randomized times while input keeps arriving, then checks against a reference computed from the input: every output exactly once and in order (nothing missing, no duplicates), all input consumed, and the SQLite stores on disk and the Changelogs holding the exact final values.
+
+```sh
+KSTREAMS_KAFKA_BROKERS=localhost:9092 npm run test:crash
+```
+
+The defaults (4 iterations of 5 SIGKILLs) take about 3 minutes. Settings, as environment variables:
+
+- `KSTREAMS_CRASH_ITERATIONS`: number of iterations, each with fresh topics and Application ID (default 4).
+- `KSTREAMS_CRASH_KILLS`: SIGKILLs per iteration (default 5).
+- `KSTREAMS_CRASH_SEED`: base seed; iteration `i` (from 0) uses seed + `i` (default: random). The seed fixes the plan (partitions, keys, commit settings, input values, kill strategies and delays), not the broker's timing.
+
+Known failure: the suite also checks Restore's Changelog reader against the log, and that reader currently drops committed records now and then (see the Comments in `.scratch/mvp/issues/17-crash-suite-v1.md`). Until that is fixed, the suite fails intermittently.
+
+Each iteration prints its seed, plan and kills. A failure names its seed and the command that reruns that iteration alone, e.g. `KSTREAMS_CRASH_SEED=1234 KSTREAMS_CRASH_ITERATIONS=1 KSTREAMS_CRASH_KILLS=5 npm run test:crash`.
+
 ## License
 
 Apache-2.0
