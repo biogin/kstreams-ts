@@ -73,9 +73,17 @@ export interface StreamsAppConfig {
   shutdownTimeoutMs?: number
   /**
    * The replication factor of the Changelog topics the app creates, one per State Store, named
-   * `<applicationId>-<store>-changelog`. Defaults to 3; use 1 with a single-broker cluster.
+   * `<applicationId>-<store>-changelog`. Defaults to 3; use 1 with a single-broker cluster. Only
+   * used when `autoCreateInternalTopics` creates the topics.
    */
   changelogReplicationFactor?: number
+  /**
+   * Whether the app creates its missing Internal Topics (the Changelogs) on start. When false, it
+   * only checks them: `start()` fails with one error listing every missing Internal Topic, with
+   * its required partition count and `cleanup.policy=compact`. Either way, an existing Internal
+   * Topic with the wrong partition count is a fatal error. Defaults to true.
+   */
+  autoCreateInternalTopics?: boolean
 }
 
 /** The processing contract an application runs under. */
@@ -381,6 +389,7 @@ interface RuntimeSettings {
   sessionTimeoutMs: number
   shutdownTimeoutMs: number
   changelogReplicationFactor: number
+  autoCreateInternalTopics: boolean
   stateDir: string | undefined
 }
 
@@ -409,6 +418,7 @@ function runtimeSettings(config: StreamsAppConfig): RuntimeSettings {
       config.changelogReplicationFactor ?? 3,
       true,
     ),
+    autoCreateInternalTopics: config.autoCreateInternalTopics ?? true,
     stateDir: config.stateDir,
   }
 }

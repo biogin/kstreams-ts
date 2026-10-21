@@ -10,6 +10,54 @@ export interface MetadataSource {
 }
 
 /**
+ * The metadata of the input topics. A missing topic makes the client fail with its own "Unknown
+ * topic" error, so on a failure each topic is asked for alone, and every missing one is reported
+ * in a single error.
+ */
+async function inputMetadata(
+  client: MetadataSource,
+  applicationId: string,
+  topics: readonly string[],
+): Promise<ReadonlyMap<string, { partitionsCount: number }>> {
+  try {
+    const { topics: found } = await client.metadata({
+      topics: [...topics],
+      forceUpdate: true,
+    })
+    const missing = topics.filter((topic) => !found.has(topic))
+    if (missing.length === 0) return found
+    throw missingInputs(applicationId, missing)
+  } catch (error) {
+    if (error instanceof MissingInputsError) throw error
+    const missing: string[] = []
+    for (const topic of topics) {
+      try {
+        const { topics: found } = await client.metadata({
+          topics: [topic],
+          forceUpdate: true,
+        })
+        if (!found.has(topic)) missing.push(topic)
+      } catch {
+        missing.push(topic)
+      }
+    }
+    if (missing.length === 0) throw error
+    throw missingInputs(applicationId, missing)
+  }
+}
+
+class MissingInputsError extends Error {}
+
+function missingInputs(applicationId: string, missing: string[]): Error {
+  const noun = missing.length === 1 ? 'input topic does' : 'input topics do'
+  return new MissingInputsError(
+    `Streams App "${applicationId}" cannot start: ${missing.length} ${noun} not exist: ` +
+      `${missing.map((topic) => `"${topic}"`).join(', ')}. Create ${missing.length === 1 ? 'it' : 'them'} ` +
+      'before starting the app (the app only creates its own Internal Topics).',
+  )
+}
+
+/**
  * Resolves with the shared partition count of `topics`; rejects with an error naming every topic's
  * partition count if they differ.
  */
@@ -18,12 +66,11 @@ export async function checkCoPartitioned(
   applicationId: string,
   topics: readonly string[],
 ): Promise<number> {
-  const metadata = await client.metadata({ topics: [...topics], forceUpdate: true })
-  const counts = topics.map((topic) => {
-    const found = metadata.topics.get(topic)
-    if (found === undefined) throw new Error(`Input topic "${topic}" does not exist`)
-    return { topic, partitions: found.partitionsCount }
-  })
+  const metadata = await inputMetadata(client, applicationId, topics)
+  const counts = topics.map((topic) => ({
+    topic,
+    partitions: metadata.get(topic)?.partitionsCount ?? 0,
+  }))
   const [first] = counts
   if (first === undefined) return 0
   if (counts.every(({ partitions }) => partitions === first.partitions)) return first.partitions
