@@ -80,6 +80,10 @@ _Avoid_: Cache, DB, state
 The compacted Kafka topic that records every write to a State Store; it is the source of truth, and the local store is only a derived copy.
 _Avoid_: Backup topic, WAL
 
+**Tombstone**:
+A record with a null value; it deletes its key from a Table, a State Store or a compacted topic.
+_Avoid_: Delete marker, null record
+
 **Restore**:
 Rebuilding a State Store from its Changelog before its Task resumes processing.
 _Avoid_: Recovery, rehydration, replay

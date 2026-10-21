@@ -15,9 +15,9 @@ const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 describe('Processor API in the Test Driver', () => {
   it('runs a Processor between DSL nodes (DSL → Processor → DSL)', async () => {
     const app = createStreamsApp({ applicationId: 'processor' })
-    const shout = app.processor('shout', (ctx: ProcessorContext<string, string>) => ({
-      process(record: StreamRecord<string, string>) {
-        ctx.forward({ ...record, value: record.value.toUpperCase() })
+    const shout = app.processor('shout', (ctx: ProcessorContext<string, string | null>) => ({
+      process(record: StreamRecord<string, string | null>) {
+        ctx.forward({ ...record, value: record.value?.toUpperCase() ?? null })
       },
     }))
     app.stream('input', strings).process(shout).to('output', strings)
@@ -31,8 +31,8 @@ describe('Processor API in the Test Driver', () => {
   it('lets a Processor forward any number of records, with new key and value types', async () => {
     const app = createStreamsApp({ applicationId: 'split' })
     const split = app.processor('split', (ctx: ProcessorContext<number, string>) => ({
-      process(record: StreamRecord<string, string>) {
-        record.value.split(' ').forEach((word, i) => {
+      process(record: StreamRecord<string, string | null>) {
+        ;(record.value ?? '').split(' ').forEach((word, i) => {
           if (word !== '') ctx.forward({ key: i, value: word, timestamp: record.timestamp })
         })
       },
@@ -59,8 +59,8 @@ describe('Processor API in the Test Driver', () => {
 
   it('forwards to every child of the Processor', async () => {
     const app = createStreamsApp({ applicationId: 'fan-out' })
-    const pass = app.processor('pass', (ctx: ProcessorContext<string, string>) => ({
-      process(record: StreamRecord<string, string>) {
+    const pass = app.processor('pass', (ctx: ProcessorContext<string, string | null>) => ({
+      process(record: StreamRecord<string, string | null>) {
         ctx.forward(record)
       },
     }))
@@ -78,8 +78,8 @@ describe('Processor API in the Test Driver', () => {
   it('chains Processors, and one Processor can read from several Streams', async () => {
     const app = createStreamsApp({ applicationId: 'chain' })
     const tag = (name: string) =>
-      app.processor(name, (ctx: ProcessorContext<string, string>) => ({
-        process(record: StreamRecord<string, string>) {
+      app.processor(name, (ctx: ProcessorContext<string, string | null>) => ({
+        process(record: StreamRecord<string, string | null>) {
           ctx.forward({ ...record, value: `${record.value}>${name}` })
         },
       }))
@@ -100,10 +100,10 @@ describe('Processor API in the Test Driver', () => {
 
   it('creates one Processor instance per Test Driver', async () => {
     const app = createStreamsApp({ applicationId: 'instances' })
-    const counter = app.processor('counter', (ctx: ProcessorContext<string, string>) => {
+    const counter = app.processor('counter', (ctx: ProcessorContext<string, string | null>) => {
       let seen = 0
       return {
-        process(record: StreamRecord<string, string>) {
+        process(record: StreamRecord<string, string | null>) {
           seen += 1
           ctx.forward({ ...record, value: String(seen) })
         },
@@ -135,8 +135,8 @@ describe('Processor API in the Test Driver', () => {
 describe('async Processors', () => {
   it('awaits an async Processor before the piped record counts as processed', async () => {
     const app = createStreamsApp({ applicationId: 'async' })
-    const enrich = app.processor('enrich', (ctx: ProcessorContext<string, string>) => ({
-      async process(record: StreamRecord<string, string>) {
+    const enrich = app.processor('enrich', (ctx: ProcessorContext<string, string | null>) => ({
+      async process(record: StreamRecord<string, string | null>) {
         await delay(5)
         ctx.forward({ ...record, value: `${record.value}+enriched` })
       },
@@ -156,8 +156,8 @@ describe('async Processors', () => {
     let active = 0
     let maxActive = 0
     const app = createStreamsApp({ applicationId: 'ordering' })
-    const slow = app.processor('slow', (ctx: ProcessorContext<string, string>) => ({
-      async process(record: StreamRecord<string, string>) {
+    const slow = app.processor('slow', (ctx: ProcessorContext<string, string | null>) => ({
+      async process(record: StreamRecord<string, string | null>) {
         active += 1
         maxActive = Math.max(maxActive, active)
         events.push(`start ${record.value}`)
@@ -189,17 +189,17 @@ describe('async Processors', () => {
     let active = 0
     let maxActive = 0
     const app = createStreamsApp({ applicationId: 'async-children' })
-    const twice = app.processor('twice', (ctx: ProcessorContext<string, string>) => ({
-      process(record: StreamRecord<string, string>) {
+    const twice = app.processor('twice', (ctx: ProcessorContext<string, string | null>) => ({
+      process(record: StreamRecord<string, string | null>) {
         ctx.forward({ ...record, value: `${record.value}-1` })
         ctx.forward({ ...record, value: `${record.value}-2` })
       },
     }))
-    const slow = app.processor('slow', (ctx: ProcessorContext<string, string>) => ({
-      async process(record: StreamRecord<string, string>) {
+    const slow = app.processor('slow', (ctx: ProcessorContext<string, string | null>) => ({
+      async process(record: StreamRecord<string, string | null>) {
         active += 1
         maxActive = Math.max(maxActive, active)
-        await delay(record.value.endsWith('-1') ? 10 : 1)
+        await delay(record.value?.endsWith('-1') ? 10 : 1)
         active -= 1
         ctx.forward(record)
       },
@@ -220,8 +220,8 @@ describe('async Processors', () => {
 
   it('rejects the pipe when an async Processor fails, and stops processing after it', async () => {
     const app = createStreamsApp({ applicationId: 'async-failure' })
-    const failing = app.processor('failing', (ctx: ProcessorContext<string, string>) => ({
-      async process(record: StreamRecord<string, string>) {
+    const failing = app.processor('failing', (ctx: ProcessorContext<string, string | null>) => ({
+      async process(record: StreamRecord<string, string | null>) {
         await delay(1)
         if (record.value === 'bad') throw new Error('enrichment failed')
         ctx.forward(record)
@@ -267,8 +267,8 @@ describe('Processor definition errors', () => {
 
   it('needs output Serdes after a Processor, since its record types may differ', () => {
     const app = createStreamsApp({ applicationId: 'serdes' })
-    const p = app.processor('p', (_ctx: ProcessorContext<string, string>) => ({
-      process(_record: StreamRecord<string, string>) {},
+    const p = app.processor('p', (_ctx: ProcessorContext<string, string | null>) => ({
+      process(_record: StreamRecord<string, string | null>) {},
     }))
     expect(() => app.stream('input', strings).process(p).to('output')).toThrow(/Serde/)
   })

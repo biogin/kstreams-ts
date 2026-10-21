@@ -111,11 +111,11 @@ describe('State Stores in Processors', () => {
   it('lets a Processor read and write a State Store it gets with ctx.store', async () => {
     const app = createStreamsApp({ applicationId: 'dedupe' })
     const seen = app.store('seen', { key: serdes.string, value: serdes.number })
-    const dedupe = app.processor('dedupe', (ctx: ProcessorContext<string, string>) => {
+    const dedupe = app.processor('dedupe', (ctx: ProcessorContext<string, string | null>) => {
       const store = ctx.store(seen)
       return {
-        process(record: StreamRecord<string, string>) {
-          if (store.get(record.value) !== undefined) return
+        process(record: StreamRecord<string, string | null>) {
+          if (record.value === null || store.get(record.value) !== undefined) return
           store.put(record.value, record.timestamp)
           ctx.forward(record)
         },
@@ -142,7 +142,7 @@ describe('State Stores in Processors', () => {
   it('finds a State Store by name, and deletes keys with delete or a null value', async () => {
     const app = createStreamsApp({ applicationId: 'latest' })
     app.store('latest', strings)
-    const latest = app.processor('latest', (ctx: ProcessorContext<string, string>) => ({
+    const latest = app.processor('latest', (ctx: ProcessorContext<string, string | null>) => ({
       process(record: StreamRecord<string, string | null>) {
         const store = ctx.store<string, string | null>('latest')
         if (record.value === 'delete') store.delete(record.key)
@@ -164,7 +164,7 @@ describe('State Stores in Processors', () => {
   it('gives a Processor typed access through the named State Store', () => {
     const app = createStreamsApp({ applicationId: 'store-types' })
     const counts = app.store('counts', { key: serdes.string, value: serdes.number })
-    app.processor('typed', (ctx: ProcessorContext<string, string>) => {
+    app.processor('typed', (ctx: ProcessorContext<string, string | null>) => {
       expectTypeOf(ctx.store(counts)).toEqualTypeOf<KeyValueStore<string, number>>()
       return { process() {} }
     })
@@ -189,7 +189,7 @@ describe('State Stores in Processors', () => {
 
   it('fails the record when a Processor asks for an unknown State Store', async () => {
     const app = createStreamsApp({ applicationId: 'unknown-store' })
-    const p = app.processor('p', (ctx: ProcessorContext<string, string>) => ({
+    const p = app.processor('p', (ctx: ProcessorContext<string, string | null>) => ({
       process() {
         ctx.store('nope')
       },
@@ -207,8 +207,9 @@ describe('State Stores in Processors', () => {
     }
     const app = createStreamsApp({ applicationId: 'store-serdes' })
     const names = app.store('names', { key: serdes.string, value: upper })
-    const p = app.processor('p', (ctx: ProcessorContext<string, string>) => ({
-      process(record: StreamRecord<string, string>) {
+    const p = app.processor('p', (ctx: ProcessorContext<string, string | null>) => ({
+      process(record: StreamRecord<string, string | null>) {
+        if (record.value === null) return
         const store = ctx.store(names)
         store.put(record.key, record.value)
         ctx.forward({ ...record, value: store.get(record.key) ?? '' })
@@ -234,9 +235,9 @@ describe('State Stores in Processors', () => {
     }
     const app = createStreamsApp({ applicationId: 'orders-app' })
     app.store('totals', { key: spy, value: serdes.string })
-    const p = app.processor('p', (ctx: ProcessorContext<string, string>) => ({
-      process(record: StreamRecord<string, string>) {
-        ctx.store<string, string>('totals').put(record.key, record.value)
+    const p = app.processor('p', (ctx: ProcessorContext<string, string | null>) => ({
+      process(record: StreamRecord<string, string | null>) {
+        if (record.value !== null) ctx.store<string, string>('totals').put(record.key, record.value)
       },
     }))
     app.stream('input', strings).process(p)
