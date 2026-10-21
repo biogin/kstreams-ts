@@ -1,6 +1,10 @@
 // Internal: a Worker, one consumer-group member that owns its Tasks, its producer and its
 // consumer (ADR-0007). With `workers: 0` the Streams App runs one Worker in the main thread.
 //
+// A Task is created when its first record arrives. Its State Stores are restored from their
+// Changelogs first (a full Restore, see restore.ts); its records wait in the Task meanwhile, and
+// the batch commits once they are processed.
+//
 // The commit cycle: read records into a batch until the commit interval runs out or the batch is
 // full, and process each record in its Task.
 // - At-least-once: then produce the batch's outputs and Changelog records, wait for the broker to
@@ -22,6 +26,7 @@ import {
 import { checkCoPartitioned } from './co-partitioning.js'
 import { ensureChangelogs } from './internal-topics.js'
 import type { ProcessorGraph, SerializedRecord } from './processor-graph.js'
+import { createChangelogReader, type KafkaChangelogReader, restoreStores } from './restore.js'
 import { createTask, type Task } from './task.js'
 
 export interface WorkerOptions {
@@ -104,6 +109,12 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
       key === undefined ? roundRobin++ : compatibilityPartitioner(message, key),
   })
 
+  // A restore consumer outside the group (ADR-0009), only for apps with State Stores.
+  const restorer =
+    graph.stores.size === 0
+      ? undefined
+      : createChangelogReader({ brokers, clientId: `${clientId}-restore` })
+
   const topics = [...graph.sources.keys()]
   let stream: MessagesStream<Bytes, Bytes, Bytes, Bytes>
   try {
@@ -122,7 +133,7 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
       autocommit: false,
     })
   } catch (error) {
-    await closeQuietly(consumer, producer)
+    await Promise.allSettled([closeQuietly(consumer, producer), restorer?.close()])
     throw error
   }
 
@@ -134,6 +145,7 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
         ? new AtLeastOnceCommitter(consumer, producer)
         : new TransactionalCommitter(consumer, producer, fail),
     stream,
+    restorer,
   )
   const done = cycle.run().then(
     () => close(),
@@ -151,7 +163,7 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
       await stream.close()
     } finally {
       // Closing the consumer leaves the group, so its Tasks move to other members right away.
-      await closeQuietly(consumer, producer, force)
+      await Promise.allSettled([closeQuietly(consumer, producer, force), restorer?.close()])
     }
   }
 
@@ -171,6 +183,8 @@ class CommitCycle {
   readonly #options: WorkerOptions
   readonly #committer: BatchCommitter
   readonly #messages: AsyncIterator<ConsumedMessage>
+  /** Reads the Changelogs of a new Task's State Stores; undefined without State Stores. */
+  readonly #restorer: KafkaChangelogReader | undefined
   /** One Task per partition number, shared by all the Co-partitioned input topics. */
   readonly #tasks = new Map<number, Task>()
 
@@ -191,8 +205,10 @@ class CommitCycle {
     options: WorkerOptions,
     createCommitter: (fail: (error: unknown) => void) => BatchCommitter,
     stream: MessagesStream<Bytes, Bytes, Bytes, Bytes>,
+    restorer: KafkaChangelogReader | undefined,
   ) {
     this.#graph = graph
+    this.#restorer = restorer
     this.#options = options
     this.#committer = createCommitter((error) => this.#fail(error))
     this.#messages = stream[Symbol.asyncIterator]()
@@ -285,6 +301,12 @@ class CommitCycle {
           // A Task's State Stores are logged to the Changelog partition of the same number.
           changelog: (topic, record) =>
             this.#committer.produce({ ...toMessage(topic, record), partition }),
+          // Every Task starts with a full Restore; its records queue behind it.
+          restore: (stores) => {
+            const restorer = this.#restorer
+            if (restorer === undefined) throw new Error('No restore consumer for State Stores')
+            return restoreStores(stores, partition, restorer)
+          },
         },
       )
       this.#tasks.set(partition, task)

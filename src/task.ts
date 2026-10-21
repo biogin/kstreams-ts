@@ -9,6 +9,7 @@ import type {
   TimerType,
 } from './processor-graph.js'
 import type { StreamRecord } from './record.js'
+import type { RestoringStore } from './restore.js'
 import {
   DeserializationError,
   deserializeNullable,
@@ -33,6 +34,12 @@ export interface TaskOptions {
    * partition of it), timestamped with the wall-clock time. Without one, writes aren't logged.
    */
   changelog?: RecordCollector | undefined
+  /**
+   * Restores the Task's State Stores, as opened, before it processes anything: records and timers
+   * given to the Task meanwhile wait for it. A failed Restore fails the Task. Without one, stores
+   * start as their suppliers open them.
+   */
+  restore?: ((stores: RestoringStore[]) => Promise<void>) | undefined
 }
 
 export interface Task {
@@ -100,7 +107,7 @@ export function createTask(
   graph: ProcessorGraph,
   collect: RecordCollector,
   wallClockTime: () => number = Date.now,
-  { task = 0, stateDir, changelog }: TaskOptions = {},
+  { task = 0, stateDir, changelog, restore }: TaskOptions = {},
 ): Task {
   // Async Processor calls of the current record that have not settled yet.
   const inFlight = new Set<Promise<void>>()
@@ -175,15 +182,18 @@ export function createTask(
   }
 
   const stores = new Map<string, KeyValueStore<unknown, unknown>>()
-  for (const { name, serdes, supplier, changelogTopic, keyEncoding } of graph.stores.values()) {
+  const opened: RestoringStore[] = []
+  for (const node of graph.stores.values()) {
+    const { name, serdes, supplier, changelogTopic, keyEncoding } = node
     const directory =
       stateDir === undefined ? undefined : taskDirectory(stateDir, graph.applicationId, task)
-    const opened = supplier({ name, applicationId: graph.applicationId, task, directory })
+    const store = supplier({ name, applicationId: graph.applicationId, task, directory })
+    opened.push({ node, store })
     const log =
       changelog &&
       ((key: Uint8Array, value: Uint8Array | null) =>
         changelog(changelogTopic, { key, value, timestamp: wallClockTime() }))
-    stores.set(name, keyValueStore(opened, serdes, { topic: changelogTopic }, keyEncoding, log))
+    stores.set(name, keyValueStore(store, serdes, { topic: changelogTopic }, keyEncoding, log))
   }
   const store = (ref: string | NamedStore<unknown, unknown>): KeyValueStore<unknown, unknown> => {
     const name = typeof ref === 'string' ? ref : ref.name
@@ -301,6 +311,9 @@ export function createTask(
     }
     return work === undefined ? Promise.resolve() : settle(work)
   }
+
+  // The first job: everything else queues behind it. Its failure fails the Task's later work.
+  if (restore !== undefined && opened.length > 0) enqueue(() => restore(opened)).catch(() => {})
 
   return {
     process(topic, record) {
