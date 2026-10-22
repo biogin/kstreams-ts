@@ -32,8 +32,7 @@
 // SQLite database it keeps an exclusive lock on (an OS file lock, which the kernel releases when
 // the process ends, whatever its PID namespace), from when it takes its App Process ID until it
 // gives it up. Another process tells whether it runs by trying to read the file: the lock makes
-// that fail. The file is locked under a private name before it is renamed to its own, so a starting
-// process that removes the readable (dead) ones never removes one that is still being taken. This needs a file system whose POSIX advisory locks the processes share (a local
+// that fail. This needs a file system whose POSIX advisory locks the processes share (a local
 // file system, e.g. one host directory bind-mounted into several containers; not NFS without
 // locking). A lock in another PID namespace without a liveness token is never taken over.
 //
@@ -60,7 +59,6 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
-  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
@@ -168,37 +166,20 @@ function aliveFile(directory: string, token: string): string {
 /** The liveness files this process holds, with how many App Processes use each. */
 const held = new Map<string, { db: Database.Database; users: number }>()
 
-/** A step of taking a liveness file. Unit tests run other processes' cleanup between them. */
-export type LivenessStep = 'create' | 'lock' | 'publish'
-
-/**
- * Holds this process's liveness file in `directory` until the returned function is called.
- * `preempt` runs before each step.
- */
-export function holdLiveness(
-  directory: string,
-  preempt: (step: LivenessStep) => void = () => {},
-): () => void {
+/** Holds this process's liveness file in `directory` until the returned function is called. */
+function holdLiveness(directory: string): () => void {
   const file = aliveFile(directory, incarnation)
   let entry = held.get(file)
   if (entry === undefined) {
-    // Created and locked under a private name that no other process's cleanup looks at, then
-    // published under its own name already locked: a readable `.alive` file is always a dead one's.
-    const draft = `${file}.${randomBytes(4).toString('hex')}.tmp`
-    preempt('create')
-    const db = new Database(draft)
+    const db = new Database(file)
     try {
       // Exclusive locking mode keeps the lock of the first transaction until the database closes;
       // the journal is kept in memory, as there is nothing to keep.
-      preempt('lock')
       db.pragma('journal_mode = MEMORY')
       db.pragma('locking_mode = EXCLUSIVE')
       db.exec('BEGIN EXCLUSIVE; COMMIT')
-      preempt('publish')
-      renameSync(draft, file) // atomic; the lock stays with the file
     } catch (error) {
       db.close()
-      rmSync(draft, { force: true })
       throw error
     }
     entry = { db, users: 0 }
