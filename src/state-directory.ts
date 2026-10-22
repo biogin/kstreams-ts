@@ -19,11 +19,15 @@
 // opens its State Stores and Checkpoint, so its directory has a lock file, `.lock`, while a Worker
 // has the Task open; the new owner waits for it.
 //
-// A lock file names its holder and the process (PID, when the host booted, and the process's
+// A lock file names its holder and the process (PID, which boot of the host, and the process's
 // incarnation: a random value of this process, shared by its worker threads). A lock is stale,
 // and taken over, when that process is gone: its PID isn't running, or the host has rebooted
 // since, or the PID is this process's but the incarnation isn't (an earlier process that had the
-// same PID, as a container's restarted process typically has). A lock of this same process is
+// same PID, as a container's restarted process typically has). The boot is told by the kernel's
+// boot ID on Linux, which no wall-clock step changes; elsewhere by when the host booted, derived
+// from the wall clock and uptime (macOS adjusts its boot time when the clock steps, so the two
+// agree; a step of more than BOOT_TOLERANCE_S where it doesn't could make a live process's lock
+// look stale). A lock of this same process is
 // never stale: the Streams App removes the Task locks of its Workers when they have all stopped,
 // even those of a worker thread that was terminated.
 //
@@ -51,10 +55,32 @@ const PROCESS_ID = /^[0-9a-f]{12}$/
 const LOCK_FILE = '.lock'
 const LOCK_POLL_MS = 50
 
-/** When this host booted, in seconds since the epoch (to a few seconds). */
-const BOOTED = Math.round(Date.now() / 1000 - uptime())
+/** Which boot of the host a process runs in. */
+export interface HostBoot {
+  /** The kernel's ID of this boot, if it has one (Linux): unlike `booted`, no clock step moves it. */
+  readonly bootId?: string
+  /** When the host booted, in seconds since the epoch (to a few seconds), from the wall clock. */
+  readonly booted: number
+}
+
 /** How far two readings of the boot time may differ for the same boot. */
 const BOOT_TOLERANCE_S = 120
+
+function readBootId(): string | undefined {
+  try {
+    const id = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim()
+    return id === '' ? undefined : id
+  } catch {
+    return undefined
+  }
+}
+
+/** This process's boot of the host. */
+const HOST_BOOT: HostBoot = (() => {
+  const bootId = readBootId()
+  const booted = Math.round(Date.now() / 1000 - uptime())
+  return bootId === undefined ? { booted } : { bootId, booted }
+})()
 
 /** This process's incarnation (see above); its worker threads adopt the main thread's. */
 let incarnation = randomBytes(8).toString('hex')
@@ -163,6 +189,7 @@ interface LockHolder {
   holder: string
   pid: number
   booted: number
+  bootId?: string
   incarnation?: string
 }
 
@@ -177,13 +204,15 @@ export function tryLock(
   holder: string,
   reentrant = false,
   files: LockFiles = lockFiles,
+  host: HostBoot = HOST_BOOT,
 ): boolean {
   for (;;) {
     // Written in full under another name first, so nobody ever reads a half-written lock.
     const mine = {
       holder,
       pid: process.pid,
-      booted: BOOTED,
+      booted: host.booted,
+      ...(host.bootId === undefined ? {} : { bootId: host.bootId }),
       incarnation,
       nonce: randomBytes(8).toString('hex'),
     }
@@ -203,11 +232,11 @@ export function tryLock(
     if (current !== undefined && isMine(current) && current.holder === holder) {
       return reentrant
     }
-    if (current !== undefined && !isStale(current)) return false
+    if (current !== undefined && !isStale(current, host)) return false
     // Stale: only the holder of its claim removes it, and only while it is still this very lock.
     const claim = `${file}.${createHash('sha256').update(content).digest('hex').slice(0, 16)}${CLAIM_SUFFIX}`
     // Reentrant: a claim of this very holder can only be left over from a terminated worker thread.
-    if (!tryLock(claim, holder, true, files)) return false // another contender takes it over
+    if (!tryLock(claim, holder, true, files, host)) return false // another contender takes it over
     try {
       if (files.read(file) === content) files.remove(file)
     } finally {
@@ -271,6 +300,7 @@ function parseLock(content: string): LockHolder | undefined {
         holder: parsed.holder,
         pid: parsed.pid,
         booted: parsed.booted,
+        ...(typeof parsed.bootId === 'string' ? { bootId: parsed.bootId } : {}),
         ...(typeof parsed.incarnation === 'string' ? { incarnation: parsed.incarnation } : {}),
       }
     }
@@ -286,10 +316,13 @@ function isMine(lock: LockHolder): boolean {
 }
 
 /** Whether the process that took `lock` is gone. */
-function isStale(lock: LockHolder): boolean {
+function isStale(lock: LockHolder, host: HostBoot): boolean {
   // A live process's PID is its own, so an earlier process that had this PID is gone.
   if (lock.pid === process.pid) return lock.incarnation !== incarnation
-  if (Math.abs(lock.booted - BOOTED) > BOOT_TOLERANCE_S) return true
+  // Taken in another boot of the host. Boot IDs, where both have one, are immune to clock steps.
+  if (lock.bootId !== undefined && host.bootId !== undefined) {
+    if (lock.bootId !== host.bootId) return true
+  } else if (Math.abs(lock.booted - host.booted) > BOOT_TOLERANCE_S) return true
   try {
     process.kill(lock.pid, 0)
     return false

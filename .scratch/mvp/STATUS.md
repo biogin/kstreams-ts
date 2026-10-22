@@ -28,7 +28,7 @@ All 30 tickets (01–30), plus three fixes: aborted-transaction filter, root-cau
 - **Pin `@platformatic/kafka` to an exact version** while `src/read-committed.ts` depends on its internals.
 - **Unverified doc claims (ticket 26):** transaction timeout wording and timers not persisting across restarts come from source comments; verify.
 - **Deferred review findings** (details, scenarios and evidence in `.scratch/mvp/review-findings-fixes.md`):
-  - Linux wall-clock step > 120 s makes a live process's locks look stale (BOOTED derives from `Date.now() - uptime()`): use a stable boot ID (finding 3; documented in docs/limitations.md).
+  - ~~Linux wall-clock step > 120 s makes a live process's locks look stale (BOOTED derives from `Date.now() - uptime()`): use a stable boot ID (finding 3; documented in docs/limitations.md).~~ Fixed on fix/deferred: locks carry the kernel boot ID (`/proc/sys/kernel/random/boot_id`) on Linux and staleness compares it instead of the clock-derived boot time; the derived time remains the fallback where there is no boot ID (macOS keeps it steady; other platforms keep a narrowed caveat in docs/limitations.md).
   - ~~Rolling back Stream Time for a skipped record doesn't undo window expiry, so expired windows reopen with partial aggregates (finding 6).~~ Fixed on fix/deferred: window expiry runs after each record that was processed and not skipped (`TaskInternals.afterRecord`).
   - ~~Timers scheduled while processing a skipped record keep a due time from the rolled-back Stream Time (finding 7).~~ Fixed on fix/deferred: the rollback re-times Stream Time timers created during the skipped record from the restored Stream Time (or leaves them for the next record to start).
 

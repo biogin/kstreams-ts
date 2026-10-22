@@ -123,6 +123,31 @@ describe('Task locks', () => {
     expect(await lockTask(dir, 'app', 0, taskLockHolder('new', 0), () => true)).toBe(true)
   })
 
+  it('of a live process are not taken over after a wall-clock step, given boot IDs', () => {
+    const dir = stateDir()
+    const lock = join(dir, '.lock')
+    // Taken by a live process (our parent) in this boot, before the clock stepped by 200 s.
+    const live = { holder: 'other/worker-0', pid: process.ppid, booted: 1_000, bootId: 'boot-1' }
+    writeFileSync(lock, JSON.stringify(live))
+    const afterStep = { bootId: 'boot-1', booted: 1_200 }
+    expect(tryLock(lock, 'new/worker-0', false, undefined, afterStep)).toBe(false)
+    // Another boot ID is a reboot since: the lock is stale, whatever the clock says.
+    expect(
+      tryLock(lock, 'new/worker-0', false, undefined, { bootId: 'boot-2', booted: 1_000 }),
+    ).toBe(true)
+  })
+
+  it('without boot IDs, tell a reboot by the boot time', () => {
+    const dir = stateDir()
+    const lock = join(dir, '.lock')
+    writeFileSync(
+      lock,
+      JSON.stringify({ holder: 'other/worker-0', pid: process.ppid, booted: 1_000 }),
+    )
+    expect(tryLock(lock, 'new/worker-0', false, undefined, { booted: 1_060 })).toBe(false)
+    expect(tryLock(lock, 'new/worker-0', false, undefined, { booted: 1_200 })).toBe(true)
+  })
+
   it('of one App Process are all removed once its Workers stopped', async () => {
     const dir = stateDir()
     await lockTask(dir, 'app', 0, taskLockHolder('p1', 0), () => true)
