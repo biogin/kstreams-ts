@@ -36,6 +36,6 @@ State Stores are a pluggable, byte-level interface (`StateStore`, [ADR-0005](./a
 
 ## The typed view
 
-`KeyValueStore<K, V>` gives `get`, `put` (a null value deletes), `delete`, `all()` and `range(from, to)`. Both ends of `range` are included and results are in ascending key order. Keys are ordered by value, not by their serialized bytes: `null`, then booleans, numbers numerically, strings by code point, byte arrays, arrays element by element; other types (objects) last, by their Serde bytes ([ADR-0015](./adr/0015-order-preserving-store-key-encoding.md)). Don't write to a store while iterating it.
+`KeyValueStore<K, V>` gives `get`, `put` (a null value deletes), `delete`, `all()` and `range(from, to)`. Both ends of `range` are included and results are in ascending key order. Keys are ordered by value, not by their serialized bytes: `null`, then booleans, numbers numerically, strings by code point, byte arrays, arrays element by element; other types (objects) last, by their Serde bytes ([ADR-0015](./adr/0015-order-preserving-store-key-encoding.md)). `put` and `delete` throw on a `null` or `undefined` key, since the compacted Changelog needs a key; the Test Driver does the same. Don't write to a store while iterating it.
 
 Stores are not readable from outside the app in 0.1. In tests, read them through the [Test Driver](./test-driver.md).

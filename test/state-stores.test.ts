@@ -219,6 +219,32 @@ describe('State Stores in Processors', () => {
     expect(opened).toEqual(['custom'])
   })
 
+  it('rejects writing a null or undefined key, like on Kafka', async () => {
+    const app = createStreamsApp({ applicationId: 'null-store-key' })
+    const store = app.store('s', { key: serdes.json<string | null>(), value: serdes.string })
+    const p = app.processor('p', (ctx: ProcessorContext<string, string | null>) => ({
+      process(record: StreamRecord<string, string | null>) {
+        const key = record.value === 'null' ? null : (undefined as unknown as string)
+        if (record.key === 'delete') ctx.store(store).delete(key)
+        else ctx.store(store).put(key, 'v')
+      },
+    }))
+    app.stream('input', strings).process(p)
+
+    // A failed record stops the app, so each write gets its own Test Driver.
+    for (const [op, key] of [
+      ['put', 'null'],
+      ['put', 'undefined'],
+      ['delete', 'null'],
+    ] as const) {
+      const driver = createTestDriver(app)
+      await expect(driver.input<string, string>('input').pipe(op, key)).rejects.toThrow(
+        `Cannot write a ${key} key to a State Store`,
+      )
+      expect(driver.store(store).all()).toEqual([])
+    }
+  })
+
   it('fails the record when a Processor asks for an unknown State Store', async () => {
     const app = createStreamsApp({ applicationId: 'unknown-store' })
     const p = app.processor('p', (ctx: ProcessorContext<string, string | null>) => ({
