@@ -195,6 +195,10 @@ export function rangeByStoreKey<K, V>(
  * Internal: wraps a byte-level store with the store's Serdes. Keys are encoded with `encoding`,
  * by default as a single part encoded with the key Serde as fallback. With a `changelog`, every
  * put and delete is also written to it.
+ *
+ * A key is used as its key Serde gives it back: serialized, deserialized, then encoded. Restore
+ * only has the Changelog's key bytes, so this makes a key's store key the same whether it was
+ * written or restored, even when the Serde changes it (e.g. a Date through `serdes.json()`).
  */
 export function keyValueStore<K, V>(
   store: StateStore,
@@ -203,7 +207,13 @@ export function keyValueStore<K, V>(
   encoding: KeyEncoding<K> = singleKeyEncoding(serdes.key),
   changelog?: ChangelogWriter,
 ): KeyValueStore<K, V> {
-  const key = (k: K) => encoding.encode(k, context)
+  /** The store key of `k`, from its key Serde bytes (null and undefined are kept as is). */
+  const fromBytes = (bytes: Uint8Array) =>
+    encoding.encode(serdes.key.deserialize(bytes, context), context)
+  const key = (k: K) =>
+    k === null || k === undefined
+      ? encoding.encode(k, context)
+      : fromBytes(serdes.key.serialize(k, context))
   const value = (bytes: Uint8Array) => serdes.value.deserialize(bytes, context)
   /** Writes `bytes` (null deletes) under `k`, and to the Changelog if there is one. */
   const write = (k: K, bytes: Uint8Array | null) => {
@@ -213,8 +223,8 @@ export function keyValueStore<K, V>(
       )
     }
     // Everything that can fail on a key happens before the store changes.
-    const local = key(k)
-    const logged = changelog === undefined ? undefined : serdes.key.serialize(k, context)
+    const logged = k === null || k === undefined ? undefined : serdes.key.serialize(k, context)
+    const local = logged === undefined ? key(k) : fromBytes(logged)
     if (bytes === null) store.delete(local)
     else store.put(local, bytes)
     if (changelog === undefined || logged === undefined) return

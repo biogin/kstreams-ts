@@ -101,6 +101,36 @@ describe('restoreStores', () => {
     expect(keyValueStore(store, strings, context).all()).toEqual([['a', 'new']])
   })
 
+  it('restores keys under the store keys they were written under, even if their Serde changes them', async () => {
+    // serdes.json() turns a Date into a string, serdes.string a lone surrogate into U+FFFD.
+    const cases: [Serdes<unknown, string>, unknown[]][] = [
+      [{ key: serdes.json<unknown>(), value: serdes.string }, [new Date(0), Number.NaN]],
+      [{ key: serdes.string as Serdes<unknown, string>['key'], value: serdes.string }, ['x\uD800']],
+    ]
+    for (const [keyed, keys] of cases) {
+      const records: ChangelogRecord[] = []
+      const written = openStore()
+      const view = keyValueStore(written, keyed, context, undefined, (key, value) =>
+        records.push({ key, value }),
+      )
+      for (const key of keys) view.put(key, 'v')
+      const restored = openStore()
+
+      await restoreStores([{ node: node({ serdes: keyed }), store: restored }], 0, {
+        read: async (_topic, _partition, apply) => {
+          apply(records)
+          return BigInt(records.length)
+        },
+      })
+
+      expect([...restored.all()]).toEqual([...written.all()])
+      const again = keyValueStore(restored, keyed, context)
+      for (const key of keys) expect(again.get(key)).toBe('v')
+      for (const key of keys) again.delete(key)
+      expect(again.all()).toEqual([])
+    }
+  })
+
   it('re-encodes keys with the store key encoding, e.g. windowed keys', async () => {
     const windows = tumbling('1m')
     const keySerde = windowedSerde(serdes.string, windows)
