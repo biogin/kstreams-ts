@@ -52,7 +52,7 @@
 // rebalance that loses partitions ends the batch. Records still buffered for lost partitions are
 // dropped, and so are records fetched during a partition's earlier ownership, and records the
 // client delivers again (after a rebalance it rewinds every partition it keeps to its committed
-// offset).
+// offset, if it has one).
 // - Exactly-once: a batch that anything of a Task whose ownership was interrupted had a part in
 //   (records it processed, outputs, Changelog writes, timer-driven writes; see `Ownership.epoch`)
 //   aborts: Kafka abort, then SQLite rollback. This is checked after the batch's processing, after
@@ -66,7 +66,10 @@
 // - At-least-once: the batch commits its outputs, and the offsets of the partitions still owned;
 //   the new owner of a lost partition processes its records again.
 // Either way the Tasks of lost partitions are closed, and their starts cancelled; one that comes
-// back is a new Task.
+// back is a new Task. Then the Worker reads every partition again from its committed offset, with
+// a new stream: a lost partition that comes back without a committed offset (nothing of it
+// committed yet) would otherwise go on from where the client was, past the records the Worker
+// dropped, and they would never be processed.
 //
 // A graceful stop ends the batch, commits it, closes the Tasks, cancels the starts (a Restore stops
 // after its current fetch) and leaves the group. If that takes longer than the shutdown timeout,
@@ -1152,6 +1155,7 @@ class CommitCycle {
       }
     }
     this.#forget(lost)
+    if (lost.size > 0 && !this.#stopRequested) await this.#rewind()
   }
 
   /**
@@ -1171,7 +1175,9 @@ class CommitCycle {
 
   /**
    * Closes the Tasks of the `lost` partitions, cancels their starts and forgets how far they were
-   * read.
+   * read. The caller then rewinds the stream: the client keeps fetching a lost partition that
+   * comes back from where it was, unless it has a committed offset to start from, so the records
+   * it fetched during the lost ownership (which the Worker dropped) would never come again.
    */
   #forget(lost: ReadonlySet<number>): void {
     if (lost.size === 0) return
@@ -1185,10 +1191,13 @@ class CommitCycle {
   }
 
   /**
-   * Reads every owned partition again from its committed offset, with a new stream: the records
-   * of an aborted batch must come again, and the client only rewinds on a rebalance.
+   * Reads every owned partition again from its committed offset (from its start if it has none),
+   * with a new stream: the records of an aborted batch must come again, and the client only
+   * rewinds on a rebalance, and then only partitions with a committed offset. A record the cycle
+   * kept back from the old stream comes again too.
    */
   async #rewind(): Promise<void> {
+    this.#held = undefined
     const previous = this.#stream
     this.#stream = await this.#openStream()
     this.#next.catch(() => {})

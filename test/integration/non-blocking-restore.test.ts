@@ -255,4 +255,83 @@ describeWithKafka('Restore without blocking other Tasks (SQLite, workers: 0)', (
     expect(counts.get('a')).toEqual([1, 2, 3])
     expect(counts.get('b')).toEqual(Array.from({ length: 11 }, (_, i) => i + 1))
   }, 180_000)
+
+  it('a Task lost during its start and given back, with nothing committed yet, reads its partition from the start (exactly-once)', async () => {
+    // Regression (crash suite kill-restore, seed 607414765): the client keeps fetching a partition
+    // that comes back from where it was when there's no committed offset to rewind it to, so the
+    // Task started again over records the Worker had dropped, and they were never processed.
+    const input = await kafka.createTopic('input', 2)
+    const output = await kafka.createTopic('output', 2)
+    const applicationId = uniqueName('non-blocking-regained')
+    const changelog = `${applicationId}-counts-changelog`
+    kafka.deleteOnClose(changelog)
+    const config = (stateDir: string) => ({
+      applicationId,
+      guarantee: 'exactly-once' as const,
+      stateDir,
+      commitMaxRecords: 10,
+    })
+
+    // Creates the Changelog; nothing is committed for the restoring Task's partition.
+    const first = counter(config(stateDirectory()), input, output)
+    await first.start()
+    await kafka.produce(input, records('a', 0, 1))
+    await waitForCounts(output, 'a', 1)
+    await first.stop()
+    expect((await kafka.committedOffsets(applicationId, input)).has(RESTORING)).toBe(false)
+
+    const gate = new Producer({
+      clientId: uniqueName('gate'),
+      bootstrapBrokers: brokers,
+      idempotent: true,
+      transactionalId: uniqueName('gate'),
+      producerId: -1n,
+      producerEpoch: -1,
+      timeout: 120_000,
+    })
+    producers.push(gate)
+    const open = await gate.beginTransaction()
+    const one = Buffer.from(serdes.number.serialize(1, { topic: changelog }))
+    await open.send({
+      messages: [{ topic: changelog, key: Buffer.from('gate'), value: one, partition: RESTORING }],
+    })
+
+    // The first App Process starts Task 1, whose Restore waits for the gate; it holds 10 records
+    // and fetches the rest of the partition meanwhile.
+    const owner = counter(config(stateDirectory()), input, output)
+    await owner.start()
+    await kafka.produce(input, records('b', RESTORING, 30))
+    await kafka.produce(input, records('a', 0, 1))
+    await waitForCounts(output, 'a', 2)
+
+    // Task 1 moves to a second App Process (the highest Task; task-assignor.ts) and comes back.
+    const other = counter(config(stateDirectory()), input, output)
+    await other.start()
+    await eventually(
+      async () => {
+        const group = await kafka.groupAssignments(applicationId, input)
+        return group.state === 'STABLE' && group.assigned.size === 2
+      },
+      { timeoutMs: 60_000, message: 'both App Processes to have a Task' },
+    )
+    await other.stop()
+    await eventually(
+      async () => {
+        const group = await kafka.groupAssignments(applicationId, input)
+        return group.state === 'STABLE' && [...group.assigned.values()][0]?.length === 2
+      },
+      { timeoutMs: 60_000, message: 'the first App Process to have both Tasks again' },
+    )
+
+    await kafka.produce(input, records('b', RESTORING, 5))
+    await open.abort()
+    await eventually(
+      async () => (await kafka.committedOffsets(applicationId, input)).get(RESTORING) === 35n,
+      { timeoutMs: 60_000, message: 'every record of Task 1 to be consumed' },
+    )
+    await owner.stop()
+    expect((await committedCounts(output)).get('b')).toEqual(
+      Array.from({ length: 35 }, (_, i) => i + 1),
+    )
+  }, 180_000)
 })
