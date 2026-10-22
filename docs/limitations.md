@@ -19,7 +19,7 @@
 - Without a `stateDir`, State Stores are in memory and each start gets a random App Process ID, so a crashed process's open transactions are only aborted by their timeout (see [delivery guarantees](./delivery-guarantees.md#transactional-ids-include-the-app-process-id)).
 - Processes on one host may share a `stateDir`: they take different App Process IDs, and a Task directory's lock has one owner at a time, taken over only once its process is gone (a restarted process with the same PID, as in a container, takes its own locks back). Whether a process is gone is judged by its PID and the host's boot time, which is derived from the wall clock: on Linux, a clock step of more than two minutes between the starts of two processes sharing a `stateDir` can make the earlier one's locks look stale, so both own them. And a dead process's locks wait while an unrelated process reuses its PID. One state directory per process avoids both.
 - At-least-once: when a rebalance takes a Task away, the uncommitted work of its lost partitions is redone by the new owner, so their outputs since the last commit can be duplicated.
-- A skipped record (error handler) does not advance Stream Time.
+- A skipped record (error handler) does not advance Stream Time, so it expires no windows and moves no timer.
 - Exactly-once relies on a workaround for the Kafka client's `read_committed` (`src/read-committed.ts`) until platformatic/kafka#470 ships.
 - Java Kafka Streams formats and topology names are not compatible, and will not be ([ADR-0003](./adr/0003-no-java-kafka-streams-compatibility.md)). Node.js 24 or later only (no Bun or Deno).
 - 0.1 is a beta: the API may change before 1.0.

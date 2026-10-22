@@ -117,17 +117,17 @@ describeWithKafka('Windowed count() on Kafka (at-least-once, workers: 0)', () =>
     await second.app.stop()
     expect(second.contents()).toEqual([[at('c', 2), 1]])
 
-    // Every write of the store is in the Changelog. The expired windows are deleted before the
-    // record that made them expire is counted, so their Tombstones come first.
+    // Every write of the store is in the Changelog. The expired windows are deleted once the
+    // record that made them expire has been counted, so their Tombstones come after it.
     const logged = await kafka.consumeBytes(changelog, 7)
     expect(logged.map(decodeChangelog)).toEqual([
       [at('a', 0), 1],
       [at('b', 0), 1],
       [at('a', 0), 2],
       [at('a', 0), 3],
+      [at('c', 2), 1],
       [at('a', 0), null],
       [at('b', 0), null],
-      [at('c', 2), 1],
     ])
 
     // Restored again, Tombstones included: only the window still kept comes back.

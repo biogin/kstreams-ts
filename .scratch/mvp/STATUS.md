@@ -29,7 +29,7 @@ All 30 tickets (01–30), plus three fixes: aborted-transaction filter, root-cau
 - **Unverified doc claims (ticket 26):** transaction timeout wording and timers not persisting across restarts come from source comments; verify.
 - **Deferred review findings** (details, scenarios and evidence in `.scratch/mvp/review-findings-fixes.md`):
   - Linux wall-clock step > 120 s makes a live process's locks look stale (BOOTED derives from `Date.now() - uptime()`): use a stable boot ID (finding 3; documented in docs/limitations.md).
-  - Rolling back Stream Time for a skipped record doesn't undo window expiry, so expired windows reopen with partial aggregates (finding 6).
+  - ~~Rolling back Stream Time for a skipped record doesn't undo window expiry, so expired windows reopen with partial aggregates (finding 6).~~ Fixed on fix/deferred: window expiry runs after each record that was processed and not skipped (`TaskInternals.afterRecord`).
   - Timers scheduled while processing a skipped record keep a due time from the rolled-back Stream Time (finding 7).
 
 ## Fixed

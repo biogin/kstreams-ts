@@ -233,6 +233,46 @@ describe('window retention', () => {
     expect(driver.store('counts').all()).toEqual([[inMinute('bob', 60 * MINUTE), 1]])
   })
 
+  it('does not expire windows for a skipped record, whose Stream Time is rolled back', async () => {
+    const app = createStreamsApp({
+      applicationId: 'window-retention-skipped',
+      errorHandlers: { processing: () => 'continue' },
+    })
+    app
+      .stream('input', strings)
+      .groupByKey()
+      .window(tumbling(1_000))
+      .aggregate(
+        () => '',
+        (_key, value: string, aggregate: string) => {
+          if (value === 'bad') throw new Error('bad value')
+          return aggregate + value
+        },
+        { serde: serdes.string, store: 'aggregates' },
+      )
+      .toStream()
+      .to('output', { key: serdes.windowed(serdes.string, tumbling(1_000)), value: serdes.string })
+    const driver = createTestDriver(app)
+    const input = driver.input<string, string>('input')
+    await input.pipe('a', 'x', { timestamp: 100 })
+    await input.pipe('a', 'y', { timestamp: 200 })
+    await input.pipe('b', 'z', { timestamp: 300 })
+    await input.pipe('b', 'bad', { timestamp: 90_000 }) // skipped
+    await input.pipe('a', 'w', { timestamp: 400 })
+
+    const window = { start: 0, end: 1_000 }
+    expect(driver.store('aggregates').all()).toEqual([
+      [{ key: 'a', window }, 'xyw'],
+      [{ key: 'b', window }, 'z'],
+    ])
+    expect(
+      driver
+        .output('output')
+        .readAll()
+        .map((record) => record.value),
+    ).toEqual(['x', 'xy', 'z', 'xyw'])
+  })
+
   it('does not forward anything when windows expire', async () => {
     const driver = createTestDriver(clickCounts('window-retention-quiet'))
     const clicks = driver.input<string, string>('clicks')

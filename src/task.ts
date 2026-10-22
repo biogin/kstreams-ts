@@ -132,6 +132,12 @@ export interface TaskInternals {
   streamTime(): number | undefined
   /** Counts a record dropped because it arrived after its window's Grace Period. */
   recordLateDropped(): void
+  /**
+   * Runs `callback` after each record the Task has processed and not skipped, before its Stream
+   * Time timers fire. Work that depends on Stream Time having advanced (window expiry) goes here,
+   * so a skipped record, whose Stream Time is rolled back, leaves it undone.
+   */
+  afterRecord(callback: () => void): void
 }
 
 const internals = new WeakMap<object, TaskInternals>()
@@ -283,10 +289,14 @@ export function createTask(
   }
 
   const metrics: TaskMetrics = noTaskCounters()
+  const afterRecord: (() => void)[] = []
   const taskSide: TaskInternals = {
     streamTime: () => streamTime,
     recordLateDropped() {
       metrics.lateRecordsDropped++
+    },
+    afterRecord(callback) {
+      afterRecord.push(callback)
     },
   }
 
@@ -393,9 +403,11 @@ export function createTask(
       processed = onError(error)
     }
     // Timers are not a record's processing: their errors always fail the Task.
-    return andThen(processed, () =>
-      skipped ? undefined : fireDue('stream-time', streamTime ?? record.timestamp),
-    )
+    return andThen(processed, () => {
+      if (skipped) return undefined
+      for (const callback of afterRecord) callback()
+      return fireDue('stream-time', streamTime ?? record.timestamp)
+    })
   }
 
   const drain = async (): Promise<void> => {

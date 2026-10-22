@@ -34,6 +34,6 @@ On a topic a windowed key is the key Serde's bytes followed by the window start 
 
 ## Retention and expiry
 
-A window's state is kept until Stream Time passes its end plus the Grace Period, that is **retention = size + Grace Period**. It is not configurable yet. Windows expire only when new records arrive: an idle Task keeps its windows, and a stalled input partition holds its state until data flows again.
+A window's state is kept until Stream Time passes its end plus the Grace Period, that is **retention = size + Grace Period**. It is not configurable yet. Windows expire only when new records arrive (after each record is processed; a record skipped by an error handler expires nothing): an idle Task keeps its windows, and a stalled input partition holds its state until data flows again.
 
 Skipped records (by an [error handler](./error-handlers.md)) don't advance Stream Time.
