@@ -13,7 +13,7 @@
 
 - DSL functions must be synchronous; async work goes in a Processor, and async Processors [stretch transactions](./delivery-guarantees.md#async-processors-stretch-transactions).
 - Windows expire only when new records arrive for their Task.
-- Timers are not persisted across restarts and rebalances; a Processor schedules them again.
+- Timers are not persisted: after a restart, or for a Task recreated by a rebalance, a Processor schedules them again. A Task retained across a cooperative rebalance keeps its timers.
 - A Task restores when its first record arrives, so a quiet Task starts late; there is no limit on concurrent Restores.
 - Disposable disks mean a [full Restore on every start](./operations.md#disposable-disks).
 - Without a `stateDir`, State Stores are in memory and each start gets a random App Process ID, so a crashed process's open transactions are only aborted by their timeout (see [delivery guarantees](./delivery-guarantees.md#transactional-ids-include-the-app-process-id)).
