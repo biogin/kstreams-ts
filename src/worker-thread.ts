@@ -9,6 +9,7 @@
 import { Worker as Thread } from 'node:worker_threads'
 import type { WorkerReport } from './observability.js'
 import { DeserializationError } from './serde.js'
+import { processIncarnation } from './state-directory.js'
 import { AsyncNotAllowedError } from './sync-dsl.js'
 import type { Worker } from './worker.js'
 
@@ -18,6 +19,8 @@ export interface WorkerThreadData {
   applicationId: string
   /** The App Process ID (see state-directory.ts). */
   processId: string
+  /** The process's incarnation (see state-directory.ts), which this thread's locks name. */
+  incarnation: string
   workerNumber: number
 }
 
@@ -78,6 +81,7 @@ export function startWorkerThread(options: WorkerThreadOptions): Promise<Worker>
     appModule: appModule.href,
     applicationId,
     processId,
+    incarnation: processIncarnation(),
     workerNumber,
   }
   const thread = new Thread(entry, { workerData, name: `${applicationId}-worker-${workerNumber}` })

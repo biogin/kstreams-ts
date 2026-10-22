@@ -19,10 +19,13 @@
 // opens its State Stores and Checkpoint, so its directory has a lock file, `.lock`, while a Worker
 // has the Task open; the new owner waits for it.
 //
-// A lock file names its holder and the process (PID, and when the host booted). A lock is stale,
+// A lock file names its holder and the process (PID, when the host booted, and the process's
+// incarnation: a random value of this process, shared by its worker threads). A lock is stale,
 // and taken over, when that process is gone: its PID isn't running, or the host has rebooted
-// since. A lock of this same process is never stale: the Streams App removes the Task locks of its
-// Workers when they have all stopped, even those of a worker thread that was terminated.
+// since, or the PID is this process's but the incarnation isn't (an earlier process that had the
+// same PID, as a container's restarted process typically has). A lock of this same process is
+// never stale: the Streams App removes the Task locks of its Workers when they have all stopped,
+// even those of a worker thread that was terminated.
 //
 // Taking over a stale lock keeps it exclusive throughout, however many contenders race: a lock is
 // only ever created where none is (a hard link, which fails if the name exists), and removed by
@@ -52,6 +55,19 @@ const LOCK_POLL_MS = 50
 const BOOTED = Math.round(Date.now() / 1000 - uptime())
 /** How far two readings of the boot time may differ for the same boot. */
 const BOOT_TOLERANCE_S = 120
+
+/** This process's incarnation (see above); its worker threads adopt the main thread's. */
+let incarnation = randomBytes(8).toString('hex')
+
+/** This process's incarnation, for its worker threads to adopt. */
+export function processIncarnation(): string {
+  return incarnation
+}
+
+/** Makes this worker thread's locks those of the process whose incarnation is `value`. */
+export function adoptProcessIncarnation(value: string): void {
+  incarnation = value
+}
 
 /** Takes an App Process ID for `applicationId`, kept in `stateDir` if there is one. */
 export function claimProcessIdentity(
@@ -136,7 +152,7 @@ export function unlockTasksOf(stateDir: string, applicationId: string, processId
     for (const name of locks) {
       const lock = join(directory, name)
       const holder = readLock(lock)
-      if (holder?.pid === process.pid && holder.holder.startsWith(`${processId}/`)) {
+      if (holder !== undefined && isMine(holder) && holder.holder.startsWith(`${processId}/`)) {
         rmSync(lock, { force: true })
       }
     }
@@ -147,6 +163,7 @@ interface LockHolder {
   holder: string
   pid: number
   booted: number
+  incarnation?: string
 }
 
 const CLAIM_SUFFIX = '.claim'
@@ -163,7 +180,13 @@ export function tryLock(
 ): boolean {
   for (;;) {
     // Written in full under another name first, so nobody ever reads a half-written lock.
-    const mine = { holder, pid: process.pid, booted: BOOTED, nonce: randomBytes(8).toString('hex') }
+    const mine = {
+      holder,
+      pid: process.pid,
+      booted: BOOTED,
+      incarnation,
+      nonce: randomBytes(8).toString('hex'),
+    }
     const draft = `${file}.${randomBytes(4).toString('hex')}.tmp`
     files.write(draft, JSON.stringify(mine))
     try {
@@ -177,7 +200,7 @@ export function tryLock(
     const content = files.read(file)
     if (content === undefined) continue // just removed
     const current = parseLock(content)
-    if (current !== undefined && current.pid === process.pid && current.holder === holder) {
+    if (current !== undefined && isMine(current) && current.holder === holder) {
       return reentrant
     }
     if (current !== undefined && !isStale(current)) return false
@@ -197,7 +220,7 @@ export function tryLock(
 export function unlock(file: string, holder: string, files: LockFiles = lockFiles): void {
   const content = files.read(file)
   const current = content === undefined ? undefined : parseLock(content)
-  if (current?.pid === process.pid && current.holder === holder) files.remove(file)
+  if (current !== undefined && isMine(current) && current.holder === holder) files.remove(file)
 }
 
 /**
@@ -244,7 +267,12 @@ function parseLock(content: string): LockHolder | undefined {
       typeof parsed.pid === 'number' &&
       typeof parsed.booted === 'number'
     ) {
-      return { holder: parsed.holder, pid: parsed.pid, booted: parsed.booted }
+      return {
+        holder: parsed.holder,
+        pid: parsed.pid,
+        booted: parsed.booted,
+        ...(typeof parsed.incarnation === 'string' ? { incarnation: parsed.incarnation } : {}),
+      }
     }
   } catch {
     // Unreadable: stale.
@@ -252,9 +280,15 @@ function parseLock(content: string): LockHolder | undefined {
   return undefined
 }
 
+/** Whether `lock` was taken by this process (not an earlier one that had its PID). */
+function isMine(lock: LockHolder): boolean {
+  return lock.pid === process.pid && lock.incarnation === incarnation
+}
+
 /** Whether the process that took `lock` is gone. */
 function isStale(lock: LockHolder): boolean {
-  if (lock.pid === process.pid) return false
+  // A live process's PID is its own, so an earlier process that had this PID is gone.
+  if (lock.pid === process.pid) return lock.incarnation !== incarnation
   if (Math.abs(lock.booted - BOOTED) > BOOT_TOLERANCE_S) return true
   try {
     process.kill(lock.pid, 0)

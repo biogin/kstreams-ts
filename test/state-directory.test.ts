@@ -12,9 +12,11 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
+  adoptProcessIncarnation,
   claimProcessIdentity,
   type LockFiles,
   lockTask,
+  processIncarnation,
   taskLockHolder,
   tryLock,
   unlock,
@@ -64,6 +66,27 @@ describe('the App Process ID', () => {
     const content = JSON.parse(readFileSync(lock, 'utf8')) as { pid: number }
     writeFileSync(lock, JSON.stringify({ ...content, pid: deadPid() }))
     expect(claimProcessIdentity(dir, 'app').id).toBe(crashed.id)
+  })
+
+  it('is taken back, with its Task locks, by a restart that got the same PID', async () => {
+    const dir = stateDir()
+    const current = processIncarnation()
+    let crashed: string
+    try {
+      // An earlier process with this same PID (a container's restarted process typically has
+      // it): it dies holding its ID and a Task lock.
+      adoptProcessIncarnation('earlier')
+      crashed = claimProcessIdentity(dir, 'app').id
+      expect(await lockTask(dir, 'app', 0, taskLockHolder(crashed, 0), () => true)).toBe(true)
+    } finally {
+      adoptProcessIncarnation(current)
+    }
+    const restarted = claimProcessIdentity(dir, 'app')
+    expect(restarted.id).toBe(crashed)
+    expect(await lockTask(dir, 'app', 0, taskLockHolder(restarted.id, 0), () => true)).toBe(true)
+    // While this process holds them, a second claim of this process doesn't take them.
+    expect(claimProcessIdentity(dir, 'app').id).not.toBe(crashed)
+    expect(await lockTask(dir, 'app', 0, taskLockHolder('other', 0), () => true)).toBe(false)
   })
 
   it('is new on every start without a state directory', () => {
