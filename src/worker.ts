@@ -114,6 +114,11 @@ import { createStableOffsetReader, type StableOffsetReader } from './stable-offs
 import { lockTask, unlockTask } from './state-directory.js'
 import { type ChangelogOffsets, createTask, type Task } from './task.js'
 import { assignTasks } from './task-assignor.js'
+import {
+  fromTopicPartitionKey,
+  type TopicPartitionKey,
+  topicPartitionKey,
+} from './topic-partition.js'
 
 export interface WorkerOptions {
   applicationId: string
@@ -349,7 +354,7 @@ interface StartingTask {
    * The offset after the last record held, by `topic:partition`: a record the stream delivers
    * again (after a rewind) isn't held twice.
    */
-  readonly heldUpTo: Map<string, bigint>
+  readonly heldUpTo: Map<TopicPartitionKey, bigint>
   /** Whether it dropped records because the bound was reached: it then reads them again. */
   overflowed: boolean
   /** Exactly-once: its stable committed offsets, by topic. */
@@ -372,10 +377,6 @@ class PartitionRevokedError extends Error {}
 function isRebalanceError(error: unknown): boolean {
   if (error instanceof PartitionRevokedError) return true
   return error instanceof Error && findErrorBy(error, 'needsRejoin', true) !== null
-}
-
-function partitionKey(topic: string, partition: number): string {
-  return `${topic}:${partition}`
 }
 
 interface CommitCycleClients {
@@ -440,7 +441,7 @@ class CommitCycle {
   // The current batch.
   #work: Promise<void>[] = []
   /** The last record read from each partition, by `topic:partition`. */
-  #lastRead = new Map<string, ConsumedMessage>()
+  #lastRead = new Map<TopicPartitionKey, ConsumedMessage>()
   /**
    * A record that ended the batch it arrived in, after partitions were lost; the next batch starts
    * with it.
@@ -450,9 +451,9 @@ class CommitCycle {
    * The offset after the last record processed, by `topic:partition`. A record before it was
    * processed already: the client delivers it again after a rebalance.
    */
-  #position = new Map<string, bigint>()
+  #position = new Map<TopicPartitionKey, bigint>()
   /** The offset after the last record committed, by `topic:partition`. */
-  #committedPosition = new Map<string, bigint>()
+  #committedPosition = new Map<TopicPartitionKey, bigint>()
 
   /** Between the client's `consumer:group:rebalance` and its `consumer:group:join`. */
   #rebalancing = false
@@ -785,7 +786,7 @@ class CommitCycle {
    * from a revoked or an earlier ownership), and wasn't processed already.
    */
   #accepts(message: ConsumedMessage): boolean {
-    const position = this.#position.get(partitionKey(message.topic, message.partition))
+    const position = this.#position.get(topicPartitionKey(message.topic, message.partition))
     return (
       this.#ownership.current(message) && (position === undefined || message.offset >= position)
     )
@@ -822,7 +823,7 @@ class CommitCycle {
   /** Holds `message` for its starting Task, within the bound (see the top of this file). */
   #hold(starting: StartingTask, message: ConsumedMessage): void {
     if (starting.overflowed) return
-    const key = partitionKey(message.topic, message.partition)
+    const key = topicPartitionKey(message.topic, message.partition)
     const upTo = starting.heldUpTo.get(key)
     if (upTo !== undefined && message.offset < upTo) return
     if (this.#heldCount >= this.#options.commitMaxRecords) {
@@ -912,7 +913,7 @@ class CommitCycle {
       this.#heldCount -= starting.held.length
       this.#tasks.set(partition, starting.task)
       for (const [topic, offset] of starting.stable ?? []) {
-        const key = partitionKey(topic, partition)
+        const key = topicPartitionKey(topic, partition)
         const position = this.#position.get(key)
         if (position === undefined || offset > position) this.#position.set(key, offset)
       }
@@ -963,7 +964,7 @@ class CommitCycle {
       timestamp: Number(message.timestamp),
     }
     this.#track(this.#task(message.partition).process(message.topic, record, message.offset))
-    const key = partitionKey(message.topic, message.partition)
+    const key = topicPartitionKey(message.topic, message.partition)
     this.#lastRead.set(key, message)
     this.#position.set(key, message.offset + 1n)
   }
@@ -1102,7 +1103,7 @@ class CommitCycle {
     }
     this.#reportCounters()
     for (const message of committing) {
-      const key = partitionKey(message.topic, message.partition)
+      const key = topicPartitionKey(message.topic, message.partition)
       if (result.offsetsCommitted) {
         this.#committedPosition.set(key, message.offset + 1n)
       } else if (!this.#lastRead.has(key)) {
@@ -1138,7 +1139,7 @@ class CommitCycle {
     this.#cancelStarts(lost)
     for (const positions of [this.#position, this.#committedPosition]) {
       for (const key of positions.keys()) {
-        if (lost.has(Number(key.slice(key.lastIndexOf(':') + 1)))) positions.delete(key)
+        if (lost.has(fromTopicPartitionKey(key).partition)) positions.delete(key)
       }
     }
   }

@@ -13,6 +13,13 @@
 // `consumer:group:join` for that round); every member gets `consumer:group:join` after the second.
 // Both events update the ownership, so one rebalance raises the generation twice, by one each time.
 
+import {
+  fromTopicPartitionKey,
+  type TopicPartition,
+  type TopicPartitionKey,
+  topicPartitionKey,
+} from './topic-partition.js'
+
 /** What `Ownership` needs from the consumer. */
 export interface GroupMember {
   readonly generationId: number
@@ -34,7 +41,7 @@ export class Ownership {
   /** The generation of the last assignment seen. */
   #generation: number
   /** The generation each owned `topic:partition` was assigned in, and owned since. */
-  #owned: Map<string, number>
+  #owned: Map<TopicPartitionKey, number>
   /** Partition numbers lost since the last `takeLost`. */
   #lost = new Set<number>()
   readonly #onLost: () => void
@@ -69,12 +76,12 @@ export class Ownership {
 
   /** The partitions owned now. */
   owned(): OwnedPartition[] {
-    return [...this.#owned.keys()].map(toPartition)
+    return [...this.#owned.keys()].map(fromTopicPartitionKey)
   }
 
   /** Whether `topic:partition` is owned now. */
   owns(topic: string, partition: number): boolean {
-    return this.#owned.has(`${topic}:${partition}`)
+    return this.#owned.has(topicPartitionKey(topic, partition))
   }
 
   /**
@@ -82,7 +89,7 @@ export class Ownership {
    * and the record was fetched after it was assigned (not left over from an earlier ownership).
    */
   current(record: FetchedRecord): boolean {
-    const since = this.#owned.get(`${record.topic}:${record.partition}`)
+    const since = this.#owned.get(topicPartitionKey(record.topic, record.partition))
     const consumer = record.metadata.consumer as { generationId?: unknown } | undefined
     const fetchedIn = consumer?.generationId
     return since !== undefined && typeof fetchedIn === 'number' && fetchedIn >= since
@@ -119,15 +126,15 @@ export class Ownership {
     // dropped partitions without a rebalance; the others are still owned.
     const continuous = generation === this.#generation + 1 || generation === this.#generation
     this.#generation = generation
-    const owned = new Map<string, number>()
+    const owned = new Map<TopicPartitionKey, number>()
     for (const key of assigned(this.#member)) {
       const since = continuous ? this.#owned.get(key) : undefined
       owned.set(key, since ?? generation)
     }
-    const revoked: string[] = []
+    const revoked: TopicPartitionKey[] = []
     for (const [key, since] of this.#owned) {
       if (owned.get(key) !== since) {
-        this.#lost.add(partitionOf(key))
+        this.#lost.add(fromTopicPartitionKey(key).partition)
         revoked.push(key)
       }
     }
@@ -135,23 +142,20 @@ export class Ownership {
     this.#owned = owned
     if (revoked.length > 0) this.#onLost()
     this.#onRound({
-      assigned: added.map(([key]) => toPartition(key)),
-      revoked: revoked.map(toPartition),
+      assigned: added.map(([key]) => fromTopicPartitionKey(key)),
+      revoked: revoked.map(fromTopicPartitionKey),
     })
   }
 }
 
-function assigned(member: GroupMember): string[] {
+function assigned(member: GroupMember): TopicPartitionKey[] {
   return (member.assignments ?? []).flatMap(({ topic, partitions }) =>
-    partitions.map((partition) => `${topic}:${partition}`),
+    partitions.map((partition) => topicPartitionKey(topic, partition)),
   )
 }
 
 /** A partition of an input topic. */
-export interface OwnedPartition {
-  topic: string
-  partition: number
-}
+export type OwnedPartition = TopicPartition
 
 /** What a completed rebalance round changed. */
 export interface OwnershipRound {
@@ -159,13 +163,4 @@ export interface OwnershipRound {
   assigned: OwnedPartition[]
   /** The partitions lost in this round (see the top of this file). */
   revoked: OwnedPartition[]
-}
-
-function toPartition(key: string): OwnedPartition {
-  const at = key.lastIndexOf(':')
-  return { topic: key.slice(0, at), partition: Number(key.slice(at + 1)) }
-}
-
-function partitionOf(key: string): number {
-  return Number(key.slice(key.lastIndexOf(':') + 1))
 }
