@@ -2,6 +2,7 @@
 
 import { TaskCheckpoint } from './checkpoint.js'
 import { type FailedRecord, handleError } from './error-handlers.js'
+import { noTaskCounters, type TaskCounters } from './observability.js'
 import type {
   OutputRecord,
   ProcessorContext,
@@ -122,10 +123,8 @@ export interface Task {
   close(): void
 }
 
-export interface TaskMetrics {
-  /** Records dropped by windowed aggregations because they arrived after the Grace Period. */
-  lateRecordsDropped: number
-}
+/** The Task's counters (see observability.ts). */
+export type TaskMetrics = TaskCounters
 
 /** Internal: what the DSL's own Processors get from their Task besides the public context. */
 export interface TaskInternals {
@@ -283,7 +282,7 @@ export function createTask(
     return found
   }
 
-  const metrics: TaskMetrics = { lateRecordsDropped: 0 }
+  const metrics: TaskMetrics = noTaskCounters()
   const taskSide: TaskInternals = {
     streamTime: () => streamTime,
     recordLateDropped() {
@@ -368,6 +367,7 @@ export function createTask(
     } catch (error) {
       // A skipped record doesn't advance Stream Time.
       handleError(graph.errorHandlers, 'deserialization', error, failed, collect)
+      metrics.recordsDropped.deserialization++
       return undefined
     }
     advanceStreamTime(record.timestamp)
@@ -375,6 +375,7 @@ export function createTask(
       // The record's async work still going on finishes before the next record starts.
       andThen(quiesce(), () => {
         handleError(graph.errorHandlers, 'processing', error, failed, collect)
+        metrics.recordsDropped.processing++
         return undefined
       })
     let processed: Promise<void> | undefined
@@ -468,13 +469,20 @@ export function createTask(
 
   return {
     process(topic, record, offset) {
-      return enqueue(transacted(() => run(topic, record, offset)))
+      return enqueue(
+        transacted(() =>
+          andThen(run(topic, record, offset), () => {
+            metrics.recordsProcessed++
+            return undefined
+          }),
+        ),
+      )
     },
     fireWallClockTimers() {
       return enqueue(transacted(() => fireDue('wall-clock-time', wallClockTime())))
     },
     store,
-    metrics: () => ({ ...metrics }),
+    metrics: () => ({ ...metrics, recordsDropped: { ...metrics.recordsDropped } }),
     restored: () => restored,
     commit() {
       if (pending !== undefined) {

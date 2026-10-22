@@ -2,10 +2,12 @@
 // Streams App, whose definition holds functions, so it imports the App Module and rebuilds the app
 // from its default export (ADR-0013), then runs the Worker as `workers: 0` runs it in the main
 // thread: its own consumer-group member with its own consumer, producer and State Stores
-// (ADR-0007). No records cross threads; the main thread only starts and stops the Worker and hears
-// about its failure, over the messages below.
+// (ADR-0007). No records cross threads; the main thread only starts and stops the Worker, hears
+// about its failure, and gets its state, events and metrics (see observability.ts), over the
+// messages below.
 
 import { Worker as Thread } from 'node:worker_threads'
+import type { WorkerReport } from './observability.js'
 import { DeserializationError } from './serde.js'
 import { AsyncNotAllowedError } from './sync-dsl.js'
 import type { Worker } from './worker.js'
@@ -25,6 +27,8 @@ export type ToWorkerThread = { type: 'stop' }
 /** Messages from a worker thread to the main thread. */
 export type FromWorkerThread =
   | { type: 'running' }
+  /** What the Worker reported since the last such message, in order. */
+  | { type: 'reports'; reports: WorkerReport[] }
   | { type: 'stopped' }
   /**
    * The running Worker failed, with this root cause; it is closing its clients and reports
@@ -48,6 +52,8 @@ export interface WorkerThreadOptions {
   shutdownTimeoutMs: number
   /** Called once if the Worker stops because of an error after it started. */
   onError(error: unknown): void
+  /** Receives what the Worker reports: its state, events and metrics. */
+  onReport(report: WorkerReport): void
 }
 
 /**
@@ -103,6 +109,8 @@ export function startWorkerThread(options: WorkerThreadOptions): Promise<Worker>
     if (message.type === 'running') {
       running = true
       onStart?.resolve(worker)
+    } else if (message.type === 'reports') {
+      for (const report of message.reports) options.onReport(report)
     } else if (message.type === 'stopped') {
       stopped = true
       void thread.terminate()

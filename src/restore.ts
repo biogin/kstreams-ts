@@ -33,7 +33,7 @@ export interface ChangelogReader {
    * in offset order, a chunk at a time. Resolves to the offset after the last one read: where a
    * later read would continue. Resolves to undefined, reading nothing, when `from` is outside the
    * partition (before its start or past its end). Once `signal` is aborted, stops reading and
-   * rejects with its reason.
+   * rejects with its reason. `observer` hears how the read goes.
    */
   read(
     topic: string,
@@ -41,7 +41,30 @@ export interface ChangelogReader {
     apply: (records: ChangelogRecord[]) => void,
     from?: bigint,
     signal?: AbortSignal,
+    observer?: ReadObserver,
   ): Promise<bigint | undefined>
+}
+
+/** Hears how a {@link ChangelogReader.read} goes. */
+export interface ReadObserver {
+  /** It waited `ms` for the transactions open on the partition to end (maybe 0). */
+  waited?(ms: number): void
+  /** It reads from offset `from` up to `end`. */
+  reading?(from: bigint, end: bigint): void
+  /** It has read up to `position`, after another fetch. */
+  advanced?(position: bigint): void
+}
+
+/** Hears how a Task's Restore goes (see {@link restoreStores}). */
+export interface RestoreListener {
+  /** A read of a Changelog waited `ms` for the transactions open on it to end. */
+  waited(ms: number): void
+  /** The Restore of store `store` begins, with `remaining` Changelog offsets to replay. */
+  started(store: string, full: boolean, remaining: number): void
+  /** The Restore of `store` has applied `restored` records, and has `remaining` offsets left. */
+  progressed(store: string, restored: number, remaining: number): void
+  /** The Restore of `store` ended, after applying `restored` records in `durationMs`. */
+  ended(store: string, restored: number, durationMs: number, cancelled: boolean): void
 }
 
 /** A State Store of a Task, as opened, with its definition. */
@@ -71,15 +94,31 @@ export async function restoreStores(
   partition: number,
   reader: ChangelogReader,
   signal?: AbortSignal,
+  listener?: RestoreListener,
 ): Promise<Map<string, bigint>> {
   const restored = new Map<string, bigint>()
   for (const { node, store, checkpoint } of stores) {
     signal?.throwIfAborted()
+    const name = node.name
     const topic = node.changelogTopic
     const context = { topic }
     const encoding = node.keyEncoding ?? singleKeyEncoding(node.serdes.key)
+    /** The records applied so far, and when the store's read began (once it has). */
+    let applied = 0
+    let began: number | undefined
+    let end = 0n
+    const observerFor = (full: boolean): ReadObserver => ({
+      waited: (ms) => listener?.waited(ms),
+      reading(from, to) {
+        began = performance.now()
+        end = to
+        listener?.started(name, full, Number(to - from))
+      },
+      advanced: (position) => listener?.progressed(name, applied, Number(end - position)),
+    })
     const apply = (records: ChangelogRecord[]) => {
       signal?.throwIfAborted()
+      applied += records.length
       inTransaction(store, () => {
         for (const { key, value } of records) {
           if (key === null) {
@@ -93,21 +132,30 @@ export async function restoreStores(
         }
       })
     }
-    let offset =
-      checkpoint === undefined
-        ? undefined
-        : await reader.read(topic, partition, apply, checkpoint, signal)
-    if (offset === undefined) {
-      signal?.throwIfAborted()
-      inTransaction(store, () => {
-        // Collected first: a store must not be written while it is iterated.
-        for (const key of Array.from(store.all(), ([key]) => key)) store.delete(key)
-      })
-      offset = await reader.read(topic, partition, apply, undefined, signal)
-      if (offset === undefined)
-        throw new Error(`Cannot read Changelog "${topic}" partition ${partition}`)
+    let offset: bigint | undefined
+    try {
+      offset =
+        checkpoint === undefined
+          ? undefined
+          : await reader.read(topic, partition, apply, checkpoint, signal, observerFor(false))
+      if (offset === undefined) {
+        signal?.throwIfAborted()
+        inTransaction(store, () => {
+          // Collected first: a store must not be written while it is iterated.
+          for (const key of Array.from(store.all(), ([key]) => key)) store.delete(key)
+        })
+        offset = await reader.read(topic, partition, apply, undefined, signal, observerFor(true))
+        if (offset === undefined)
+          throw new Error(`Cannot read Changelog "${topic}" partition ${partition}`)
+      }
+    } catch (error) {
+      if (began !== undefined && signal?.aborted) {
+        listener?.ended(name, applied, performance.now() - began, true)
+      }
+      throw error
     }
-    restored.set(node.name, offset)
+    if (began !== undefined) listener?.ended(name, applied, performance.now() - began, false)
+    restored.set(name, offset)
   }
   return restored
 }
@@ -194,7 +242,7 @@ export function createChangelogReader({
   }
 
   return {
-    async read(topic, partition, apply, from, signal) {
+    async read(topic, partition, apply, from, signal, observer) {
       // With read_committed, the latest offset is the last stable offset: every aborted
       // transaction before it has its marker. It must reach the end as of now (read_uncommitted):
       // see the top of this file.
@@ -205,14 +253,17 @@ export function createChangelogReader({
         FetchIsolationLevels.READ_UNCOMMITTED,
       )
       let end = await offset(topic, partition, ListOffsetTimestamps.LATEST)
+      const waiting = performance.now()
       while (end < written) {
         await sleep(TRANSACTION_POLL_MS, signal)
         end = await offset(topic, partition, ListOffsetTimestamps.LATEST)
       }
+      observer?.waited?.(performance.now() - waiting)
       signal?.throwIfAborted()
       const start = await offset(topic, partition, ListOffsetTimestamps.EARLIEST)
       if (from !== undefined && (from < start || from > end)) return undefined
       let position = from ?? start
+      observer?.reading?.(position, end)
       let target = await leader(topic, partition, false)
       let retries = 0
       while (position < end) {
@@ -271,6 +322,7 @@ export function createChangelogReader({
           position = last + 1n
         }
         if (records.length > 0) apply(records)
+        observer?.advanced?.(position)
       }
       return position
     },

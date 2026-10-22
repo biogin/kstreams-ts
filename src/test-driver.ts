@@ -1,4 +1,5 @@
 import { deadLetterTopicsOf } from './error-handlers.js'
+import { recordMetric, taskCounterMetrics } from './observability.js'
 import type { OutputRecord } from './processor-graph.js'
 import type { StreamRecord } from './record.js'
 import {
@@ -9,7 +10,7 @@ import {
   serializeNullable,
 } from './serde.js'
 import type { KeyValueStore, NamedStore } from './state-store.js'
-import { processorGraphOf, type StreamsApp } from './streams-app.js'
+import { metricsSinkOf, processorGraphOf, type StreamsApp } from './streams-app.js'
 import { createTask } from './task.js'
 
 /**
@@ -53,11 +54,23 @@ export interface TestDriver {
    */
   store<K, V>(store: NamedStore<K, V>): TestStore<K, V>
   store<K = unknown, V = unknown>(name: string): TestStore<K, V>
-  /** The Streams App's counters so far, e.g. how many late records windows have dropped. */
+  /**
+   * The Streams App's counters so far, e.g. how many late records windows have dropped. The
+   * Streams App's metrics sink, if it has one, gets them too, as the counter metrics of Worker 0's
+   * Task 0 (`records-processed`, `records-dropped`, `late-records-dropped`).
+   */
   metrics(): TestDriverMetrics
 }
 
 export interface TestDriverMetrics {
+  /** Input records piped and finished with: processed, or skipped by an error handler. */
+  recordsProcessed: number
+  /**
+   * Input records error handlers skipped (they returned `'continue'`), for deserialization and
+   * processing errors together. A skipped record doesn't advance Stream Time; what it forwarded
+   * before it failed is kept.
+   */
+  recordsDropped: number
   /**
    * Records dropped by windowed aggregations because they arrived after their window's Grace
    * Period. Each windowed aggregation that drops a record counts it.
@@ -133,6 +146,17 @@ export function createTestDriver(app: StreamsApp, options: TestDriverOptions = {
     { stateDir: options.stateDir },
   )
 
+  const sink = metricsSinkOf(app)
+  /** The Task's counters as last given to the metrics sink. */
+  let reported = task.metrics()
+  /** Gives the metrics sink what the Task counted since last time. */
+  const reportMetrics = (): void => {
+    if (sink === undefined) return
+    const now = task.metrics()
+    for (const metric of taskCounterMetrics(0, 0, now, reported)) recordMetric(sink, metric)
+    reported = now
+  }
+
   /** Runs work on the Task, stopping the Streams App if it fails. */
   const runOnTask = async (work: () => Promise<void>): Promise<void> => {
     if (stoppedBy !== undefined) {
@@ -145,6 +169,8 @@ export function createTestDriver(app: StreamsApp, options: TestDriverOptions = {
     } catch (error) {
       stoppedBy ??= { error }
       throw error
+    } finally {
+      reportMetrics()
     }
   }
 
@@ -161,7 +187,12 @@ export function createTestDriver(app: StreamsApp, options: TestDriverOptions = {
     store: store as TestDriver['store'],
 
     metrics() {
-      return task.metrics()
+      const { recordsProcessed, recordsDropped, lateRecordsDropped } = task.metrics()
+      return {
+        recordsProcessed,
+        recordsDropped: recordsDropped.deserialization + recordsDropped.processing,
+        lateRecordsDropped,
+      }
     },
 
     input<K, V>(topic: string, serdes: Partial<Serdes<K, V>> = {}): TestInputTopic<K, V> {

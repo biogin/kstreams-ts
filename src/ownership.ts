@@ -38,13 +38,22 @@ export class Ownership {
   /** Partition numbers lost since the last `takeLost`. */
   #lost = new Set<number>()
   readonly #onLost: () => void
+  readonly #onRound: (round: OwnershipRound) => void
   readonly #onJoin = () => this.#assigned()
   readonly #onRebalance = () => this.#revoked()
 
-  /** Starts from the member's current assignment; calls `onLost` when partitions are lost. */
-  constructor(member: GroupMember, onLost: () => void) {
+  /**
+   * Starts from the member's current assignment; calls `onLost` when partitions are lost, and
+   * `onRound` after each completed rebalance round (after `onLost`).
+   */
+  constructor(
+    member: GroupMember,
+    onLost: () => void,
+    onRound: (round: OwnershipRound) => void = () => {},
+  ) {
     this.#member = member
     this.#onLost = onLost
+    this.#onRound = onRound
     this.#generation = member.generationId
     this.#owned = new Map()
     for (const key of assigned(member)) this.#owned.set(key, member.generationId)
@@ -56,6 +65,11 @@ export class Ownership {
   close(): void {
     this.#member.off('consumer:group:join', this.#onJoin)
     this.#member.off('consumer:group:rebalance', this.#onRebalance)
+  }
+
+  /** The partitions owned now. */
+  owned(): OwnedPartition[] {
+    return [...this.#owned.keys()].map(toPartition)
   }
 
   /** Whether `topic:partition` is owned now. */
@@ -110,15 +124,20 @@ export class Ownership {
       const since = continuous ? this.#owned.get(key) : undefined
       owned.set(key, since ?? generation)
     }
-    let lost = false
+    const revoked: string[] = []
     for (const [key, since] of this.#owned) {
       if (owned.get(key) !== since) {
         this.#lost.add(partitionOf(key))
-        lost = true
+        revoked.push(key)
       }
     }
+    const added = [...owned].filter(([key, since]) => this.#owned.get(key) !== since)
     this.#owned = owned
-    if (lost) this.#onLost()
+    if (revoked.length > 0) this.#onLost()
+    this.#onRound({
+      assigned: added.map(([key]) => toPartition(key)),
+      revoked: revoked.map(toPartition),
+    })
   }
 }
 
@@ -126,6 +145,25 @@ function assigned(member: GroupMember): string[] {
   return (member.assignments ?? []).flatMap(({ topic, partitions }) =>
     partitions.map((partition) => `${topic}:${partition}`),
   )
+}
+
+/** A partition of an input topic. */
+export interface OwnedPartition {
+  topic: string
+  partition: number
+}
+
+/** What a completed rebalance round changed. */
+export interface OwnershipRound {
+  /** The partitions owned since this round. */
+  assigned: OwnedPartition[]
+  /** The partitions lost in this round (see the top of this file). */
+  revoked: OwnedPartition[]
+}
+
+function toPartition(key: string): OwnedPartition {
+  const at = key.lastIndexOf(':')
+  return { topic: key.slice(0, at), partition: Number(key.slice(at + 1)) }
 }
 
 function partitionOf(key: string): number {

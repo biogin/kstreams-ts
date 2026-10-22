@@ -10,6 +10,23 @@ export {
   type HandlerOutputRecord,
 } from './error-handlers.js'
 export type {
+  AbortReason,
+  ApplicationState,
+  Metric,
+  MetricName,
+  MetricsSink,
+  RebalanceEvent,
+  RestoreEndEvent,
+  RestoreProgressEvent,
+  RestoreStartEvent,
+  StateChangeEvent,
+  StreamsAppErrorEvent,
+  StreamsAppEventName,
+  StreamsAppEvents,
+  TopicPartition,
+  WaitKind,
+} from './observability.js'
+export type {
   Processor,
   ProcessorContext,
   ProcessorSupplier,
@@ -34,7 +51,6 @@ export {
   stores,
 } from './state-store.js'
 export {
-  type ApplicationState,
   type CountOptions,
   createStreamsApp,
   type DeliveryGuarantee,

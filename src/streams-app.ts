@@ -1,4 +1,15 @@
 import { checkErrorHandlers, type ErrorHandlers } from './error-handlers.js'
+import {
+  type ApplicationState,
+  checkMetricsSink,
+  Listeners,
+  type MetricsSink,
+  recordMetric,
+  type StreamsAppEventName,
+  type StreamsAppEvents,
+  type WorkerReport,
+  type WorkerState,
+} from './observability.js'
 import { type ProcessorContext, ProcessorGraph, type ProcessorSupplier } from './processor-graph.js'
 import type { StreamRecord } from './record.js'
 import { serdes as builtInSerdes, type Serde, type Serdes } from './serde.js'
@@ -112,6 +123,14 @@ export interface StreamsAppConfig {
    * With worker threads, handlers run in each worker thread.
    */
   errorHandlers?: ErrorHandlers
+  /**
+   * Receives the app's metrics: throughput, consumer lag, commit durations, aborts, Restore
+   * progress, dropped records and the time new Tasks wait for their previous owners (see
+   * `Metric`). With worker threads, every Worker's metrics reach this sink, in the main thread
+   * (the sink of the app a worker thread rebuilds is not used). Without one, no metrics are
+   * collected.
+   */
+  metrics?: MetricsSink
 }
 
 /** Worker threads, and the App Module each of them rebuilds the Streams App from. */
@@ -128,30 +147,42 @@ export interface WorkersConfig {
 /** The processing contract an application runs under. */
 export type DeliveryGuarantee = 'at-least-once' | 'exactly-once'
 
-/**
- * The lifecycle phase a Streams App reports: created → rebalancing ⇄ restoring ⇄ running →
- * stopping → stopped, or error from any state.
- */
-export type ApplicationState =
-  | 'created'
-  | 'rebalancing'
-  | 'restoring'
-  | 'running'
-  | 'stopping'
-  | 'stopped'
-  | 'error'
-
 /** The in-process object that defines and runs an application. */
 export interface StreamsApp {
   readonly applicationId: string
   /** The configured state directory, if any. */
   readonly stateDir: string | undefined
-  /** The Application State. */
+  /**
+   * The Application State: `created` → `rebalancing` ⇄ `restoring` ⇄ `running` → `stopping` →
+   * `stopped`, or `error` from any state. With several Workers it sums theirs up: `rebalancing`
+   * while any Worker is, else `restoring` while any Worker restores, else `running` (see
+   * `ApplicationState`). The `state` event reports each change.
+   */
   readonly state: ApplicationState
+  /**
+   * Adds a listener for `event`; returns the app. Listeners are called synchronously, in the main
+   * thread (events of Workers in worker threads are passed on to it), in the order they were
+   * added. An exception a listener throws is ignored. The events:
+   * - `state`: the Application State changed.
+   * - `error`: the app stopped because of this error, the root cause (see `StreamsAppErrorEvent`).
+   * - `rebalance`: a Worker took part in a completed rebalance round.
+   * - `restore-start`, `restore-progress`, `restore-end`: a Task restores a State Store from its
+   *   Changelog.
+   */
+  on<E extends StreamsAppEventName>(
+    event: E,
+    listener: (payload: StreamsAppEvents[E]) => void,
+  ): StreamsApp
+  /** Removes a listener added with `on`; returns the app. */
+  off<E extends StreamsAppEventName>(
+    event: E,
+    listener: (payload: StreamsAppEvents[E]) => void,
+  ): StreamsApp
   /**
    * Connects to Kafka and starts processing: starts the Workers, each of which joins the consumer
    * group (named after the Application ID) and resumes from its committed offsets, or reads input
-   * topics from the beginning the first time. Resolves once every Worker is running. Rejects if the
+   * topics from the beginning the first time. The app is `rebalancing` meanwhile. Resolves once
+   * every Worker has joined the group; the app may still be rebalancing or restoring. Rejects if the
    * app has no brokers or reads no topic, was started before, or a Worker can't start (the app
    * then goes to `error` and stops the other Workers).
    *
@@ -392,6 +423,7 @@ export function createStreamsApp(config: StreamsAppConfig): StreamsApp {
   }
   const settings = runtimeSettings(config)
   checkErrorHandlers(config.errorHandlers)
+  checkMetricsSink(config.metrics)
   const graph = new ProcessorGraph(applicationId, config.errorHandlers)
   const runtime = new Runtime(graph, settings)
   const app: StreamsApp = {
@@ -399,6 +431,14 @@ export function createStreamsApp(config: StreamsAppConfig): StreamsApp {
     stateDir,
     get state() {
       return runtime.state
+    },
+    on(event, listener) {
+      runtime.listeners.on(event, listener)
+      return app
+    },
+    off(event, listener) {
+      runtime.listeners.off(event, listener)
+      return app
     },
     start: () => runtime.start(),
     stop: () => runtime.stop(),
@@ -429,7 +469,7 @@ export function createStreamsApp(config: StreamsAppConfig): StreamsApp {
  */
 export async function startWorkerOf(
   app: unknown,
-  { appModule, applicationId, processId, workerNumber, onError }: WorkerOfOptions,
+  { appModule, applicationId, processId, workerNumber, onError, report }: WorkerOfOptions,
 ): Promise<Worker> {
   const runtime = runtimes.get(app as StreamsApp)
   if (runtime === undefined) {
@@ -442,7 +482,7 @@ export async function startWorkerOf(
       `App Module ${appModule} exports Streams App "${(app as StreamsApp).applicationId}", not "${applicationId}"`,
     )
   }
-  return runtime.startWorker(processId, workerNumber, onError)
+  return runtime.startWorker(processId, workerNumber, onError, report)
 }
 
 export interface WorkerOfOptions {
@@ -452,6 +492,8 @@ export interface WorkerOfOptions {
   processId: string
   workerNumber: number
   onError(error: unknown): void
+  /** Receives the Worker's state, events and metrics, for the main thread. */
+  report(report: WorkerReport): void
 }
 
 interface RuntimeSettings {
@@ -469,6 +511,7 @@ interface RuntimeSettings {
   workers: number
   /** The App Module worker threads rebuild the app from; set when `workers > 0`. */
   appModule: URL | undefined
+  metrics: MetricsSink | undefined
 }
 
 function runtimeSettings(config: StreamsAppConfig): RuntimeSettings {
@@ -497,6 +540,7 @@ function runtimeSettings(config: StreamsAppConfig): RuntimeSettings {
     stateDir: config.stateDir,
     workers,
     appModule,
+    metrics: config.metrics,
   }
 }
 
@@ -531,13 +575,19 @@ function positive(option: string, value: number, whole = false): number {
 }
 
 /**
- * Runs a Streams App on Kafka and tracks its Application State, which sums up its Workers': it is
- * running once every Worker is, and goes to `error` when one fails, which stops the others.
+ * Runs a Streams App on Kafka and tracks its Application State, which sums up its Workers' states:
+ * `rebalancing` while any Worker is (a Worker that hasn't joined the group yet is), else
+ * `restoring` while any Worker restores, else `running`. It goes to `error` when a Worker fails,
+ * which stops the others. Passes the Workers' events on to the listeners, and their metrics to
+ * the metrics sink.
  */
 class Runtime {
+  readonly listeners = new Listeners()
   readonly #graph: ProcessorGraph
   readonly #settings: RuntimeSettings
   #state: ApplicationState = 'created'
+  /** Each Worker's state, by Worker number, once the app has started. */
+  #workerStates: WorkerState[] = []
   /** One per Worker, settled once it is running (undefined if it failed to start). */
   #workers: Promise<Worker | undefined>[] | undefined
   #stopped: Promise<void> | undefined
@@ -556,6 +606,10 @@ class Runtime {
     return this.#state
   }
 
+  get metrics(): MetricsSink | undefined {
+    return this.#settings.metrics
+  }
+
   async start(): Promise<void> {
     const { applicationId, workers, appModule, shutdownTimeoutMs } = this.#settings
     if (this.#state !== 'created' || this.#workers !== undefined) {
@@ -565,9 +619,16 @@ class Runtime {
     const identity = claimProcessIdentity(this.#settings.stateDir, applicationId)
     this.#identity = identity
     const onError = (error: unknown) => this.#fail(error)
+    const reportOf = (workerNumber: number) => (report: WorkerReport) =>
+      this.#report(workerNumber, report)
+    // Every Worker joins the consumer group first.
+    this.#workerStates = Array.from({ length: appModule === undefined ? 1 : workers }, () => {
+      return 'rebalancing' as const
+    })
+    this.#setState('rebalancing')
     const starting =
       appModule === undefined
-        ? [this.startWorker(identity.id, 0, onError)]
+        ? [this.startWorker(identity.id, 0, onError, reportOf(0))]
         : Array.from({ length: workers }, (_, workerNumber) =>
             startWorkerThread({
               appModule,
@@ -576,6 +637,7 @@ class Runtime {
               workerNumber,
               shutdownTimeoutMs,
               onError,
+              onReport: reportOf(workerNumber),
             }),
           )
     this.#workers = starting.map((worker) => worker.catch(() => undefined))
@@ -585,7 +647,6 @@ class Runtime {
       this.#fail(failed.reason)
       throw failed.reason
     }
-    if (this.#state === 'created') this.#state = 'running'
   }
 
   /** Starts Worker `workerNumber` of App Process `processId` in this thread. */
@@ -593,6 +654,7 @@ class Runtime {
     processId: string,
     workerNumber: number,
     onError: (error: unknown) => void,
+    report: (report: WorkerReport) => void,
   ): Promise<Worker> {
     const brokers = this.#checkStartable()
     const { applicationId, guarantee } = this.#settings
@@ -605,7 +667,12 @@ class Runtime {
       // with the same state directory, so a restarted Worker fences its predecessor's producer.
       transactionalId: guarantee === 'exactly-once' ? workerId : undefined,
       lockHolder: taskLockHolder(processId, workerNumber),
+      workerNumber,
+      // A worker thread's app has the same config, so it collects metrics exactly when the main
+      // thread's app has a sink for them.
+      collectMetrics: this.#settings.metrics !== undefined,
       onError,
+      report,
     })
   }
 
@@ -621,6 +688,36 @@ class Runtime {
     return brokers
   }
 
+  /** Takes what Worker `workerNumber` reported. */
+  #report(workerNumber: number, report: WorkerReport): void {
+    if (report.type === 'metric') {
+      recordMetric(this.#settings.metrics, report.metric)
+    } else if (report.type === 'event') {
+      const { name, payload } = report.event
+      ;(this.listeners.emit as (name: StreamsAppEventName, payload: unknown) => void)(name, payload)
+    } else {
+      this.#workerStates[workerNumber] = report.state
+      this.#sumUpStates()
+    }
+  }
+
+  /** Sets the Application State from the Workers' states, unless the app is past running. */
+  #sumUpStates(): void {
+    const state = this.#state
+    if (state !== 'rebalancing' && state !== 'restoring' && state !== 'running') return
+    const states = this.#workerStates
+    if (states.includes('rebalancing')) this.#setState('rebalancing')
+    else if (states.includes('restoring')) this.#setState('restoring')
+    else this.#setState('running')
+  }
+
+  #setState(state: ApplicationState): void {
+    const previous = this.#state
+    if (state === previous) return
+    this.#state = state
+    this.listeners.emit('state', { state, previous })
+  }
+
   stop(): Promise<void> {
     this.#stopped ??= this.#stop()
     return this.#stopped
@@ -628,15 +725,15 @@ class Runtime {
 
   async #stop(): Promise<void> {
     if (this.#state === 'created' && this.#workers === undefined) {
-      this.#state = 'stopped'
+      this.#setState('stopped')
       return
     }
-    if (this.#state !== 'error') this.#state = 'stopping'
+    if (this.#state !== 'error') this.#setState('stopping')
     await this.#stopWorkers()
     if (this.#failure !== undefined) {
       throw this.#failure.error
     }
-    this.#state = 'stopped'
+    this.#setState('stopped')
   }
 
   /** Stops every Worker (each once it has started), all at the same time. */
@@ -672,8 +769,11 @@ class Runtime {
   }
 
   #fail(error: unknown): void {
+    const first = this.#failure === undefined
     this.#failure ??= { error }
-    this.#state = 'error'
+    this.#setState('error')
+    // The root cause only: later errors are consequences of it.
+    if (first) this.listeners.emit('error', { error })
     // One Worker failed: stop the others, so the app doesn't keep running with part of its Tasks.
     void this.#stopWorkers()
   }
@@ -702,6 +802,11 @@ function addStore(
 
 const graphs = new WeakMap<StreamsApp, ProcessorGraph>()
 const runtimes = new WeakMap<StreamsApp, Runtime>()
+
+/** Internal: the metrics sink a Streams App was configured with, if any. */
+export function metricsSinkOf(app: StreamsApp): MetricsSink | undefined {
+  return runtimes.get(app)?.metrics
+}
 
 // Record types are erased once a Processor is registered; `Stream.process` restores them.
 // biome-ignore lint/suspicious/noExplicitAny: type erasure, see above

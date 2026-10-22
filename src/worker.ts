@@ -68,6 +68,12 @@
 // after its current fetch) and leaves the group. If that takes longer than the shutdown timeout,
 // the batch is given up (under exactly-once, aborted) and the Worker closes the Tasks and leaves
 // the group anyway.
+//
+// Observability (observability.ts): the Worker reports its state, events and metrics through
+// `WorkerOptions.report`. Its state is `rebalancing` from the client's `consumer:group:rebalance`
+// (a rebalance began) to its `consumer:group:join` (it completed), else `restoring` while a Task
+// with State Stores is starting, else `running`. Task counters are reported once their batch has
+// committed; consumer lag is measured every few seconds, in the background.
 
 import {
   COOPERATIVE_STICKY_ASSIGNOR,
@@ -76,6 +82,7 @@ import {
   compatibilityPartitioner,
   FetchIsolationLevels,
   findErrorBy,
+  ListOffsetTimestamps,
   type Message,
   type MessagesStream,
   type MessageToProduce,
@@ -84,10 +91,25 @@ import {
 } from '@platformatic/kafka'
 import { checkCoPartitioned } from './co-partitioning.js'
 import { ensureChangelogs } from './internal-topics.js'
+import {
+  type AbortReason,
+  type Metric,
+  noTaskCounters,
+  type TaskCounters,
+  taskCounterMetrics,
+  type WaitKind,
+  type WorkerReport,
+  type WorkerState,
+} from './observability.js'
 import { Ownership } from './ownership.js'
 import type { OutputRecord, ProcessorGraph, SerializedRecord } from './processor-graph.js'
 import { ReadCommittedConsumer } from './read-committed.js'
-import { createChangelogReader, type KafkaChangelogReader, restoreStores } from './restore.js'
+import {
+  createChangelogReader,
+  type KafkaChangelogReader,
+  type RestoreListener,
+  restoreStores,
+} from './restore.js'
 import { createStableOffsetReader, type StableOffsetReader } from './stable-offsets.js'
 import { lockTask, unlockTask } from './state-directory.js'
 import { type ChangelogOffsets, createTask, type Task } from './task.js'
@@ -116,6 +138,12 @@ export interface WorkerOptions {
   stateDir: string | undefined
   /** Names the Worker in the Task directory locks it takes (see state-directory.ts). */
   lockHolder: string
+  /** The Worker's number in its App Process, which labels its events and metrics. */
+  workerNumber: number
+  /** Whether the Worker reports metrics (only when there is a metrics sink for them). */
+  collectMetrics: boolean
+  /** Receives the Worker's state, events and metrics (see observability.ts). */
+  report(report: WorkerReport): void
   /**
    * Called once if the Worker stops because of an error, with the first error (the root cause), as
    * soon as it happens: before the Worker has rolled back and closed its clients, so that what
@@ -136,6 +164,8 @@ export interface Worker {
 
 /** How much longer than the commit interval a transaction may stay open. */
 const TRANSACTION_TIMEOUT_MARGIN_MS = 10_000
+/** How often the consumer lag is measured, at most. */
+const LAG_INTERVAL_MS = 2_000
 
 /** Bytes, as the Kafka client wants them. */
 type Bytes = Buffer
@@ -369,6 +399,7 @@ class CommitCycle {
   readonly #exactlyOnce: boolean
   readonly #committer: BatchCommitter
   readonly #ownership: Ownership
+  readonly #consumer: Consumer<Bytes, Bytes, Bytes, Bytes>
   readonly #openStream: () => Promise<Stream>
   #stream: Stream
   #messages: AsyncIterator<ConsumedMessage>
@@ -423,6 +454,24 @@ class CommitCycle {
   /** The offset after the last record committed, by `topic:partition`. */
   #committedPosition = new Map<string, bigint>()
 
+  /** Between the client's `consumer:group:rebalance` and its `consumer:group:join`. */
+  #rebalancing = false
+  /** The state last reported. */
+  #reportedState: WorkerState | undefined
+  /** Each started Task's counters as last reported, by partition. */
+  readonly #reportedCounters = new Map<number, TaskCounters>()
+  /** When the consumer lag was last measured (`Date.now()`), and whether that is still going on. */
+  #lagMeasuredAt = 0
+  #measuringLag = false
+  readonly #onRebalance = () => {
+    this.#rebalancing = true
+    this.#updateState()
+  }
+  readonly #onJoin = () => {
+    this.#rebalancing = false
+    this.#updateState()
+  }
+
   constructor(graph: ProcessorGraph, options: WorkerOptions, clients: CommitCycleClients) {
     this.#graph = graph
     this.#options = options
@@ -432,7 +481,19 @@ class CommitCycle {
     this.#openStream = clients.openStream
     this.#stream = clients.stream
     this.#messages = clients.stream[Symbol.asyncIterator]()
-    this.#ownership = new Ownership(clients.consumer, () => this.#endBatch())
+    this.#consumer = clients.consumer
+    // Before the listeners below, so that a rebalance's lost partitions are known first.
+    this.#ownership = new Ownership(
+      clients.consumer,
+      () => this.#endBatch(),
+      ({ assigned, revoked }) =>
+        this.#event({
+          name: 'rebalance',
+          payload: { worker: options.workerNumber, assigned, revoked },
+        }),
+    )
+    clients.consumer.on('consumer:group:rebalance', this.#onRebalance)
+    clients.consumer.on('consumer:group:join', this.#onJoin)
     this.#committer = clients.createCommitter(
       (error) => this.#fail(error),
       (topic, partition) => this.#ownership.owns(topic, partition),
@@ -441,6 +502,123 @@ class CommitCycle {
       this.#interrupt = () => resolve(INTERRUPTED)
     })
     this.#renewStarted()
+    this.#updateState()
+  }
+
+  /** Reports the Worker's state if it changed (see the top of this file). */
+  #updateState(): void {
+    const state: WorkerState = this.#rebalancing
+      ? 'rebalancing'
+      : this.#graph.stores.size > 0 && this.#starting.size > 0
+        ? 'restoring'
+        : 'running'
+    if (state === this.#reportedState) return
+    this.#reportedState = state
+    this.#options.report({ type: 'state', state })
+  }
+
+  #event(event: Extract<WorkerReport, { type: 'event' }>['event']): void {
+    this.#options.report({ type: 'event', event })
+  }
+
+  #metric(metric: Metric): void {
+    if (this.#options.collectMetrics) this.#options.report({ type: 'metric', metric })
+  }
+
+  #countAbort(reason: AbortReason): void {
+    this.#metric({
+      name: 'aborts',
+      type: 'counter',
+      value: 1,
+      labels: { worker: this.#options.workerNumber, reason },
+    })
+  }
+
+  #wait(task: number, wait: WaitKind, ms: number): void {
+    this.#metric({
+      name: 'wait-duration',
+      type: 'duration',
+      value: ms,
+      labels: { worker: this.#options.workerNumber, task, wait },
+    })
+  }
+
+  /** Reports what the started Tasks counted since last time; called once their batch committed. */
+  #reportCounters(): void {
+    if (!this.#options.collectMetrics) return
+    for (const [partition, task] of this.#tasks) {
+      const now = task.metrics()
+      const before = this.#reportedCounters.get(partition) ?? noTaskCounters()
+      for (const metric of taskCounterMetrics(this.#options.workerNumber, partition, now, before)) {
+        this.#metric(metric)
+      }
+      this.#reportedCounters.set(partition, now)
+    }
+  }
+
+  /** Measures the consumer lag in the background, unless it was measured recently. */
+  #measureLagSometimes(): void {
+    if (!this.#options.collectMetrics || this.#measuringLag || this.#stopRequested) return
+    const now = Date.now()
+    if (now - this.#lagMeasuredAt < LAG_INTERVAL_MS) return
+    this.#lagMeasuredAt = now
+    this.#measuringLag = true
+    this.#measureLag()
+      .catch(() => {
+        // Measured again next time.
+      })
+      .finally(() => {
+        this.#measuringLag = false
+      })
+  }
+
+  /**
+   * Reports the records of each owned partition after its committed offset (or its start, before
+   * any commit), up to its last stable offset.
+   */
+  async #measureLag(): Promise<void> {
+    const byTopic = new Map<string, number[]>()
+    for (const { topic, partition } of this.#ownership.owned()) {
+      byTopic.set(topic, [...(byTopic.get(topic) ?? []), partition])
+    }
+    if (byTopic.size === 0) return
+    const consumer = this.#consumer
+    const topics = [...byTopic.keys()]
+    const partitions = Object.fromEntries(byTopic)
+    const [latest, committed] = await Promise.all([
+      consumer.listOffsets({
+        topics,
+        partitions,
+        isolationLevel: FetchIsolationLevels.READ_COMMITTED,
+      }),
+      consumer.listCommittedOffsets({
+        topics: [...byTopic].map(([topic, partitions]) => ({ topic, partitions })),
+      }),
+    ])
+    const uncommitted = [...byTopic].some(([topic, numbers]) =>
+      numbers.some((partition) => (committed.get(topic)?.[partition] ?? -1n) < 0n),
+    )
+    const earliest = uncommitted
+      ? await consumer.listOffsets({
+          topics,
+          partitions,
+          timestamp: ListOffsetTimestamps.EARLIEST,
+        })
+      : undefined
+    for (const [topic, numbers] of byTopic) {
+      for (const partition of numbers) {
+        const end = latest.get(topic)?.[partition]
+        const known = committed.get(topic)?.[partition] ?? -1n
+        const from = known >= 0n ? known : earliest?.get(topic)?.[partition]
+        if (end === undefined || from === undefined) continue
+        this.#metric({
+          name: 'consumer-lag',
+          type: 'gauge',
+          value: Number(end > from ? end - from : 0n),
+          labels: { worker: this.#options.workerNumber, topic, partition },
+        })
+      }
+    }
   }
 
   #renewStarted(): void {
@@ -461,7 +639,7 @@ class CommitCycle {
   async abandon(): Promise<void> {
     this.#abandoned = true
     this.requestStop()
-    await this.#committer.abort().catch(() => {})
+    if (await this.#committer.abort().catch(() => false)) this.#countAbort('shutdown-timeout')
     this.#closeTasks()
     this.#cancelStarts()
   }
@@ -497,6 +675,7 @@ class CommitCycle {
       while (!this.#stopRequested) {
         await this.#readBatch()
         await this.#commit()
+        this.#measureLagSometimes()
       }
     } catch (error) {
       // After a stop gave up, what was still running fails against closed stores and clients.
@@ -506,7 +685,7 @@ class CommitCycle {
       const failure = this.#failure ?? { error }
       // Not a failure to abort either. A Kafka abort rolls back the store transactions too; their
       // writes' Changelog records are aborted with it.
-      await this.#committer.abort().catch(() => {})
+      if (await this.#committer.abort().catch(() => false)) this.#countAbort('error')
       throw failure.error
     } finally {
       // The read still pending when the cycle ends settles once the stream closes.
@@ -515,6 +694,8 @@ class CommitCycle {
       this.#closeTasks()
       this.#cancelStarts()
       this.#ownership.close()
+      this.#consumer.off('consumer:group:rebalance', this.#onRebalance)
+      this.#consumer.off('consumer:group:join', this.#onJoin)
       // Restores stop after their current fetch; the Worker closes the restore consumer after.
       await Promise.all(this.#cancelling.values())
     }
@@ -530,6 +711,7 @@ class CommitCycle {
     const task = this.#tasks.get(partition)
     if (task !== undefined) closeTask(task)
     this.#tasks.delete(partition)
+    this.#reportedCounters.delete(partition)
     this.#unlock(partition)
   }
 
@@ -676,6 +858,7 @@ class CommitCycle {
       },
     )
     this.#starting.set(partition, starting)
+    this.#updateState()
     return starting
   }
 
@@ -691,13 +874,17 @@ class CommitCycle {
     const giveUp = () => signal.aborted
     const { stateDir, applicationId, lockHolder } = this.#options
     if (stateDir !== undefined && this.#graph.stores.size > 0) {
+      const waiting = performance.now()
       if (!(await lockTask(stateDir, applicationId, partition, lockHolder, giveUp))) return
+      this.#wait(partition, 'task-lock', performance.now() - waiting)
       this.#locked.add(partition)
     }
     if (this.#stableOffsets !== undefined) {
       const topics = [...this.#graph.sources.keys()]
+      const waiting = performance.now()
       starting.stable = await this.#stableOffsets.read(topics, partition, giveUp)
       if (starting.stable === undefined) return
+      this.#wait(partition, 'stable-offsets', performance.now() - waiting)
     }
     if (signal.aborted) return
     starting.task = this.#createTask(partition, signal)
@@ -732,6 +919,7 @@ class CommitCycle {
       }
       rewind ||= starting.overflowed
     }
+    this.#updateState()
     if (rewind) await this.#rewind()
     return count
   }
@@ -754,6 +942,7 @@ class CommitCycle {
         })
       }
     }
+    this.#updateState()
   }
 
   /** Closes the Task of a start that won't be taken over, and unlocks its directory. */
@@ -807,10 +996,51 @@ class CommitCycle {
         restore: (stores) => {
           const restorer = this.#restorer
           if (restorer === undefined) throw new Error('No restore consumer for State Stores')
-          return restoreStores(stores, partition, restorer, signal)
+          return restoreStores(
+            stores,
+            partition,
+            restorer,
+            signal,
+            this.#restoreListener(partition),
+          )
         },
       },
     )
+  }
+
+  /** Reports the Restore of Task `task` as events and metrics. */
+  #restoreListener(task: number): RestoreListener {
+    const worker = this.#options.workerNumber
+    /** The records applied so far, by store, as last reported. */
+    const reported = new Map<string, number>()
+    const progress = (store: string, restored: number, remaining: number) => {
+      const labels = { worker, task, store }
+      const more = restored - (reported.get(store) ?? 0)
+      reported.set(store, restored)
+      if (more > 0) this.#metric({ name: 'records-restored', type: 'counter', value: more, labels })
+      this.#metric({ name: 'restore-remaining', type: 'gauge', value: remaining, labels })
+    }
+    return {
+      waited: (ms) => this.#wait(task, 'changelog-transactions', ms),
+      started: (store, full, remaining) => {
+        this.#event({ name: 'restore-start', payload: { worker, task, store, full, remaining } })
+        progress(store, 0, remaining)
+      },
+      progressed: (store, restored, remaining) => {
+        this.#event({
+          name: 'restore-progress',
+          payload: { worker, task, store, restored, remaining },
+        })
+        progress(store, restored, remaining)
+      },
+      ended: (store, restored, durationMs, cancelled) => {
+        this.#event({
+          name: 'restore-end',
+          payload: { worker, task, store, restored, durationMs, cancelled },
+        })
+        if (!cancelled) progress(store, restored, 0)
+      },
+    }
   }
 
   /**
@@ -839,6 +1069,7 @@ class CommitCycle {
     const committing = this.#exactlyOnce
       ? lastRead
       : lastRead.filter(({ topic, partition }) => this.#ownership.owns(topic, partition))
+    const committingSince = performance.now()
     let result: CommitResult
     try {
       result = await this.#committer.commit(committing)
@@ -856,6 +1087,15 @@ class CommitCycle {
     for (const [partition, task] of this.#tasks) {
       task.checkpoint(result.produced.get(partition) ?? new Map())
     }
+    if (!result.empty) {
+      this.#metric({
+        name: 'commit-duration',
+        type: 'duration',
+        value: performance.now() - committingSince,
+        labels: { worker: this.#options.workerNumber },
+      })
+    }
+    this.#reportCounters()
     for (const message of committing) {
       const key = partitionKey(message.topic, message.partition)
       if (result.offsetsCommitted) {
@@ -874,7 +1114,7 @@ class CommitCycle {
    * is not held twice when the stream delivers it again.
    */
   async #abortBatch(lost: ReadonlySet<number>): Promise<void> {
-    await this.#committer.abort()
+    if (await this.#committer.abort()) this.#countAbort('rebalance')
     // Rolled back, a Task would still have the batch's Stream Time, timers and Processor state.
     this.#closeTasks()
     this.#held = undefined
@@ -938,6 +1178,8 @@ interface CommitResult {
   produced: ProducedOffsets
   /** False if the outputs committed but the offsets didn't, because of a rebalance. */
   offsetsCommitted: boolean
+  /** True if the batch had nothing to commit: no outputs, no offsets. */
+  empty: boolean
 }
 
 /** Commits a batch under one Delivery Guarantee. */
@@ -950,8 +1192,8 @@ interface BatchCommitter {
    * leave the offsets uncommitted after a rebalance.
    */
   commit(lastRead: ConsumedMessage[]): Promise<CommitResult>
-  /** Gives up on the current batch. */
-  abort(): Promise<void>
+  /** Gives up on the current batch. Resolves to whether a Kafka transaction was aborted. */
+  abort(): Promise<boolean>
 }
 
 /** Produces the outputs, waits for the broker to acknowledge them, then commits the offsets. */
@@ -975,6 +1217,7 @@ class AtLeastOnceCommitter implements BatchCommitter {
   async commit(lastRead: ConsumedMessage[]): Promise<CommitResult> {
     const outputs = this.#outputs
     this.#outputs = []
+    const empty = outputs.length === 0 && lastRead.length === 0
     let produced: ProducedOffsets = new Map()
     if (outputs.length > 0) {
       const result = await this.#producer.send({ messages: outputs })
@@ -993,14 +1236,15 @@ class AtLeastOnceCommitter implements BatchCommitter {
         })
       } catch (error) {
         if (!isRebalanceError(error)) throw error
-        return { produced, offsetsCommitted: false }
+        return { produced, offsetsCommitted: false, empty }
       }
     }
-    return { produced, offsetsCommitted: true }
+    return { produced, offsetsCommitted: true, empty }
   }
 
-  async abort(): Promise<void> {
+  async abort(): Promise<boolean> {
     this.#outputs = []
+    return false
   }
 }
 
@@ -1081,7 +1325,7 @@ class TransactionalCommitter implements BatchCommitter {
     this.#transaction = undefined
     this.#produced = new Map()
     await transaction?.commit()
-    return { produced, offsetsCommitted: true }
+    return { produced, offsetsCommitted: true, empty: transaction === undefined }
   }
 
   /**
@@ -1111,13 +1355,14 @@ class TransactionalCommitter implements BatchCommitter {
     } as ConsumedMessage
   }
 
-  async abort(): Promise<void> {
+  async abort(): Promise<boolean> {
     await this.#sending
     this.#pending = []
     this.#produced = new Map()
     const transaction = this.#transaction
     this.#transaction = undefined
     await transaction?.abort()
+    return transaction !== undefined
   }
 }
 
