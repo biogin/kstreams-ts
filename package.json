@@ -1,7 +1,6 @@
 {
   "name": "kstreams-ts",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
   "description": "Partition-aware stateful stream processing on Kafka for Node.js, with fault-tolerant state and exactly-once processing.",
   "license": "Apache-2.0",
   "type": "module",
@@ -15,7 +14,12 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "docs",
+    "examples",
+    "CONTEXT.md",
+    "CHANGELOG.md",
+    "!dist/**/*.map"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -26,7 +30,8 @@
     "test:watch": "vitest",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:crash": "vitest run --config vitest.crash.config.ts",
-    "kafka": "scripts/kafka-local.sh"
+    "kafka": "scripts/kafka-local.sh",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "@platformatic/kafka": "^2.14.0",
@@ -38,5 +43,12 @@
     "@types/node": "^24.19.2",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"
-  }
+  },
+  "keywords": [
+    "kafka",
+    "stream-processing",
+    "kafka-streams",
+    "exactly-once",
+    "typescript"
+  ]
 }

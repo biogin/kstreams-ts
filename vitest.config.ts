@@ -1,6 +1,8 @@
 import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
+  // The examples (and the user docs) import the package by name.
+  resolve: { alias: { 'kstreams-ts': new URL('./src/index.ts', import.meta.url).pathname } },
   test: {
     include: ['test/**/*.test.ts'],
     // Integration tests and the crash suite need a broker: `npm run test:integration` and

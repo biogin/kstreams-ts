@@ -97,7 +97,12 @@ start() {
   write_config
   if [ ! -f "$DATA_DIR/meta.properties" ]; then
     cluster_id=$("$KAFKA_HOME/bin/kafka-storage.sh" random-uuid)
-    "$KAFKA_HOME/bin/kafka-storage.sh" format --standalone -t "$cluster_id" -c "$CONFIG" >/dev/null
+    if ! "$KAFKA_HOME/bin/kafka-storage.sh" format --standalone -t "$cluster_id" -c "$CONFIG" >/dev/null 2>&1; then
+      # Brokers without --standalone (before KIP-853) take a static single-voter quorum instead.
+      sed "s/^controller.quorum.bootstrap.servers=.*/controller.quorum.voters=1@localhost:$CONTROLLER_PORT/" \
+        "$CONFIG" > "$CONFIG.static" && mv "$CONFIG.static" "$CONFIG"
+      "$KAFKA_HOME/bin/kafka-storage.sh" format -t "$cluster_id" -c "$CONFIG" >/dev/null
+    fi
   fi
   # nohup + background; the JVM logs go to LOG_FILE (log4j also writes $KAFKA_HOME/logs).
   LOG_DIR="$RUN_DIR/logs" KAFKA_HEAP_OPTS="${KAFKA_HEAP_OPTS:--Xms256m -Xmx512m}" \

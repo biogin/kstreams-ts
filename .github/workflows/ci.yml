@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly crash suite (ADR-0011): no release claims exactly-once unless it passes.
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Typecheck, lint, unit tests, build
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+      - name: Check the package contents
+        run: npm pack --dry-run
+
+  integration:
+    name: Integration (Kafka ${{ matrix.kafka }})
+    if: github.event_name != 'schedule'
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # The minimum tested broker is 3.9; 4.x is the current line. scripts/kafka-local.sh
+        # downloads the release (checking its sha512) and runs a single-node KRaft broker.
+        kafka: ['3.9.1', '4.4.0']
+    env:
+      KAFKA_VERSION: ${{ matrix.kafka }}
+      KSTREAMS_KAFKA_BROKERS: localhost:9092
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/kstreams-ts/kafka_2.13-${{ matrix.kafka }}.tgz
+          key: kafka-${{ matrix.kafka }}
+      - run: npm ci
+      - run: npm run kafka -- start
+      - run: npm run test:integration
+      - name: Broker log on failure
+        if: failure()
+        run: tail -n 200 ~/.cache/kstreams-ts/run/kafka.log
+      - run: npm run kafka -- stop
+        if: always()
+
+  crash:
+    name: Crash suite (Kafka ${{ matrix.kafka }})
+    # Nightly, and on demand. Slow and randomized, so not on every push.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        kafka: ['3.9.1', '4.4.0']
+    env:
+      KAFKA_VERSION: ${{ matrix.kafka }}
+      KSTREAMS_KAFKA_BROKERS: localhost:9092
+      # More iterations than the local default (4); each prints its seed and the command to
+      # rerun it, so a failure can be reproduced.
+      KSTREAMS_CRASH_ITERATIONS: '8'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - run: npm ci
+      - run: npm run kafka -- start
+      - run: npm run test:crash
+      - name: Broker log on failure
+        if: failure()
+        run: tail -n 200 ~/.cache/kstreams-ts/run/kafka.log
+      - run: npm run kafka -- stop
+        if: always()
