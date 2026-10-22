@@ -1,3 +1,4 @@
+import { tracingChannel } from 'node:diagnostics_channel'
 import { Producer } from '@platformatic/kafka'
 import { afterEach, beforeEach, expect, it } from 'vitest'
 import { createStreamsApp, type Metric, type StreamsApp, serdes } from '../../src/index.js'
@@ -103,6 +104,48 @@ describeWithKafka('exactly-once batches and the transaction timeout (workers: 0)
     expect(
       aborts.every(({ labels }) => 'reason' in labels && labels.reason === 'transaction-timeout'),
     ).toBe(true)
+  }, 150_000)
+
+  it('aborts and replays a batch whose transaction the broker aborted while it was committing', async () => {
+    const input = await kafka.createTopic('input', 1)
+    const output = await kafka.createTopic('output', 1)
+    const { app, aborts } = slowApp(input, output, () => 0)
+    // The first commit request stalls (the event loop blocks) for 10 s, past the timeout and the
+    // broker's check after it (5 s): the broker aborts the transaction while it is being committed.
+    let stalled = false
+    const commits = tracingChannel<string, { operation?: string }>(
+      'plt:kafka:producer:transactions',
+    )
+    const handlers = {
+      start({ operation }: { operation?: string }) {
+        if (operation !== 'commit' || stalled) return
+        stalled = true
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10_000)
+      },
+      end() {},
+      asyncStart() {},
+      asyncEnd() {},
+      error() {},
+    }
+    commits.subscribe(handlers)
+    try {
+      const sent = records(3)
+      await kafka.produce(input, sent)
+      await app.start()
+
+      const received = await kafka.consume(output, sent.length, {
+        timeoutMs: 90_000,
+        settleMs: 2_000,
+      })
+      expect(stalled).toBe(true)
+      expect(received.map(({ value }) => value)).toEqual(sent.map(({ value }) => value))
+      expect(app.state).toBe('running')
+      expect(aborts.map(({ labels }) => labels)).toContainEqual(
+        expect.objectContaining({ reason: 'transaction-timeout' }),
+      )
+    } finally {
+      commits.unsubscribe(handlers)
+    }
   }, 150_000)
 
   // What keeps a zombie fenced: a Worker takes its transactional ID up again with its old epoch

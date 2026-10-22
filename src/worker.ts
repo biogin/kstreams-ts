@@ -1552,6 +1552,8 @@ class TransactionalCommitter implements BatchCommitter {
    * transactional ID up again with.
    */
   #retake: { producerId: bigint; producerEpoch: number } | undefined
+  /** Whether the broker aborted the last transaction, for its timeout, while it was committing. */
+  #abortedWhileCommitting = false
   /** Outputs waiting for the next send. */
   #pending: Output[] = []
   /** The chain of sends: one at a time, so outputs keep their order. */
@@ -1635,16 +1637,18 @@ class TransactionalCommitter implements BatchCommitter {
   }
 
   /** How long the open transaction has been open, in milliseconds (0 if none is). */
-  #openMs(): number {
-    return this.#openedAt === undefined ? 0 : performance.now() - this.#openedAt
+  #openMs(openedAt = this.#openedAt): number {
+    return openedAt === undefined ? 0 : performance.now() - openedAt
   }
 
   /**
    * `error` as a `TransactionTimedOutError` if it means the broker aborted the transaction for its
-   * timeout: an epoch error once the transaction has been open (`openMs`) that long. Else `error`.
+   * timeout: an epoch error once the transaction, opened at `openedAt`, has been open that long
+   * now, when the error arrived (a request may have waited past the timeout). Else `error`.
    */
-  #timedOut(error: unknown, openMs = this.#openMs()): unknown {
+  #timedOut(error: unknown, openedAt = this.#openedAt): unknown {
     if (error instanceof TransactionTimedOutError) return error
+    const openMs = this.#openMs(openedAt)
     if (!isEpochError(error) || openMs < this.#timeoutMs) return error
     return new TransactionTimedOutError(
       `The broker aborted the batch's transaction, open for ${Math.round(openMs)} ms, past the transaction timeout (${this.#timeoutMs} ms)`,
@@ -1674,12 +1678,16 @@ class TransactionalCommitter implements BatchCommitter {
     if (this.#sendFailure !== undefined) throw this.#sendFailure.error
     check()
     // The broker may abort the transaction any moment now: abort it first, and read it again.
-    const openMs = this.#openMs()
-    if (openMs >= commitDeadline(this.#timeoutMs)) {
-      throw new TransactionTimedOutError(
-        `The batch's transaction has been open for ${Math.round(openMs)} ms, too close to the transaction timeout (${this.#timeoutMs} ms) to commit`,
-      )
+    // Checked again after registering the offsets, which waits for the broker too.
+    const checkDeadline = () => {
+      const openMs = this.#openMs()
+      if (openMs >= commitDeadline(this.#timeoutMs)) {
+        throw new TransactionTimedOutError(
+          `The batch's transaction has been open for ${Math.round(openMs)} ms, too close to the transaction timeout (${this.#timeoutMs} ms) to commit`,
+        )
+      }
     }
+    checkDeadline()
     try {
       const offsets = [...lastRead, ...(guard?.fencing ?? [])]
       if (offsets.length > 0) {
@@ -1698,17 +1706,19 @@ class TransactionalCommitter implements BatchCommitter {
       throw this.#timedOut(error)
     }
     check()
+    checkDeadline()
     const transaction = this.#transaction
     const produced = this.#produced
-    const committingMs = this.#openMs()
+    const openedAt = this.#openedAt
     this.#transaction = undefined
     this.#openedAt = undefined
     this.#produced = new Map()
     try {
       await transaction?.commit()
     } catch (error) {
-      const failure = this.#timedOut(error, committingMs)
+      const failure = this.#timedOut(error, openedAt)
       if (failure instanceof TransactionTimedOutError && transaction !== undefined) {
+        this.#abortedWhileCommitting = true
         await this.#retakeAfter(transaction)
       }
       throw failure
@@ -1749,15 +1759,18 @@ class TransactionalCommitter implements BatchCommitter {
     this.#produced = new Map()
     this.#sendFailure = undefined
     const transaction = this.#transaction
-    const openMs = this.#openMs()
+    const openedAt = this.#openedAt
     this.#transaction = undefined
     this.#openedAt = undefined
-    if (transaction === undefined) return false
+    // A transaction the broker aborted while it was committing counts as this batch's abort.
+    const abortedWhileCommitting = this.#abortedWhileCommitting
+    this.#abortedWhileCommitting = false
+    if (transaction === undefined) return abortedWhileCommitting
     try {
       await transaction.abort()
     } catch (error) {
       // Unless the broker aborted it already, for its timeout.
-      if (!(this.#timedOut(error, openMs) instanceof TransactionTimedOutError)) throw error
+      if (!(this.#timedOut(error, openedAt) instanceof TransactionTimedOutError)) throw error
       await this.#retakeAfter(transaction)
     }
     return true
