@@ -149,7 +149,8 @@ describeWithKafka('exactly-once batches and the transaction timeout (workers: 0)
   }, 150_000)
 
   // What keeps a zombie fenced: a Worker takes its transactional ID up again with its old epoch
-  // after a timed-out transaction, which the broker refuses once another producer has the ID.
+  // (on Kafka 3.x, the one after it) after a timed-out transaction, which the broker refuses once
+  // another producer has the ID.
   it('the broker refuses an old epoch once another producer took the transactional ID', async () => {
     const topic = await kafka.createTopic('fenced', 1)
     const transactionalId = uniqueName('fenced')
@@ -187,6 +188,10 @@ describeWithKafka('exactly-once batches and the transaction timeout (workers: 0)
           }
         })(),
       ).rejects.toThrow()
+      // Nor the epoch after it, which a Worker tries next on Kafka 3.x (there the broker's
+      // timeout abort leaves exactly that epoch).
+      const bumped = { ...retake, producerEpoch: retake.producerEpoch + 1 }
+      await expect(producer().beginTransaction(bumped)).rejects.toThrow()
     } finally {
       await Promise.allSettled(producers.map((created) => created.close()))
     }
