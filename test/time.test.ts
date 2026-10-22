@@ -102,6 +102,54 @@ describe('Stream Time and skipped records', () => {
     await input.pipe('k', 'c', { timestamp: 110 })
     expect(ticks(output.readAll())).toEqual([110])
   })
+
+  /** A Processor that schedules its timer on the first record whose value starts with `sched`. */
+  function lazyApp() {
+    const app = createStreamsApp({
+      applicationId: 'skipping-lazy',
+      errorHandlers: { processing: () => 'continue' },
+    })
+    const ticker = app.processor('ticker', (ctx: ProcessorContext<string, string | null>) => {
+      let scheduled = false
+      return {
+        process(record: StreamRecord<string, string | null>) {
+          if (!scheduled && record.value?.startsWith('sched')) {
+            scheduled = true
+            ctx.schedule(10, 'stream-time', (timestamp) => {
+              ctx.forward({ key: 'tick', value: String(timestamp), timestamp })
+            })
+          }
+          if (record.value?.endsWith('bad')) throw new Error('bad record')
+          ctx.forward(record)
+        },
+      }
+    })
+    app.stream('input', strings).process(ticker).to('output', strings)
+    const driver = createTestDriver(app)
+    return { input: driver.input<string, string>('input'), output: driver.output('output') }
+  }
+
+  it('times a timer scheduled during a skipped first record from the next record', async () => {
+    const { input, output } = lazyApp()
+    await input.pipe('k', 'sched-bad', { timestamp: 500 })
+    await input.pipe('k', 'a', { timestamp: 100 })
+    await input.pipe('k', 'b', { timestamp: 109 })
+    expect(ticks(output.readAll())).toEqual([])
+
+    await input.pipe('k', 'c', { timestamp: 110 })
+    expect(ticks(output.readAll())).toEqual([110])
+  })
+
+  it('times a timer scheduled during a skipped record from the Stream Time before it', async () => {
+    const { input, output } = lazyApp()
+    await input.pipe('k', 'a', { timestamp: 100 })
+    await input.pipe('k', 'sched-bad', { timestamp: 900 })
+    await input.pipe('k', 'b', { timestamp: 109 })
+    expect(ticks(output.readAll())).toEqual([])
+
+    await input.pipe('k', 'c', { timestamp: 110 })
+    expect(ticks(output.readAll())).toEqual([110])
+  })
 })
 
 describe('Stream Time timers', () => {

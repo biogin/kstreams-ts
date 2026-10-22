@@ -392,7 +392,17 @@ export function createTask(
         // A skipped record doesn't advance Stream Time.
         skipped = true
         streamTime = before.streamTime
-        for (const [timer, due] of before.dues) timer.due = due
+        const existed = new Set<ScheduledTimer>()
+        for (const [timer, due] of before.dues) {
+          timer.due = due
+          existed.add(timer)
+        }
+        // A Stream Time timer scheduled during the record is due as if scheduled at the restored
+        // Stream Time (or once the next record sets it), not the skipped record's.
+        for (const timer of timers) {
+          if (existed.has(timer) || timer.type !== 'stream-time') continue
+          timer.due = streamTime === undefined ? undefined : streamTime + timer.intervalMs
+        }
         return undefined
       })
     let processed: Promise<void> | undefined
