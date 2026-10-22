@@ -8,7 +8,7 @@ All 30 tickets (01–30), plus three fixes: aborted-transaction filter, root-cau
 
 ## Remaining
 
-0. **Paused 2026-10-22.** The code review was started and then stopped before reporting; re-run it from scratch: `/code-review` on `mvp` against `main` (spec `.scratch/mvp/spec.md`, open items below).
+0. **Paused 2026-10-22.** The code review was started and then stopped before reporting; re-run it from scratch: `/code-review` on `mvp` against `main` (spec `.scratch/mvp/spec.md`, open items below). The user may have another AI model do the review using `.scratch/mvp/review-brief.md`; if `.scratch/mvp/review-findings-*.md` exists, start from it (verify its claims before acting) instead of re-running the review.
 1. Code review of `mvp` (`/code-review`), one fix agent, final full test run, worktree cleanup.
 2. Left for the user: create the remote repository and fill in `repository`, `npm publish`, release tag, check the first CI run on Kafka 3.9.
 
