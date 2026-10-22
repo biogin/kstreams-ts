@@ -82,6 +82,25 @@ describe('restoreStores', () => {
     expect(view.all()).toEqual([['a', 'new']])
   })
 
+  it('wipes the store with clear(), without reading its entries', async () => {
+    const store = openStore()
+    keyValueStore(store, strings, context).put('stale', 'x')
+    const unreadable: StateStore = {
+      ...bound(store),
+      all: () => {
+        throw new Error('the wipe read the whole store')
+      },
+    }
+
+    await restoreStores(
+      [{ node: node(), store: unreadable }],
+      0,
+      fakeReader({ [`${topic}:0`]: [{ key: bytes('a'), value: bytes('new') }] }),
+    )
+
+    expect(keyValueStore(store, strings, context).all()).toEqual([['a', 'new']])
+  })
+
   it('re-encodes keys with the store key encoding, e.g. windowed keys', async () => {
     const windows = tumbling('1m')
     const keySerde = windowedSerde(serdes.string, windows)
@@ -253,3 +272,19 @@ describe('restoreStores', () => {
     ).rejects.toThrow(`Changelog "${topic}" partition 0 has a record without a key`)
   })
 })
+
+/** `store`'s methods, bound to it, to override some. */
+function bound(store: StateStore): StateStore {
+  return {
+    get: (key) => store.get(key),
+    put: (key, value) => store.put(key, value),
+    delete: (key) => store.delete(key),
+    clear: () => store.clear(),
+    all: () => store.all(),
+    range: (from, to) => store.range(from, to),
+    begin: () => store.begin(),
+    commit: () => store.commit(),
+    rollback: () => store.rollback(),
+    close: () => store.close(),
+  }
+}

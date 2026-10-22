@@ -221,6 +221,9 @@ function guarded(store: StateStore, dirty: () => void, changelogFirst: boolean):
       if (!inTransaction) dirty()
       store.delete(key)
     },
+    clear() {
+      store.clear()
+    },
     all: () => store.all(),
     range: (from, to) => store.range(from, to),
     begin() {

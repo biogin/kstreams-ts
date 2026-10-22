@@ -32,7 +32,7 @@ app
   .to('out', { key: serdes.string, value: serdes.number })
 ```
 
-State Stores are a pluggable, byte-level interface (`StateStore`, [ADR-0005](./adr/0005-pluggable-stores-sqlite-default.md)): `get`, `put`, `delete`, `all`, `range`, `begin`/`commit`/`rollback`, `close`, and optional `persistent` and `flush`. The engine lines the store's transactions up with Kafka transactions, so a store must make writes durable only on `commit` and undo them on `rollback`. A supplier receives the store's name, the Application ID, the Task number and the Task directory.
+State Stores are a pluggable, byte-level interface (`StateStore`, [ADR-0005](./adr/0005-pluggable-stores-sqlite-default.md)): `get`, `put`, `delete`, `clear`, `all`, `range`, `begin`/`commit`/`rollback`, `close`, and optional `persistent` and `flush`. The engine lines the store's transactions up with Kafka transactions, so a store must make writes durable only on `commit` and undo them on `rollback`. `clear` removes every entry; the engine uses it to wipe a store before a full Restore, so it shouldn't read the entries (SQLite runs `DELETE FROM`). A supplier receives the store's name, the Application ID, the Task number and the Task directory.
 
 ## The typed view
 

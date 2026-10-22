@@ -26,6 +26,11 @@ export interface StateStore {
   /** Removes `key`. Does nothing if it has no value. */
   delete(key: Uint8Array): void
   /**
+   * Removes every entry, like deleting each key, without reading them: the engine wipes a store
+   * this way before a full Restore, so it must not need memory in proportion to the store.
+   */
+  clear(): void
+  /**
    * Every entry, in ascending key byte order (unsigned, shorter prefix first). Don't write to the
    * store while iterating.
    */
@@ -281,6 +286,11 @@ class InMemoryStore implements StateStore {
     const id = hex(key)
     this.#remember(id)
     this.#entries.delete(id)
+  }
+
+  clear(): void {
+    if (this.#undo !== undefined) for (const id of this.#entries.keys()) this.#remember(id)
+    this.#entries.clear()
   }
 
   all(): [Uint8Array, Uint8Array][] {

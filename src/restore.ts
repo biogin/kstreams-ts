@@ -140,10 +140,7 @@ export async function restoreStores(
           : await reader.read(topic, partition, apply, checkpoint, signal, observerFor(false))
       if (offset === undefined) {
         signal?.throwIfAborted()
-        inTransaction(store, () => {
-          // Collected first: a store must not be written while it is iterated.
-          for (const key of Array.from(store.all(), ([key]) => key)) store.delete(key)
-        })
+        store.clear()
         offset = await reader.read(topic, partition, apply, undefined, signal, observerFor(true))
         if (offset === undefined)
           throw new Error(`Cannot read Changelog "${topic}" partition ${partition}`)

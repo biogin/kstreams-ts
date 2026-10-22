@@ -441,6 +441,7 @@ export function keptOpen(store: StateStore): StateStore {
     get: (key) => store.get(key),
     put: (key, value) => store.put(key, value),
     delete: (key) => store.delete(key),
+    clear: () => store.clear(),
     all: () => store.all(),
     range: (from, to) => store.range(from, to),
     begin: () => store.begin(),

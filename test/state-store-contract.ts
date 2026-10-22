@@ -219,6 +219,45 @@ export function describeStateStoreContract(implementation: string, open: () => S
       })
     })
 
+    describe('clear', () => {
+      it('removes every entry, and leaves the store usable', () => {
+        const s = store()
+        for (const key of ['a', 'b', 'c']) s.put(text(key), text('1'))
+        s.clear()
+        expect([...s.all()]).toEqual([])
+        expect(s.get(text('a'))).toBeUndefined()
+        s.put(text('d'), text('2'))
+        expect([...s.all()]).toEqual([[text('d'), text('2')]])
+      })
+
+      it('does nothing on an empty store', () => {
+        const s = store()
+        s.clear()
+        expect([...s.all()]).toEqual([])
+      })
+
+      it('is undone by rollback inside a transaction, and kept by commit', () => {
+        const s = store()
+        s.put(text('a'), text('1'))
+        s.put(text('b'), text('1'))
+        s.begin()
+        s.put(text('b'), text('2'))
+        s.clear()
+        s.put(text('c'), text('2'))
+        expect([...s.all()]).toEqual([[text('c'), text('2')]])
+        s.rollback()
+        expect([...s.all()]).toEqual([
+          [text('a'), text('1')],
+          [text('b'), text('1')],
+        ])
+        s.begin()
+        s.clear()
+        s.put(text('c'), text('3'))
+        s.commit()
+        expect([...s.all()]).toEqual([[text('c'), text('3')]])
+      })
+    })
+
     describe('Buffers and mutation', () => {
       it('keeps stored bytes apart from the Buffers given to put', () => {
         const s = store()

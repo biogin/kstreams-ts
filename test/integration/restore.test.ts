@@ -319,6 +319,7 @@ function countingWrites(store: StateStore, run: { writes: number }): StateStore 
       run.writes++
       store.delete(key)
     },
+    clear: () => store.clear(),
     all: () => store.all(),
     range: (from, to) => store.range(from, to),
     begin: () => store.begin(),

@@ -27,6 +27,7 @@ class SqliteStore implements StateStore {
   readonly #get: Database.Statement<[Buffer], Row>
   readonly #put: Database.Statement<[Buffer, Buffer]>
   readonly #delete: Database.Statement<[Buffer]>
+  readonly #clear: Database.Statement<[]>
   readonly #all: Database.Statement<[], Row>
   readonly #from: Database.Statement<[Buffer], Row>
   readonly #to: Database.Statement<[Buffer], Row>
@@ -48,6 +49,7 @@ class SqliteStore implements StateStore {
       'INSERT INTO entries (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value',
     )
     this.#delete = db.prepare('DELETE FROM entries WHERE key = ?')
+    this.#clear = db.prepare('DELETE FROM entries')
     this.#all = db.prepare('SELECT key, value FROM entries ORDER BY key')
     this.#from = db.prepare('SELECT key, value FROM entries WHERE key >= ? ORDER BY key')
     this.#to = db.prepare('SELECT key, value FROM entries WHERE key < ? ORDER BY key')
@@ -67,6 +69,11 @@ class SqliteStore implements StateStore {
 
   delete(key: Uint8Array): void {
     this.#delete.run(buffer(key))
+  }
+
+  // Without a WHERE clause SQLite truncates the table instead of deleting row by row.
+  clear(): void {
+    this.#clear.run()
   }
 
   all(): [Uint8Array, Uint8Array][] {
