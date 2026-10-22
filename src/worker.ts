@@ -185,8 +185,8 @@ const LAG_INTERVAL_MS = 2_000
 /** Bytes, as the Kafka client wants them. */
 type Bytes = Buffer
 type ConsumedMessage = Message<Bytes, Bytes, Bytes, Bytes>
-type Output = MessageToProduce<Bytes, Bytes, Bytes, Bytes>
-type Stream = MessagesStream<Bytes, Bytes, Bytes, Bytes>
+export type Output = MessageToProduce<Bytes, Bytes, Bytes, Bytes>
+export type Stream = MessagesStream<Bytes, Bytes, Bytes, Bytes>
 /** The client doesn't export its transaction type. */
 type Transaction = Awaited<ReturnType<Producer<Bytes, Bytes, Bytes, Bytes>['beginTransaction']>>
 
@@ -389,7 +389,8 @@ function isRebalanceError(error: unknown): boolean {
   return error instanceof Error && findErrorBy(error, 'needsRejoin', true) !== null
 }
 
-interface CommitCycleClients {
+/** Exported for the Worker-level unit tests (ADR-0016), like `CommitCycle`. */
+export interface CommitCycleClients {
   consumer: Consumer<Bytes, Bytes, Bytes, Bytes>
   createCommitter(
     fail: (error: unknown) => void,
@@ -404,7 +405,8 @@ interface CommitCycleClients {
   stableOffsets: StableOffsetReader | undefined
 }
 
-class CommitCycle {
+/** Exported for the Worker-level unit tests only (ADR-0016): not part of the API. */
+export class CommitCycle {
   readonly #graph: ProcessorGraph
   readonly #options: WorkerOptions
   readonly #exactlyOnce: boolean
@@ -1243,9 +1245,9 @@ function closeTask(task: Task): void {
 }
 
 /** The offset after the last record a batch produced, by partition, then by topic. */
-type ProducedOffsets = ReadonlyMap<number, ChangelogOffsets>
+export type ProducedOffsets = ReadonlyMap<number, ChangelogOffsets>
 
-interface CommitResult {
+export interface CommitResult {
   /**
    * The offset after the last output in each partition that outputs given an explicit partition
    * (the Changelog records) went to. An offset may be lower than that, never higher: restoring from
@@ -1259,7 +1261,7 @@ interface CommitResult {
 }
 
 /** Exactly-once: what keeps a batch from committing after its Tasks' ownership was interrupted. */
-interface CommitGuard {
+export interface CommitGuard {
   /** Whether every Task with a part in the batch has been owned throughout since. */
   ownedThroughout(): boolean
   /**
@@ -1294,7 +1296,7 @@ export function fencingOffsets(
 }
 
 /** Commits a batch under one Delivery Guarantee. */
-interface BatchCommitter {
+export interface BatchCommitter {
   /** Takes an output of the current batch. */
   produce(output: Output): void
   /**
