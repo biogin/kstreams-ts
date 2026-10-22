@@ -21,6 +21,10 @@
 // version, doesn't list the store, or has an offset outside the Changelog partition (before its
 // start or past its end, e.g. a recreated topic).
 //
+// A full Restore first wipes the store (`clear`), which always removes the Checkpoint, even under
+// exactly-once: if that Restore is cancelled or crashes, the next start must not apply only the
+// Changelog after the old Checkpoint to a wiped or half-restored store.
+//
 // Under exactly-once a store transaction commits only after the Kafka transaction holding its
 // Changelog records (ADR-0002), so its commit doesn't make the store unclean: the store is then
 // its Changelog up to some offset at or after the Checkpoint, and applying the Changelog records
@@ -207,7 +211,8 @@ function sameOffsets(a: CheckpointOffsets, b: CheckpointOffsets | undefined): bo
 
 /**
  * `store`, calling `dirty` before each write that could make it differ from its Checkpoint: a
- * write outside a store transaction, or a store transaction's commit unless `changelogFirst`.
+ * write outside a store transaction, a store transaction's commit unless `changelogFirst`, and
+ * any `clear` (the wipe before a full Restore).
  */
 function guarded(store: StateStore, dirty: () => void, changelogFirst: boolean): StateStore {
   let inTransaction = false
@@ -222,6 +227,9 @@ function guarded(store: StateStore, dirty: () => void, changelogFirst: boolean):
       store.delete(key)
     },
     clear() {
+      // A wiped store is unclean whatever `changelogFirst` says: until its full Restore is done,
+      // it isn't its Changelog up to any offset, and the old Checkpoint must not be trusted.
+      dirty()
       store.clear()
     },
     all: () => store.all(),

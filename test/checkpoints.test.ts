@@ -44,9 +44,11 @@ function fakeChangelog(start = 0n) {
   const reads: (bigint | undefined)[] = []
   let replayed = 0
   const end = () => start + BigInt(records.length)
+  const state = { cancelFullReads: false }
   const reader: ChangelogReader = {
     async read(_topic, _partition, apply, from) {
       reads.push(from)
+      if (from === undefined && state.cancelFullReads) throw new Error('Restore cancelled')
       if (from !== undefined && (from < start || from > end())) return undefined
       const chunk = records.slice(Number((from ?? start) - start))
       replayed += chunk.length
@@ -57,6 +59,8 @@ function fakeChangelog(start = 0n) {
   return {
     records,
     reader,
+    /** Set `cancelFullReads` to make full reads fail, as a cancelled Restore or a crash. */
+    state,
     /** The `from` of each read, undefined for a full one. */
     reads,
     replayed: () => replayed,
@@ -266,6 +270,36 @@ describe('Store transactions under exactly-once (ADR-0002)', () => {
     task.commit()
     commit(task, log)
   }
+
+  it('a cancelled full Restore leaves the store unclean: the next start restores it in full', async () => {
+    const log = fakeChangelog()
+    const first = transactional(log)
+    await pipe(first, 'a', 'b', 'c')
+    commitAll(first, log)
+    close(first)
+    // The Changelog was recreated: its end is now before the Checkpoint's offset 3.
+    const one = serdes.number.serialize(1, context)
+    log.records.splice(0, log.records.length, { key: text('z'), value: one })
+    // The store is wiped for a full Restore, which is then cancelled (a rebalance, a crash).
+    log.state.cancelFullReads = true
+    const second = transactional(log)
+    await expect(second.restored()).rejects.toThrow(/cancelled/)
+    close(second)
+    log.state.cancelFullReads = false
+    // The Changelog grows past the old Checkpoint's offset.
+    for (const key of ['y', 'x', 'w']) log.records.push({ key: text(key), value: one })
+
+    const third = transactional(log)
+    await third.restored()
+
+    expect(log.reads.at(-1)).toBeUndefined()
+    expect(entries(third)).toEqual([
+      ['w', 1],
+      ['x', 1],
+      ['y', 1],
+      ['z', 1],
+    ])
+  })
 
   it('restores before the first store transaction begins', async () => {
     const log = fakeChangelog()
