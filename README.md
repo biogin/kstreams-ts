@@ -18,7 +18,7 @@ Requires Node.js 24 or later and a Kafka cluster, version 3.6 or later ([broker 
 npm install kstreams-ts
 ```
 
-<!-- TODO(release): add the repository URL here and in package.json (`repository`, `bugs`, `homepage`) once the GitHub repository exists. -->
+Source and issues: [github.com/biogin/kstreams-ts](https://github.com/biogin/kstreams-ts).
 
 ## Quick start
 

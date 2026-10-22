@@ -3,6 +3,12 @@
   "version": "0.1.0",
   "description": "Partition-aware stateful stream processing on Kafka for Node.js, with fault-tolerant state and exactly-once processing.",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/biogin/kstreams-ts.git"
+  },
+  "homepage": "https://github.com/biogin/kstreams-ts#readme",
+  "bugs": "https://github.com/biogin/kstreams-ts/issues",
   "type": "module",
   "engines": {
     "node": ">=24"
