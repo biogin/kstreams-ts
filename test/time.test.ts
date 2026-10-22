@@ -58,6 +58,52 @@ describe('Event Time', () => {
   })
 })
 
+describe('Stream Time and skipped records', () => {
+  /** Like `timerApp`, but a record with the value `bad` fails processing and is skipped. */
+  function skippingApp() {
+    const app = createStreamsApp({
+      applicationId: 'skipping',
+      errorHandlers: { processing: () => 'continue' },
+    })
+    const ticker = app.processor('ticker', (ctx: ProcessorContext<string, string | null>) => {
+      ctx.schedule(10, 'stream-time', (timestamp) => {
+        ctx.forward({ key: 'tick', value: String(timestamp), timestamp })
+      })
+      return {
+        process(record: StreamRecord<string, string | null>) {
+          if (record.value === 'bad') throw new Error('bad record')
+          ctx.forward(record)
+        },
+      }
+    })
+    app.stream('input', strings).process(ticker).to('output', strings)
+    const driver = createTestDriver(app)
+    return { input: driver.input<string, string>('input'), output: driver.output('output') }
+  }
+
+  it('is not advanced by a record skipped by an error handler', async () => {
+    const { input, output } = skippingApp()
+    await input.pipe('k', 'a', { timestamp: 100 })
+    await input.pipe('k', 'bad', { timestamp: 500 })
+    await input.pipe('k', 'b', { timestamp: 105 })
+    expect(ticks(output.readAll())).toEqual([])
+
+    await input.pipe('k', 'c', { timestamp: 110 })
+    expect(ticks(output.readAll())).toEqual([110])
+  })
+
+  it('does not start Stream Time timers counting when the first record is skipped', async () => {
+    const { input, output } = skippingApp()
+    await input.pipe('k', 'bad', { timestamp: 500 })
+    await input.pipe('k', 'a', { timestamp: 100 })
+    await input.pipe('k', 'b', { timestamp: 109 })
+    expect(ticks(output.readAll())).toEqual([])
+
+    await input.pipe('k', 'c', { timestamp: 110 })
+    expect(ticks(output.readAll())).toEqual([110])
+  })
+})
+
 describe('Stream Time timers', () => {
   it('fire as Stream Time advances, every interval after the first record', async () => {
     const { input, output } = timerApp(10, 'stream-time')

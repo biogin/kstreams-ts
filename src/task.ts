@@ -370,12 +370,19 @@ export function createTask(
       metrics.recordsDropped.deserialization++
       return undefined
     }
+    // What a skipped record must leave as it was: Stream Time and when its timers are due.
+    const before = { streamTime, dues: timers.map((timer) => [timer, timer.due] as const) }
     advanceStreamTime(record.timestamp)
+    let skipped = false
     const onError = (error: unknown) =>
       // The record's async work still going on finishes before the next record starts.
       andThen(quiesce(), () => {
         handleError(graph.errorHandlers, 'processing', error, failed, collect)
         metrics.recordsDropped.processing++
+        // A skipped record doesn't advance Stream Time.
+        skipped = true
+        streamTime = before.streamTime
+        for (const [timer, due] of before.dues) timer.due = due
         return undefined
       })
     let processed: Promise<void> | undefined
@@ -386,7 +393,9 @@ export function createTask(
       processed = onError(error)
     }
     // Timers are not a record's processing: their errors always fail the Task.
-    return andThen(processed, () => fireDue('stream-time', streamTime ?? record.timestamp))
+    return andThen(processed, () =>
+      skipped ? undefined : fireDue('stream-time', streamTime ?? record.timestamp),
+    )
   }
 
   const drain = async (): Promise<void> => {
