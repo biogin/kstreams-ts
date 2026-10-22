@@ -24,6 +24,10 @@ All 30 tickets (01–30), plus three fixes: aborted-transaction filter, root-cau
 - **Silent wrong aggregation (from ticket 26, high priority):** `map` (key change) followed by `groupByKey` doesn't repartition, so records with the same new key can land in different Tasks. Repartition Topics are v1 scope; for 0.1, fail fast when the app is built with a clear message.
 - **Pin `@platformatic/kafka` to an exact version** while `src/read-committed.ts` depends on its internals.
 - **Unverified doc claims (ticket 26):** transaction timeout wording and timers not persisting across restarts come from source comments; verify.
+- **Deferred review findings** (details, scenarios and evidence in `.scratch/mvp/review-findings-fixes.md`):
+  - Linux wall-clock step > 120 s makes a live process's locks look stale (BOOTED derives from `Date.now() - uptime()`): use a stable boot ID (finding 3; documented in docs/limitations.md).
+  - Rolling back Stream Time for a skipped record doesn't undo window expiry, so expired windows reopen with partial aggregates (finding 6).
+  - Timers scheduled while processing a skipped record keep a due time from the rolled-back Stream Time (finding 7).
 
 ## Fixed
 
