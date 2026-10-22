@@ -148,7 +148,9 @@ describeWithKafka('scale out across App Processes (exactly-once, 2 Workers each)
     )
     expect(processIds.size).toBe(2)
     expect(
-      readdirSync(join(stateDir, applicationId, 'processes')).filter((f) => !f.endsWith('.lock')),
+      readdirSync(join(stateDir, applicationId, 'processes')).filter((f) =>
+        /^[0-9a-f]{12}$/.test(f),
+      ),
     ).toHaveLength(2)
 
     await kafka.produce(input, records(400, 400, start))

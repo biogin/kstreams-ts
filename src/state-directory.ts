@@ -19,11 +19,24 @@
 // opens its State Stores and Checkpoint, so its directory has a lock file, `.lock`, while a Worker
 // has the Task open; the new owner waits for it.
 //
-// A lock file names its holder and the process (PID, which boot of the host, and the process's
-// incarnation: a random value of this process, shared by its worker threads). A lock is stale,
-// and taken over, when that process is gone: its PID isn't running, or the host has rebooted
-// since, or the PID is this process's but the incarnation isn't (an earlier process that had the
-// same PID, as a container's restarted process typically has). The boot is told by the kernel's
+// A lock file names its holder and the process (PID, its PID namespace on Linux, which boot of
+// the host, the process's incarnation: a random value of this process, shared by its worker
+// threads, and its liveness token, below). A lock is stale, and taken over, when that process is
+// gone: the host has rebooted since, or, for a process in this PID namespace, its PID isn't
+// running or the PID is this process's but the incarnation isn't (an earlier process that had the
+// same PID), or, for a process in another PID namespace (another container, or this container
+// before it restarted), its liveness file isn't held. PIDs tell nothing across PID namespaces:
+// containers on one host typically all run as PID 1.
+//
+// Liveness files. An App Process with a state directory holds `processes/<incarnation>.alive`, a
+// SQLite database it keeps an exclusive lock on (an OS file lock, which the kernel releases when
+// the process ends, whatever its PID namespace), from when it takes its App Process ID until it
+// gives it up. Another process tells whether it runs by trying to read the file: the lock makes
+// that fail. This needs a file system whose POSIX advisory locks the processes share (a local
+// file system, e.g. one host directory bind-mounted into several containers; not NFS without
+// locking). A lock in another PID namespace without a liveness token is never taken over.
+//
+// The boot is told by the kernel's
 // boot ID on Linux, which no wall-clock step changes; elsewhere by when the host booted, derived
 // from the wall clock and uptime (macOS adjusts its boot time when the clock steps, so the two
 // agree; a step of more than BOOT_TOLERANCE_S where it doesn't could make a live process's lock
@@ -39,9 +52,19 @@
 // its place, and leaves it be. A claim whose holder died is stale too, and taken over likewise.
 
 import { createHash, randomBytes } from 'node:crypto'
-import { linkSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  linkSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { uptime } from 'node:os'
 import { join } from 'node:path'
+import Database from 'better-sqlite3'
 import { taskDirectory } from './state-store.js'
 
 /** The ID of this App Process, while it holds it. */
@@ -55,12 +78,14 @@ const PROCESS_ID = /^[0-9a-f]{12}$/
 const LOCK_FILE = '.lock'
 const LOCK_POLL_MS = 50
 
-/** Which boot of the host a process runs in. */
+/** Which boot of the host a process runs in, and in which PID namespace. */
 export interface HostBoot {
   /** The kernel's ID of this boot, if it has one (Linux): unlike `booted`, no clock step moves it. */
   readonly bootId?: string
   /** When the host booted, in seconds since the epoch (to a few seconds), from the wall clock. */
   readonly booted: number
+  /** The process's PID namespace, if the OS has them (Linux), e.g. `pid:[4026531836]`. */
+  readonly pidNamespace?: string
 }
 
 /** How far two readings of the boot time may differ for the same boot. */
@@ -75,12 +100,103 @@ function readBootId(): string | undefined {
   }
 }
 
+function readPidNamespace(): string | undefined {
+  try {
+    return readlinkSync('/proc/self/ns/pid')
+  } catch {
+    return undefined
+  }
+}
+
 /** This process's boot of the host. */
 const HOST_BOOT: HostBoot = (() => {
   const bootId = readBootId()
-  const booted = Math.round(Date.now() / 1000 - uptime())
-  return bootId === undefined ? { booted } : { bootId, booted }
+  const pidNamespace = readPidNamespace()
+  return {
+    booted: Math.round(Date.now() / 1000 - uptime()),
+    ...(bootId === undefined ? {} : { bootId }),
+    ...(pidNamespace === undefined ? {} : { pidNamespace }),
+  }
 })()
+
+/** Tells whether processes run, by their liveness files (see above). */
+export interface Liveness {
+  /** This process's liveness token, if it holds a liveness file. */
+  token(): string | undefined
+  /** Whether the process with liveness token `token` still runs. */
+  alive(token: string): boolean
+}
+
+const TOKEN = /^[0-9A-Za-z_-]+$/
+const ALIVE_SUFFIX = '.alive'
+
+/** The liveness files in `directory` (an application's `processes` directory). */
+export function livenessIn(directory: string): Liveness {
+  return {
+    token() {
+      // The file exists only while this process (its main thread) holds it.
+      return existsSync(aliveFile(directory, incarnation)) ? incarnation : undefined
+    },
+    alive(token) {
+      if (!TOKEN.test(token)) return false
+      const file = aliveFile(directory, token)
+      // This process's own: alive (and not to be opened twice, which could drop its lock).
+      if (held.has(file)) return true
+      let db: Database.Database | undefined
+      try {
+        db = new Database(file, { fileMustExist: true, timeout: 0 })
+        db.prepare('SELECT count(*) FROM sqlite_master').get()
+      } catch (error) {
+        // Locked: its process holds it. Anything but a missing file counts as alive, to be safe.
+        return (error as { code?: unknown }).code !== 'SQLITE_CANTOPEN'
+      } finally {
+        db?.close()
+      }
+      // Readable: its process is gone, and nobody holds that token again. The file is left over.
+      rmSync(file, { force: true })
+      return false
+    },
+  }
+}
+
+function aliveFile(directory: string, token: string): string {
+  return join(directory, `${token}${ALIVE_SUFFIX}`)
+}
+
+/** The liveness files this process holds, with how many App Processes use each. */
+const held = new Map<string, { db: Database.Database; users: number }>()
+
+/** Holds this process's liveness file in `directory` until the returned function is called. */
+function holdLiveness(directory: string): () => void {
+  const file = aliveFile(directory, incarnation)
+  let entry = held.get(file)
+  if (entry === undefined) {
+    const db = new Database(file)
+    try {
+      // Exclusive locking mode keeps the lock of the first transaction until the database closes;
+      // the journal is kept in memory, as there is nothing to keep.
+      db.pragma('journal_mode = MEMORY')
+      db.pragma('locking_mode = EXCLUSIVE')
+      db.exec('BEGIN EXCLUSIVE; COMMIT')
+    } catch (error) {
+      db.close()
+      throw error
+    }
+    entry = { db, users: 0 }
+    held.set(file, entry)
+  }
+  const current = entry
+  current.users++
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    if (--current.users > 0) return
+    held.delete(file)
+    current.db.close()
+    rmSync(file, { force: true })
+  }
+}
 
 /** This process's incarnation (see above); its worker threads adopt the main thread's. */
 let incarnation = randomBytes(8).toString('hex')
@@ -103,14 +219,33 @@ export function claimProcessIdentity(
   if (stateDir === undefined) return { id: newProcessId(), release() {} }
   const directory = join(stateDir, applicationId, 'processes')
   mkdirSync(directory, { recursive: true })
+  const liveness = livenessIn(directory)
+  // Removes the liveness files of processes that are gone.
+  for (const name of readdirSync(directory)) {
+    if (name.endsWith(ALIVE_SUFFIX)) liveness.alive(name.slice(0, -ALIVE_SUFFIX.length))
+  }
+  const releaseLiveness = holdLiveness(directory)
   const known = readdirSync(directory)
     .filter((name) => PROCESS_ID.test(name))
     .sort()
-  for (;;) {
-    const id = known.shift() ?? newProcessId()
-    writeFileSync(join(directory, id), '', { flag: 'a' })
-    const lock = join(directory, `${id}.lock`)
-    if (tryLock(lock, id)) return { id, release: () => unlock(lock, id) }
+  try {
+    for (;;) {
+      const id = known.shift() ?? newProcessId()
+      writeFileSync(join(directory, id), '', { flag: 'a' })
+      const lock = join(directory, `${id}.lock`)
+      if (tryLock(lock, id, false, lockFiles, HOST_BOOT, liveness)) {
+        return {
+          id,
+          release() {
+            unlock(lock, id)
+            releaseLiveness()
+          },
+        }
+      }
+    }
+  } catch (error) {
+    releaseLiveness()
+    throw error
   }
 }
 
@@ -137,7 +272,8 @@ export async function lockTask(
   const directory = taskDirectory(stateDir, applicationId, task)
   mkdirSync(directory, { recursive: true })
   const lock = join(directory, LOCK_FILE)
-  while (!tryLock(lock, holder, true)) {
+  const liveness = livenessIn(join(stateDir, applicationId, 'processes'))
+  while (!tryLock(lock, holder, true, lockFiles, HOST_BOOT, liveness)) {
     if (giveUp()) return false
     await new Promise((resolve) => setTimeout(resolve, LOCK_POLL_MS))
   }
@@ -191,6 +327,9 @@ interface LockHolder {
   booted: number
   bootId?: string
   incarnation?: string
+  pidNamespace?: string
+  /** The holder's liveness token. */
+  alive?: string
 }
 
 const CLAIM_SUFFIX = '.claim'
@@ -205,7 +344,9 @@ export function tryLock(
   reentrant = false,
   files: LockFiles = lockFiles,
   host: HostBoot = HOST_BOOT,
+  liveness?: Liveness,
 ): boolean {
+  const token = liveness?.token()
   for (;;) {
     // Written in full under another name first, so nobody ever reads a half-written lock.
     const mine = {
@@ -213,7 +354,9 @@ export function tryLock(
       pid: process.pid,
       booted: host.booted,
       ...(host.bootId === undefined ? {} : { bootId: host.bootId }),
+      ...(host.pidNamespace === undefined ? {} : { pidNamespace: host.pidNamespace }),
       incarnation,
+      ...(token === undefined ? {} : { alive: token }),
       nonce: randomBytes(8).toString('hex'),
     }
     const draft = `${file}.${randomBytes(4).toString('hex')}.tmp`
@@ -232,11 +375,11 @@ export function tryLock(
     if (current !== undefined && isMine(current) && current.holder === holder) {
       return reentrant
     }
-    if (current !== undefined && !isStale(current, host)) return false
+    if (current !== undefined && !isStale(current, host, liveness)) return false
     // Stale: only the holder of its claim removes it, and only while it is still this very lock.
     const claim = `${file}.${createHash('sha256').update(content).digest('hex').slice(0, 16)}${CLAIM_SUFFIX}`
     // Reentrant: a claim of this very holder can only be left over from a terminated worker thread.
-    if (!tryLock(claim, holder, true, files, host)) return false // another contender takes it over
+    if (!tryLock(claim, holder, true, files, host, liveness)) return false // another contender takes it over
     try {
       if (files.read(file) === content) files.remove(file)
     } finally {
@@ -302,6 +445,8 @@ function parseLock(content: string): LockHolder | undefined {
         booted: parsed.booted,
         ...(typeof parsed.bootId === 'string' ? { bootId: parsed.bootId } : {}),
         ...(typeof parsed.incarnation === 'string' ? { incarnation: parsed.incarnation } : {}),
+        ...(typeof parsed.pidNamespace === 'string' ? { pidNamespace: parsed.pidNamespace } : {}),
+        ...(typeof parsed.alive === 'string' ? { alive: parsed.alive } : {}),
       }
     }
   } catch {
@@ -312,17 +457,26 @@ function parseLock(content: string): LockHolder | undefined {
 
 /** Whether `lock` was taken by this process (not an earlier one that had its PID). */
 function isMine(lock: LockHolder): boolean {
+  // The incarnation is random, so no process in another PID namespace has it.
   return lock.pid === process.pid && lock.incarnation === incarnation
 }
 
 /** Whether the process that took `lock` is gone. */
-function isStale(lock: LockHolder, host: HostBoot): boolean {
-  // A live process's PID is its own, so an earlier process that had this PID is gone.
-  if (lock.pid === process.pid) return lock.incarnation !== incarnation
+function isStale(lock: LockHolder, host: HostBoot, liveness: Liveness | undefined): boolean {
   // Taken in another boot of the host. Boot IDs, where both have one, are immune to clock steps.
   if (lock.bootId !== undefined && host.bootId !== undefined) {
     if (lock.bootId !== host.bootId) return true
   } else if (Math.abs(lock.booted - host.booted) > BOOT_TOLERANCE_S) return true
+  // Another PID namespace: its PIDs mean nothing here; only its liveness file tells.
+  if (
+    lock.pidNamespace !== undefined &&
+    host.pidNamespace !== undefined &&
+    lock.pidNamespace !== host.pidNamespace
+  ) {
+    return lock.alive !== undefined && liveness !== undefined && !liveness.alive(lock.alive)
+  }
+  // A live process's PID is its own, so an earlier process that had this PID is gone.
+  if (lock.pid === process.pid) return lock.incarnation !== incarnation
   try {
     process.kill(lock.pid, 0)
     return false

@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import {
   linkSync,
   mkdirSync,
@@ -15,6 +15,7 @@ import {
   adoptProcessIncarnation,
   claimProcessIdentity,
   type LockFiles,
+  livenessIn,
   lockTask,
   processIncarnation,
   taskLockHolder,
@@ -300,5 +301,116 @@ describe('taking over a stale lock', () => {
       if (found !== undefined) failures.push(`C crashed at ${k}: ${found}`)
     }
     expect(failures).toEqual([])
+  })
+})
+
+describe('locks across PID namespaces (containers sharing a state directory)', () => {
+  /** This host, in PID namespace `pidNamespace`. */
+  const host = (pidNamespace: string) => ({ bootId: 'boot-1', booted: 1_000, pidNamespace })
+
+  /**
+   * A lock of a process in PID namespace `pidNamespace` that has this very PID, as the main
+   * process of another container typically has (PID 1), with liveness token `alive`.
+   */
+  function lockOf(pidNamespace: string, alive?: string): string {
+    const lock = join(stateDir(), '.lock')
+    const holder = { holder: 'other/worker-0', pid: process.pid, booted: 1_000, bootId: 'boot-1' }
+    writeFileSync(
+      lock,
+      JSON.stringify({ ...holder, incarnation: 'other', pidNamespace, ...(alive && { alive }) }),
+    )
+    return lock
+  }
+
+  const liveness = (alive: boolean) => ({
+    token: () => 'mine',
+    alive(token: string) {
+      expect(token).toBe('other-token')
+      return alive
+    },
+  })
+
+  it('are not taken over while their process lives, though it has this PID', () => {
+    const lock = lockOf('pid:[2]', 'other-token')
+    expect(tryLock(lock, 'new/worker-0', false, undefined, host('pid:[1]'), liveness(true))).toBe(
+      false,
+    )
+  })
+
+  it('are taken over once their process is gone, e.g. by the restarted container', () => {
+    const lock = lockOf('pid:[2]', 'other-token')
+    expect(tryLock(lock, 'new/worker-0', false, undefined, host('pid:[1]'), liveness(false))).toBe(
+      true,
+    )
+  })
+
+  it('without a liveness token are kept: their PID tells nothing in this namespace', () => {
+    const lock = lockOf('pid:[2]')
+    expect(tryLock(lock, 'new/worker-0', false, undefined, host('pid:[1]'), liveness(false))).toBe(
+      false,
+    )
+  })
+
+  it('in this PID namespace, are stale when this PID is another incarnation', () => {
+    const lock = lockOf('pid:[1]', 'other-token')
+    const unused = {
+      token: () => 'mine',
+      alive(): boolean {
+        throw new Error('the PID tells in one namespace')
+      },
+    }
+    expect(tryLock(lock, 'new/worker-0', false, undefined, host('pid:[1]'), unused)).toBe(true)
+  })
+
+  it('record the PID namespace and liveness token of their process', () => {
+    const dir = stateDir()
+    const lock = join(dir, '.lock')
+    expect(tryLock(lock, 'me', false, undefined, host('pid:[1]'), liveness(true))).toBe(true)
+    expect(JSON.parse(readFileSync(lock, 'utf8'))).toMatchObject({
+      pidNamespace: 'pid:[1]',
+      alive: 'mine',
+    })
+  })
+})
+
+describe('liveness files', () => {
+  it('tell whether the process holding one runs, by its SQLite lock', async () => {
+    const dir = stateDir()
+    // Another process holds a liveness file the way an App Process holds its own.
+    const child = spawn(
+      process.execPath,
+      [
+        '-e',
+        `const db = new (require('better-sqlite3'))(${JSON.stringify(join(dir, 'other.alive'))})
+        db.pragma('locking_mode = EXCLUSIVE')
+        db.exec('BEGIN EXCLUSIVE; COMMIT')
+        process.stdout.write('held')
+        process.stdin.on('end', () => process.exit(0)).resume()`,
+      ],
+      { cwd: process.cwd(), stdio: ['pipe', 'pipe', 'inherit'] },
+    )
+    await new Promise((resolve) => child.stdout.once('data', resolve))
+    const liveness = livenessIn(dir)
+    expect(liveness.alive('other')).toBe(true)
+    const exited = new Promise((resolve) => child.once('exit', resolve))
+    child.stdin.end()
+    await exited
+    expect(liveness.alive('other')).toBe(false)
+    expect(liveness.alive('missing')).toBe(false)
+    expect(liveness.alive('../escape')).toBe(false)
+  })
+
+  it('are held by an App Process while it has its ID, and recorded in its locks', async () => {
+    const dir = stateDir()
+    const identity = claimProcessIdentity(dir, 'app')
+    const processes = join(dir, 'app', 'processes')
+    expect(readdirSync(processes)).toContain(`${processIncarnation()}.alive`)
+    expect(await lockTask(dir, 'app', 0, taskLockHolder(identity.id, 0), () => true)).toBe(true)
+    expect(JSON.parse(readFileSync(join(dir, 'app', '0', '.lock'), 'utf8'))).toMatchObject({
+      alive: processIncarnation(),
+    })
+    unlockTask(dir, 'app', 0, taskLockHolder(identity.id, 0))
+    identity.release()
+    expect(readdirSync(processes)).not.toContain(`${processIncarnation()}.alive`)
   })
 })
