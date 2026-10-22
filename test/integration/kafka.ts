@@ -3,9 +3,17 @@
 // integration tests are skipped. Start a local broker with `npm run kafka -- start`.
 
 import { randomUUID } from 'node:crypto'
-import { Admin, Consumer, FetchIsolationLevels, type Message, Producer } from '@platformatic/kafka'
+import {
+  Admin,
+  Consumer,
+  FetchIsolationLevels,
+  IS_CONTROL,
+  ListOffsetTimestamps,
+  Producer,
+} from '@platformatic/kafka'
 import { describe } from 'vitest'
 import type { StateStore } from '../../src/index.js'
+import { ReadCommittedConsumer } from '../support/internals.js'
 
 export const BROKERS_ENV = 'KSTREAMS_KAFKA_BROKERS'
 
@@ -168,6 +176,12 @@ export function createKafka() {
       return offsets
     },
 
+    /** The sum of the committed offsets of `topic` for consumer group `groupId`. */
+    async consumed(groupId: string, topic: string): Promise<bigint> {
+      const committed = await this.committedOffsets(groupId, topic)
+      return [...committed.values()].reduce((sum, offset) => sum + offset, 0n)
+    },
+
     /** The members of consumer group `groupId`. */
     async groupMembers(groupId: string): Promise<number> {
       const groups = await admin.describeGroups({ groups: [groupId] })
@@ -214,12 +228,12 @@ export interface BytesRecord {
   partition: number
 }
 
-function toBytesRecord(message: Message): BytesRecord {
+function toBytesRecord(record: FetchedRecord): BytesRecord {
   return {
-    key: message.key ?? null,
-    value: message.value ?? null,
-    timestamp: Number(message.timestamp),
-    partition: message.partition,
+    key: record.key,
+    value: record.value,
+    timestamp: record.timestamp,
+    partition: record.partition,
   }
 }
 
@@ -228,83 +242,178 @@ export interface HeadersRecord extends TestRecord {
   headers: Record<string, string>
 }
 
-function toHeadersRecord(message: Message): HeadersRecord {
+function toHeadersRecord(record: FetchedRecord): HeadersRecord {
   return {
-    ...toTestRecord(message),
+    ...toTestRecord(record),
     headers: Object.fromEntries(
-      [...message.headers].map(([name, value]) => [name.toString(), value.toString()]),
+      record.headers.map(([name, value]) => [String(name ?? ''), String(value ?? '')]),
     ),
   }
 }
 
-function toTestRecord(message: Message): TestRecord {
+function toTestRecord(record: FetchedRecord): TestRecord {
   return {
-    key: message.key === undefined ? null : message.key.toString(),
-    value: message.value === undefined ? null : message.value.toString(),
-    timestamp: Number(message.timestamp),
-    partition: message.partition,
+    key: record.key === null ? null : record.key.toString(),
+    value: record.value === null ? null : record.value.toString(),
+    timestamp: record.timestamp,
+    partition: record.partition,
   }
 }
 
 function readTopic(
   topic: string,
   done: (record: TestRecord) => boolean,
-  options: { timeoutMs: number; settleMs: number; uncommitted?: boolean; startSettled?: boolean },
+  options: ReadOptions,
 ): Promise<TestRecord[]> {
   return readMessages(topic, toTestRecord, done, options)
 }
 
+/** A data record as fetched. */
+interface FetchedRecord {
+  key: Buffer | null
+  value: Buffer | null
+  headers: [Buffer | null, Buffer | null][]
+  timestamp: number
+  partition: number
+}
+
+interface ReadOptions {
+  timeoutMs: number
+  settleMs: number
+  uncommitted?: boolean
+  startSettled?: boolean
+}
+
+/** Fetch errors that new metadata (another leader, a newer leader epoch) fixes. */
+const RETRIABLE_FETCH_ERRORS = new Set([3, 6, 74, 75])
+
+/**
+ * Reads every partition of `topic` from its start, without joining a consumer group: it fetches
+ * the partitions itself, from positions it keeps. Read_committed reads go through the engine's
+ * abort-aware `ReadCommittedConsumer`, because the client's own read_committed filter can deliver
+ * aborted records and drop committed ones (platformatic/kafka#467). Calls `done` with each record
+ * until it returns true, then keeps reading for `settleMs` to catch extra (duplicate) records.
+ * Rejects after `timeoutMs` unless `done` has returned true by then.
+ */
 async function readMessages<R>(
   topic: string,
-  convert: (message: Message) => R,
+  convert: (record: FetchedRecord) => R,
   done: (record: R) => boolean,
-  {
-    timeoutMs,
-    settleMs,
-    uncommitted = false,
-    startSettled = false,
-  }: { timeoutMs: number; settleMs: number; uncommitted?: boolean; startSettled?: boolean },
+  { timeoutMs, settleMs, uncommitted = false, startSettled = false }: ReadOptions,
 ): Promise<R[]> {
-  const consumer = new Consumer({
-    clientId: uniqueName('test-consumer'),
-    groupId: uniqueName('test-group'),
+  const clientId = uniqueName('test-reader')
+  const options = {
+    clientId,
+    // Required by the client, but `fetch()` never joins the group.
+    groupId: `${clientId}-unused`,
     bootstrapBrokers: brokers,
-    autocommit: false,
-    isolationLevel: uncommitted
-      ? FetchIsolationLevels.READ_UNCOMMITTED
-      : FetchIsolationLevels.READ_COMMITTED,
-    sessionTimeout: 10_000,
-    heartbeatInterval: 1_000,
-    maxWaitTime: 100,
-  })
+  }
+  const isolationLevel = uncommitted
+    ? FetchIsolationLevels.READ_UNCOMMITTED
+    : FetchIsolationLevels.READ_COMMITTED
+  const consumer = uncommitted
+    ? new Consumer(options)
+    : new ReadCommittedConsumer({ ...options, fetchSessions: false })
   const records: R[] = []
+  const deadline = Date.now() + timeoutMs
+  let settleUntil = startSettled ? Date.now() + settleMs : undefined
   try {
-    const stream = await consumer.consume({ topics: [topic], mode: 'earliest' })
-    await new Promise<void>((resolve, reject) => {
-      let settle: NodeJS.Timeout | undefined
-      const timeout = setTimeout(
-        () => reject(new Error(`Read only ${records.length} records from "${topic}" in time`)),
-        timeoutMs,
-      )
-      if (startSettled) {
-        clearTimeout(timeout)
-        settle = setTimeout(resolve, settleMs)
-      }
-      stream.on('error', reject)
-      stream.on('data', (message: Message) => {
-        const record = convert(message)
-        records.push(record)
-        if (settle === undefined && done(record)) {
-          clearTimeout(timeout)
-          settle = setTimeout(resolve, settleMs)
-        }
-      })
+    const positions = new Map<number, bigint>()
+    const earliest = await consumer.listOffsets({
+      topics: [topic],
+      timestamp: ListOffsetTimestamps.EARLIEST,
+      isolationLevel,
     })
-    await stream.close()
+    for (const [partition, offset] of (earliest.get(topic) ?? []).entries()) {
+      positions.set(partition, offset)
+    }
+    let leaders = await partitionLeaders(consumer, topic, false)
+    while (settleUntil === undefined ? Date.now() <= deadline : Date.now() < settleUntil) {
+      let retry = false
+      for (const [node, partitions] of leaders.byNode) {
+        const response = await consumer.fetch({
+          node,
+          isolationLevel,
+          maxWaitTime: 100,
+          topics: [
+            {
+              topicId: leaders.topicId,
+              partitions: partitions.map((partition) => ({
+                partition,
+                fetchOffset: positions.get(partition) ?? 0n,
+                currentLeaderEpoch: -1,
+                lastFetchedEpoch: -1,
+                partitionMaxBytes: 1 << 20,
+              })),
+            },
+          ],
+        })
+        for (const fetched of response.responses[0]?.partitions ?? []) {
+          const partition = fetched.partitionIndex
+          if (fetched.errorCode !== 0) {
+            if (!RETRIABLE_FETCH_ERRORS.has(fetched.errorCode)) {
+              throw new Error(
+                `Fetching "${topic}" partition ${partition} failed with error code ${fetched.errorCode}`,
+              )
+            }
+            retry = true
+            continue
+          }
+          let position = positions.get(partition) ?? 0n
+          for (const batch of fetched.records ?? []) {
+            const last = batch.firstOffset + BigInt(batch.lastOffsetDelta)
+            if (last < position) continue
+            // Control batches hold markers, and aborted batches come without records.
+            if (!(batch.attributes & IS_CONTROL)) {
+              for (const record of batch.records) {
+                if (batch.firstOffset + BigInt(record.offsetDelta) < position) continue
+                const converted = convert({
+                  key: record.key ?? null,
+                  value: record.value ?? null,
+                  headers: record.headers,
+                  timestamp: Number(batch.firstTimestamp + record.timestampDelta),
+                  partition,
+                })
+                records.push(converted)
+                if (settleUntil === undefined && done(converted)) {
+                  settleUntil = Date.now() + settleMs
+                }
+              }
+            }
+            position = last + 1n
+          }
+          positions.set(partition, position)
+        }
+      }
+      if (retry) {
+        await delay(100)
+        leaders = await partitionLeaders(consumer, topic, true)
+      }
+    }
+    if (settleUntil === undefined) {
+      throw new Error(`Read only ${records.length} records from "${topic}" in time`)
+    }
   } finally {
     await consumer.close(true)
   }
   return records
+}
+
+/** The topic ID of `topic`, and its partitions by the node that leads them. */
+async function partitionLeaders(
+  consumer: Consumer,
+  topic: string,
+  forceUpdate: boolean,
+): Promise<{ topicId: string; byNode: Map<number, number[]> }> {
+  const metadata = await consumer.metadata({ topics: [topic], forceUpdate })
+  const found = metadata.topics.get(topic)
+  if (found === undefined) throw new Error(`No metadata for topic "${topic}"`)
+  const byNode = new Map<number, number[]>()
+  for (const [partition, { leader }] of found.partitions.entries()) {
+    if (leader < 0) continue
+    byNode.set(leader, [...(byNode.get(leader) ?? []), partition])
+  }
+  return { topicId: found.id, byNode }
 }
 
 export function delay(ms: number): Promise<void> {

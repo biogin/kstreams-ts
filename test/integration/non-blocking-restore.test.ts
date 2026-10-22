@@ -16,10 +16,8 @@ import {
   type StreamsApp,
   type StreamsAppConfig,
   serdes,
-  stores,
 } from '../../src/index.js'
-import { createChangelogReader } from '../../src/restore.js'
-import { keyValueStore, taskDirectory } from '../../src/state-store.js'
+import { createChangelogReader, storedEntries } from '../support/internals.js'
 import {
   brokers,
   createKafka,
@@ -198,21 +196,9 @@ describeWithKafka('Restore without blocking other Tasks (SQLite, workers: 0)', (
     const counts = await committedCounts(output)
     expect(counts.get('a')).toEqual(Array.from({ length: 21 }, (_, i) => i + 1))
     expect(counts.get('b')).toEqual(Array.from({ length: 31 }, (_, i) => i + 1))
-    const directory = taskDirectory(stateDir, applicationId, RESTORING)
-    const local = stores.sqlite()({ name: 'counts', applicationId, task: RESTORING, directory })
-    try {
-      const entries = keyValueStore(
-        local,
-        { key: serdes.string, value: serdes.number },
-        {
-          topic: 'unused',
-        },
-      ).all()
-      expect(entries.length).toBe(LARGE_STORE + 2)
-      expect(new Map(entries).get('b')).toBe(31)
-    } finally {
-      local.close()
-    }
+    const entries = storedEntries(stateDir, applicationId, RESTORING, 'counts', serdes.number)
+    expect(entries.length).toBe(LARGE_STORE + 2)
+    expect(new Map(entries).get('b')).toBe(31)
   }, 180_000)
 
   it('stops during a Restore without waiting for it, well within the shutdown timeout', async () => {

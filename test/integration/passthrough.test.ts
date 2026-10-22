@@ -79,9 +79,7 @@ describeWithKafka('pass-through Streams App on real Kafka (at-least-once, worker
     expect(states).toEqual(['created', 'running', 'stopping', 'stopped'])
 
     // The consumer group is the Application ID; every input record's offset is committed.
-    const committed = await kafka.committedOffsets(app.applicationId, input)
-    const total = [...committed.values()].reduce((sum, offset) => sum + offset, 0n)
-    expect(total).toBe(BigInt(sent.length))
+    expect(await kafka.consumed(app.applicationId, input)).toBe(BigInt(sent.length))
   })
 
   it('passes tombstones and null keys through', async () => {

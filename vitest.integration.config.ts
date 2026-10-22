@@ -11,6 +11,9 @@ export default defineConfig({
       '--import',
       new URL('./test/integration/harness/ts-resolve.ts', import.meta.url).href,
     ],
+    // One test file at a time: the files share one broker, and running them in parallel made
+    // timing-sensitive tests (session timeouts, rebalances) flaky under the load.
+    fileParallelism: false,
     testTimeout: 60_000,
     hookTimeout: 30_000,
   },

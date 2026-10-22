@@ -7,6 +7,7 @@ import {
   createKafka,
   delay,
   describeWithKafka,
+  eventually,
   type TestRecord,
   uniqueName,
 } from './kafka.js'
@@ -17,12 +18,14 @@ const countApp = new URL('./fixtures/count-app.ts', import.meta.url)
 describeWithKafka('at-least-once survives SIGKILL (Streams App in a child process)', () => {
   let kafka: ReturnType<typeof createKafka>
   const processes: AppProcess[] = []
+  const producers: { stop(): Promise<number> }[] = []
 
   beforeEach(() => {
     kafka = createKafka()
   })
 
   afterEach(async () => {
+    await Promise.allSettled(producers.splice(0).map((producer) => producer.stop()))
     await Promise.allSettled(processes.splice(0).map((app) => app.kill()))
     await kafka.close()
   })
@@ -31,7 +34,7 @@ describeWithKafka('at-least-once survives SIGKILL (Streams App in a child proces
     params: PassThroughParams,
     appModule: URL = passThroughApp,
   ): Promise<AppProcess> {
-    const app = await launchAppModule(appModule, params)
+    const app = await launchAppModule(appModule, params, { timeoutMs: 60_000 })
     processes.push(app)
     return app
   }
@@ -66,29 +69,72 @@ describeWithKafka('at-least-once survives SIGKILL (Streams App in a child proces
     ).rejects.toThrow(/exited before running/)
   })
 
+  /**
+   * Waits until this incarnation of the app is processing: it has committed input offsets since
+   * the call. A SIGKILLed Worker's partitions move to the restarted one only once its session
+   * times out, so a fixed wait could kill the app before it got any partition.
+   */
+  async function processing(applicationId: string, input: string, app: AppProcess, kill: number) {
+    const before = await kafka.consumed(applicationId, input)
+    await eventually(async () => (await kafka.consumed(applicationId, input)) > before, {
+      timeoutMs: 60_000,
+      message: `progress before kill ${kill + 1}; app output:\n${app.log()}`,
+    })
+  }
+
+  /**
+   * Produces at least `minimum` records to `input`, in chunks of 100, and goes on until `stop()`,
+   * so that every kill lands mid-stream however long the restarts take. Resolves `stop()` with
+   * the number of records sent.
+   */
+  function keepProducing(input: string, minimum: number) {
+    let killing = true
+    let sent = 0
+    const producing = (async () => {
+      while (killing || sent < minimum) {
+        await kafka.produce(input, records(100, sent))
+        sent += 100
+        await delay(40)
+      }
+    })()
+    const producer = {
+      async stop(): Promise<number> {
+        killing = false
+        await producing
+        return sent
+      },
+    }
+    producers.push(producer)
+    return producer
+  }
+
+  /** Waits until the app has committed the offsets of all `total` input records. */
+  async function consumedAll(applicationId: string, input: string, total: number, app: AppProcess) {
+    await eventually(async () => (await kafka.consumed(applicationId, input)) >= BigInt(total), {
+      timeoutMs: 90_000,
+      message: `every input record to be consumed; app output:\n${app.log()}`,
+    })
+  }
+
   it('loses no record when the Worker is SIGKILLed mid-stream and restarted', async () => {
     const input = await kafka.createTopic('input', 3)
     const output = await kafka.createTopic('output', 3)
     const params = { applicationId: uniqueName('sigkill'), brokers, input, output }
-    const total = 3_000
     const kills = 3
 
     // Keep producing while the app is killed and restarted, so every kill lands mid-stream.
-    const producing = (async () => {
-      for (let from = 0; from < total; from += 100) {
-        await kafka.produce(input, records(100, from))
-        await delay(40)
-      }
-    })()
+    const producer = keepProducing(input, 3_000)
 
     let app = await launch(params)
     for (let kill = 0; kill < kills; kill++) {
-      await delay(randomBetween(200, 1_000))
+      await processing(params.applicationId, input, app, kill)
+      await delay(randomBetween(0, 600))
       const exit = await app.kill()
       expect(exit.signal).toBe('SIGKILL')
       app = await launch(params)
     }
-    await producing
+    const total = await producer.stop()
+    await consumedAll(params.applicationId, input, total, app)
 
     // Duplicates are allowed under at-least-once; nothing may be missing.
     const missing = new Set(records(total).map((record) => record.value))
@@ -116,24 +162,20 @@ describeWithKafka('at-least-once survives SIGKILL (Streams App in a child proces
     kafka.deleteOnClose(`${applicationId}-counts-changelog`)
     const commitMaxRecords = 100
     const params: CountParams = { applicationId, brokers, input, output, commitMaxRecords }
-    const total = 3_000
     const kills = 3
 
-    const producing = (async () => {
-      for (let from = 0; from < total; from += 100) {
-        await kafka.produce(input, records(100, from))
-        await delay(40)
-      }
-    })()
+    const producer = keepProducing(input, 3_000)
 
     let app = await launch(params, countApp)
     for (let kill = 0; kill < kills; kill++) {
-      await delay(randomBetween(500, 1_500))
+      await processing(applicationId, input, app, kill)
+      await delay(randomBetween(0, 600))
       const exit = await app.kill()
       expect(exit.signal).toBe('SIGKILL')
       app = await launch(params, countApp)
     }
-    await producing
+    const total = await producer.stop()
+    await consumedAll(applicationId, input, total, app)
 
     const expected = new Map<string, number>()
     for (const { key } of records(total))

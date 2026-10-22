@@ -13,8 +13,7 @@ import {
   serdes,
   stores,
 } from '../../src/index.js'
-import { createChangelogReader } from '../../src/restore.js'
-import { keyValueStore, taskDirectory } from '../../src/state-store.js'
+import { readCommitted as readCommittedRecords, storedEntries } from '../support/internals.js'
 import {
   brokers,
   createKafka,
@@ -81,50 +80,25 @@ describeWithKafka('revoke and graceful shutdown (workers: 0)', () => {
   }
 
   /** Every committed record of `topic` (read_committed, aborted transactions skipped). */
-  async function readCommitted(
-    topic: string,
-    partitions: number,
-  ): Promise<{ key: string; value: string | null }[]> {
-    const reader = createChangelogReader({ brokers, clientId: uniqueName('test-reader') })
-    const records: { key: string; value: string | null }[] = []
-    try {
-      for (let partition = 0; partition < partitions; partition++) {
-        await reader.read(topic, partition, (chunk) => {
-          for (const { key, value } of chunk) {
-            records.push({
-              key: Buffer.from(key ?? new Uint8Array()).toString(),
-              value: value === null ? null : Buffer.from(value).toString(),
-            })
-          }
-        })
-      }
-    } finally {
-      await reader.close()
-    }
-    return records
+  function readCommitted(topic: string, partitions: number) {
+    return readCommittedRecords(brokers, uniqueName('test-reader'), topic, partitions)
   }
 
   /** The counts in the SQLite stores of `tasks`, as the app left them on disk. */
   function storedCounts(stateDir: string, applicationId: string, tasks: number) {
     const counts = new Map<string, number>()
-    const countSerdes = { key: serdes.string, value: serdes.number }
     for (let task = 0; task < tasks; task++) {
-      const directory = taskDirectory(stateDir, applicationId, task)
-      const store = stores.sqlite()({ name: 'counts', applicationId, task, directory })
-      try {
-        const entries = keyValueStore(store, countSerdes, { topic: 'counts' }).all()
-        for (const [key, count] of entries) counts.set(key, count)
-      } finally {
-        store.close()
+      for (const [key, count] of storedEntries(
+        stateDir,
+        applicationId,
+        task,
+        'counts',
+        serdes.number,
+      )) {
+        counts.set(key, count)
       }
     }
     return counts
-  }
-
-  /** The sum of the committed offsets of `input` for the Application ID. */
-  async function consumed(applicationId: string, input: string): Promise<bigint> {
-    const committed = await kafka.committedOffsets(applicationId, input)
-    return [...committed.values()].reduce((sum, offset) => sum + offset, 0n)
   }
 
   /** Whether some partition of `topic` has an open transaction (its LSO is behind its end). */
@@ -196,7 +170,7 @@ describeWithKafka('revoke and graceful shutdown (workers: 0)', () => {
     await app.start()
     const producer = keepProducing(input, 9)
     try {
-      await eventually(async () => (await consumed(applicationId, input)) > 0n, {
+      await eventually(async () => (await kafka.consumed(applicationId, input)) > 0n, {
         timeoutMs: 30_000,
         message: 'the first batch to commit',
       })
@@ -224,8 +198,8 @@ describeWithKafka('revoke and graceful shutdown (workers: 0)', () => {
         message: 'the intruder to own a partition',
       })
       // The app keeps committing its remaining Tasks.
-      let before = await consumed(applicationId, input)
-      await eventually(async () => (await consumed(applicationId, input)) > before, {
+      let before = await kafka.consumed(applicationId, input)
+      await eventually(async () => (await kafka.consumed(applicationId, input)) > before, {
         timeoutMs: 30_000,
         message: 'progress while the intruder owns some partitions',
       })
@@ -234,8 +208,8 @@ describeWithKafka('revoke and graceful shutdown (workers: 0)', () => {
       // The intruder leaves: its partitions come back to the app (new Tasks, restored).
       await stream.close()
       await intruder.close()
-      before = await consumed(applicationId, input)
-      await eventually(async () => (await consumed(applicationId, input)) > before + 50n, {
+      before = await kafka.consumed(applicationId, input)
+      await eventually(async () => (await kafka.consumed(applicationId, input)) > before + 50n, {
         timeoutMs: 30_000,
         message: 'progress after the intruder left',
       })
@@ -243,7 +217,7 @@ describeWithKafka('revoke and graceful shutdown (workers: 0)', () => {
       await producer.stop()
     }
     const total = BigInt(producer.sent.length)
-    await eventually(async () => (await consumed(applicationId, input)) === total, {
+    await eventually(async () => (await kafka.consumed(applicationId, input)) === total, {
       timeoutMs: 60_000,
       message: 'every input record to be consumed',
     })
@@ -282,21 +256,21 @@ describeWithKafka('revoke and graceful shutdown (workers: 0)', () => {
     await a.start()
     const producer = keepProducing(input, 9)
     try {
-      await eventually(async () => (await consumed(applicationId, input)) > 50n, {
+      await eventually(async () => (await kafka.consumed(applicationId, input)) > 50n, {
         timeoutMs: 30_000,
         message: 'progress of the first instance',
       })
       // A second instance takes some Tasks, processes them, then hands them back on stop.
       const b = countApp({ ...options, stateDir: stateDirectory() })
       await b.start()
-      let before = await consumed(applicationId, input)
-      await eventually(async () => (await consumed(applicationId, input)) > before + 100n, {
+      let before = await kafka.consumed(applicationId, input)
+      await eventually(async () => (await kafka.consumed(applicationId, input)) > before + 100n, {
         timeoutMs: 30_000,
         message: 'progress with two instances',
       })
       await b.stop()
-      before = await consumed(applicationId, input)
-      await eventually(async () => (await consumed(applicationId, input)) > before + 100n, {
+      before = await kafka.consumed(applicationId, input)
+      await eventually(async () => (await kafka.consumed(applicationId, input)) > before + 100n, {
         timeoutMs: 30_000,
         message: 'progress after the second instance stopped',
       })
@@ -304,7 +278,7 @@ describeWithKafka('revoke and graceful shutdown (workers: 0)', () => {
       await producer.stop()
     }
     const total = BigInt(producer.sent.length)
-    await eventually(async () => (await consumed(applicationId, input)) === total, {
+    await eventually(async () => (await kafka.consumed(applicationId, input)) === total, {
       timeoutMs: 60_000,
       message: 'every input record to be consumed',
     })
@@ -344,7 +318,7 @@ describeWithKafka('revoke and graceful shutdown (workers: 0)', () => {
     await kafka.produce(input, sent)
     // Processed into the open transaction, not committed: the batch lasts two minutes.
     await kafka.consume(output, sent.length, { uncommitted: true, timeoutMs: 30_000, settleMs: 0 })
-    expect(await consumed(applicationId, input)).toBe(0n)
+    expect(await kafka.consumed(applicationId, input)).toBe(0n)
 
     const started = Date.now()
     await app.stop()
@@ -352,7 +326,7 @@ describeWithKafka('revoke and graceful shutdown (workers: 0)', () => {
     expect(app.state).toBe('stopped')
 
     expect(await readCommitted(output, 1)).toHaveLength(sent.length)
-    expect(await consumed(applicationId, input)).toBe(BigInt(sent.length))
+    expect(await kafka.consumed(applicationId, input)).toBe(BigInt(sent.length))
     expect(storedCounts(stateDir, applicationId, 1)).toEqual(
       new Map([0, 1, 2, 3].map((k) => [`key-${k}`, 5])),
     )
@@ -426,6 +400,6 @@ describeWithKafka('revoke and graceful shutdown (workers: 0)', () => {
     await kafka.consume(output, 5, { uncommitted: true, timeoutMs: 30_000, settleMs: 0 })
     await restarted.stop()
     expect((await readCommitted(output, 1)).map(({ value }) => value)).toEqual(['a', 'b', 'hang'])
-    expect(await consumed(applicationId, input)).toBe(3n)
+    expect(await kafka.consumed(applicationId, input)).toBe(3n)
   }, 120_000)
 })

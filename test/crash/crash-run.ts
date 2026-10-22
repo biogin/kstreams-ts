@@ -3,9 +3,7 @@
 // stores with a reference computed from the input. Used by crash.test.ts (one App Process,
 // killed and restarted) and rebalance.test.ts (several App Processes coming and going).
 
-import { type Serde, serdes, stores } from '../../src/index.js'
-import { type ChangelogRecord, createChangelogReader } from '../../src/restore.js'
-import { keyValueStore, taskDirectory } from '../../src/state-store.js'
+import { serdes } from '../../src/index.js'
 import type { AppProcess } from '../integration/harness/app-process.js'
 import {
   brokers,
@@ -14,6 +12,7 @@ import {
   type TestRecord,
   uniqueName,
 } from '../integration/kafka.js'
+import { type ChangelogRecord, createChangelogReader, storedEntries } from '../support/internals.js'
 import { nextChain } from './crash-app.js'
 import { layoutAround, readPartitionLog } from './log-reader.js'
 
@@ -313,23 +312,6 @@ async function readCommitted(
     await restoreReader.close()
   }
   return records
-}
-
-/** The entries of the SQLite store `name` of a Task, as the app left it on disk. */
-function storedEntries<V>(
-  stateDir: string,
-  applicationId: string,
-  task: number,
-  name: string,
-  value: Serde<V>,
-): [string, V][] {
-  const directory = taskDirectory(stateDir, applicationId, task)
-  const store = stores.sqlite()({ name, applicationId, task, directory })
-  try {
-    return keyValueStore(store, { key: serdes.string, value }, { topic: name }).all()
-  } finally {
-    store.close()
-  }
 }
 
 /**

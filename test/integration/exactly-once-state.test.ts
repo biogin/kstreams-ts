@@ -2,10 +2,13 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it } from 'vitest'
-import { readCheckpoint } from '../../src/checkpoint.js'
-import { createStreamsApp, type Serde, type StreamsApp, serdes, stores } from '../../src/index.js'
-import { createChangelogReader } from '../../src/restore.js'
-import { keyValueStore, taskDirectory } from '../../src/state-store.js'
+import { createStreamsApp, type StreamsApp, serdes, stores } from '../../src/index.js'
+import {
+  readCheckpoint,
+  readCommitted as readCommittedRecords,
+  storedEntries,
+  taskDirectory,
+} from '../support/internals.js'
 import type { CountParams } from './fixtures/count-app.js'
 import { type AppProcess, launchAppModule, randomBetween } from './harness/app-process.js'
 import {
@@ -47,45 +50,8 @@ describeWithKafka('exactly-once with State Stores (SQLite, workers: 0)', () => {
   }
 
   /** Every committed record of `topic` (read_committed, aborted transactions skipped). */
-  async function readCommitted(
-    topic: string,
-    partitions: number,
-  ): Promise<{ key: string; value: string | null; partition: number }[]> {
-    const reader = createChangelogReader({ brokers, clientId: uniqueName('test-reader') })
-    const records: { key: string; value: string | null; partition: number }[] = []
-    try {
-      for (let partition = 0; partition < partitions; partition++) {
-        await reader.read(topic, partition, (chunk) => {
-          for (const { key, value } of chunk) {
-            records.push({
-              key: Buffer.from(key ?? new Uint8Array()).toString(),
-              value: value === null ? null : Buffer.from(value).toString(),
-              partition,
-            })
-          }
-        })
-      }
-    } finally {
-      await reader.close()
-    }
-    return records
-  }
-
-  /** The entries of the SQLite store `name` of a Task, as the app left it on disk. */
-  function storedEntries<V>(
-    stateDir: string,
-    applicationId: string,
-    task: number,
-    name: string,
-    value: Serde<V>,
-  ): [string, V][] {
-    const directory = taskDirectory(stateDir, applicationId, task)
-    const store = stores.sqlite()({ name, applicationId, task, directory })
-    try {
-      return keyValueStore(store, { key: serdes.string, value }, { topic: name }).all()
-    } finally {
-      store.close()
-    }
+  function readCommitted(topic: string, partitions: number) {
+    return readCommittedRecords(brokers, uniqueName('test-reader'), topic, partitions)
   }
 
   it('a Kafka abort rolls back the SQLite transaction; the Checkpoint stays usable', async () => {
@@ -186,10 +152,7 @@ describeWithKafka('exactly-once with State Stores (SQLite, workers: 0)', () => {
       }
     })()
 
-    const consumed = async () => {
-      const committed = await kafka.committedOffsets(applicationId, input)
-      return [...committed.values()].reduce((sum, offset) => sum + offset, 0n)
-    }
+    const consumed = () => kafka.consumed(applicationId, input)
     const launch = async () => {
       const app = await launchAppModule(countApp, params, { timeoutMs: 60_000 })
       processes.push(app)
