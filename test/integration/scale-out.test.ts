@@ -5,7 +5,9 @@
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { type Consumer, type Message, Producer } from '@platformatic/kafka'
 import { afterEach, beforeEach, expect, it } from 'vitest'
+import { createStreamsApp, serdes } from '../../src/index.js'
 import type { WorkersCountParams } from './fixtures/workers-count-app.js'
 import { type AppProcess, launchAppModule } from './harness/app-process.js'
 import {
@@ -216,4 +218,57 @@ describeWithKafka('scale out across App Processes (exactly-once, 2 Workers each)
     await expectExactCounts(output, total)
     expect(await a.stop()).toEqual({ code: 0, signal: null })
   }, 240_000)
+
+  it("a new owner waits for the previous owner's transaction and starts from its offset", async () => {
+    const input = await kafka.createTopic('stable-input', 1)
+    const output = await kafka.createTopic('stable-output', 1)
+    const applicationId = uniqueName('stable-offsets')
+    await kafka.produce(input, records(10, 0, Date.now()))
+
+    // The previous owner of the Task: its transaction commits the offset after record 5 (6), and
+    // is still open when the app takes the Task over.
+    const previous = new Producer({
+      clientId: uniqueName('previous-owner'),
+      bootstrapBrokers: brokers,
+      idempotent: true,
+      transactionalId: uniqueName('previous-owner'),
+      producerId: -1n,
+      producerEpoch: -1,
+      timeout: 60_000,
+    })
+    const app = createStreamsApp({
+      applicationId,
+      brokers,
+      guarantee: 'exactly-once',
+      sessionTimeoutMs: 6_000,
+    })
+    app.stream(input, { key: serdes.string, value: serdes.string }).to(output)
+    try {
+      const transaction = await previous.beginTransaction()
+      await transaction.addConsumer({ groupId: applicationId } as Consumer)
+      const metadata = await kafka.admin.metadata({ topics: [input] })
+      const [coordinatorId] = [...metadata.brokers.keys()]
+      await transaction.addOffset({
+        topic: input,
+        partition: 0,
+        offset: 5n,
+        metadata: {
+          consumer: { groupId: applicationId, memberId: '', generationId: -1, coordinatorId },
+        },
+      } as unknown as Message)
+
+      await app.start()
+      await balanced(applicationId, input, 1, 1)
+      // The client read the committed offset without `requireStable`, so it starts the Task from
+      // the beginning; the Worker must not process records 0..5 nonetheless.
+      await transaction.commit()
+      const received = await kafka.consume(output, 4, { timeoutMs: 30_000, settleMs: 2_000 })
+      expect(received.map(({ value }) => value)).toEqual(
+        Array.from({ length: 4 }, (_, i) => `value-${6 + i}`),
+      )
+    } finally {
+      await previous.close(true)
+      await app.stop()
+    }
+  }, 120_000)
 })
