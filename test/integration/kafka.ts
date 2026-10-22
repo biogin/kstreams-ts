@@ -63,11 +63,14 @@ export function createKafka() {
       configs: Record<string, string> = {},
     ): Promise<string> {
       const topic = uniqueName(prefix)
+      // Test records carry fixed timestamps from 2023, so the broker's time-based retention
+      // (checked every 5 minutes) would delete them mid-test: keep them for good.
+      const all = { 'retention.ms': '-1', ...configs }
       await admin.createTopics({
         topics: [topic],
         partitions,
         replicas: 1,
-        configs: Object.entries(configs).map(([name, value]) => ({ name, value })),
+        configs: Object.entries(all).map(([name, value]) => ({ name, value })),
       })
       topics.push(topic)
       for (let attempt = 0; ; attempt++) {
@@ -208,10 +211,15 @@ export function createKafka() {
       return { state: String(group?.state ?? '').toUpperCase(), assigned }
     },
 
-    /** Deletes the topics this helper created and closes its clients. */
+    /**
+     * Deletes the topics this helper created (unless KSTREAMS_KEEP_TOPICS is set, to inspect them
+     * after a failure) and closes its clients.
+     */
     async close(): Promise<void> {
       try {
-        if (topics.length > 0) await admin.deleteTopics({ topics })
+        if (topics.length > 0 && !process.env.KSTREAMS_KEEP_TOPICS) {
+          await admin.deleteTopics({ topics })
+        }
       } finally {
         await producer.close()
         await admin.close()
@@ -391,7 +399,18 @@ async function readMessages<R>(
       }
     }
     if (settleUntil === undefined) {
-      throw new Error(`Read only ${records.length} records from "${topic}" in time`)
+      // Tells a stalled read (positions short of the end) from records missing on the topic.
+      const latest = await consumer.listOffsets({
+        topics: [topic],
+        timestamp: ListOffsetTimestamps.LATEST,
+        isolationLevel,
+      })
+      const ends = (latest.get(topic) ?? []).map(
+        (end, partition) => `${partition}: ${positions.get(partition) ?? 0n}/${end}`,
+      )
+      throw new Error(
+        `Read only ${records.length} records from "${topic}" in time (position/end ${ends.join(', ')})`,
+      )
     }
   } finally {
     await consumer.close(true)

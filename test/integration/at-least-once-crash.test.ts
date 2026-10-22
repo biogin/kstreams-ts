@@ -194,7 +194,9 @@ describeWithKafka('at-least-once survives SIGKILL (Streams App in a child proces
         { timeoutMs: 60_000 },
       )
       .catch((error: Error) => {
-        throw new Error(`${error.message}; counts ${JSON.stringify([...counted])}`)
+        throw new Error(
+          `${error.message}; ${total} input records; counts ${JSON.stringify([...counted])}; expected ${JSON.stringify([...expected])}`,
+        )
       })
 
     // The precise at-least-once assertion. No count is lost: every key's count reaches its number
