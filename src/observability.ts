@@ -74,10 +74,10 @@ export interface RestoreStartEvent {
   task: number
   /** The State Store's name. */
   store: string
-  /** True when the store was wiped and its whole Changelog is replayed (no usable Checkpoint). */
+  /** True when the store was wiped and restored from its whole Changelog (no usable Checkpoint). */
   full: boolean
   /**
-   * The Changelog offsets left to replay. Transaction markers and aborted records take offsets
+   * The Changelog offsets left to restore from. Transaction markers and aborted records take offsets
    * too, so fewer records may be left.
    */
   remaining: number
@@ -90,7 +90,7 @@ export interface RestoreProgressEvent {
   store: string
   /** The records applied to the store so far. */
   restored: number
-  /** The Changelog offsets left to replay (see {@link RestoreStartEvent.remaining}). */
+  /** The Changelog offsets left to restore from (see {@link RestoreStartEvent.remaining}). */
   remaining: number
 }
 

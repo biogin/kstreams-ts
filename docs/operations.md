@@ -2,7 +2,7 @@
 
 ## Broker version support
 
-- **Minimum: Apache Kafka 3.6**, using the classic consumer group protocol. The new KIP-848 consumer protocol is not used.
+- **Minimum: Apache Kafka 3.6**, using the classic consumer group protocol. The new KIP-848 consumer group protocol is not supported yet, on Kafka 4.x either; the classic protocol works there.
 - **Tested on Kafka 3.9 and 4.x** (single-node KRaft brokers) in CI: the integration suite runs against both, and the crash suite against the latest 4.x.
 - Exactly-once needs a broker with transaction support (KIP-447, the transactional offset commit with group metadata), which 3.6 has. With fewer than three brokers lower `transaction.state.log.replication.factor` and `transaction.state.log.min.isr`, and use `changelogReplicationFactor: 1`.
 
@@ -20,7 +20,7 @@ Rules:
 - Processes that share one host may share a state directory; they take different App Process IDs and lock Tasks. Stale locks of dead processes are taken over.
 - **Do not copy, restore from a backup, or edit** a state directory by hand. A store whose Checkpoint is missing or unclean is wiped and fully restored, which is safe, but you gain nothing from copies; the Changelog is the source of truth and the only backup you need.
 - Size disks for the SQLite files of the Tasks a process may own, including after a rebalance when it takes over Tasks from a failed process.
-- Without a `stateDir`, state is in memory: every start is a full Restore and each start gets a new App Process ID.
+- Without a `stateDir`, State Stores are in memory: every start is a full Restore, and each start gets a new, random App Process ID, so a crashed process's open transactions are only aborted by their timeout and the new owners of its Tasks wait for that.
 
 ## Disposable disks
 

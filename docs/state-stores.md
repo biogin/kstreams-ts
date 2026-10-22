@@ -8,7 +8,7 @@ Every write to a State Store is also written to its **Changelog**, a compacted K
 
 When a Task starts on a Worker (after a restart, a rebalance, or a disk loss) its stores are rebuilt by **Restore**:
 
-- A persistent store (SQLite in a `stateDir`) keeps a **Checkpoint**, the Changelog offset it has applied up to. Restore replays only what comes after it ([ADR-0009](./adr/0009-local-state-checkpoints-and-restore.md)).
+- A persistent store (SQLite in a `stateDir`) keeps a **Checkpoint**, the Changelog offset it has applied up to. Restore applies only what comes after it ([ADR-0009](./adr/0009-local-state-checkpoints-and-restore.md)).
 - If the Checkpoint is missing or unclean (a crash mid-batch, a copied directory), the store is wiped and fully restored, so corrupt local state never leaks into results.
 - A store without a persistent directory (no `stateDir`, or `stores.inMemory()`) is fully restored on every start.
 

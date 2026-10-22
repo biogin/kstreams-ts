@@ -31,7 +31,7 @@ Add listeners with `app.on(event, listener)` and remove them with `app.off`. The
 | `state` | `{ state, previous }` | The Application State changed. |
 | `error` | `{ error }` | The app stopped because of this error (the root cause, emitted once). `stop()` rejects with the same error. |
 | `rebalance` | `{ worker, assigned, revoked }` | A Worker took part in a completed rebalance round. A cooperative rebalance that moves Tasks has two rounds: the giver sees them revoked in the first, the taker sees them assigned in the second. |
-| `restore-start` | `{ worker, task, store, full, remaining }` | A Task began restoring a store. `full` is true when the store was wiped and the whole Changelog is replayed. |
+| `restore-start` | `{ worker, task, store, full, remaining }` | A Task began restoring a store. `full` is true when the store was wiped and it is restored from the whole Changelog. |
 | `restore-progress` | `{ worker, task, store, restored, remaining }` | Another chunk of the Changelog was applied. |
 | `restore-end` | `{ worker, task, store, restored, durationMs, cancelled }` | A Restore finished, or was cancelled because the Task moved or the app is stopping (the store is then incomplete). |
 

@@ -1,6 +1,6 @@
 // Internal: Restore, rebuilding a Task's State Stores from their Changelogs before the Task
-// processes records (ADR-0009). A store with a usable Checkpoint replays only the committed
-// Changelog records after it; any other store is wiped and every committed record replayed (a full
+// processes records (ADR-0009). A store with a usable Checkpoint applies only the committed
+// Changelog records after it; any other store is wiped and every committed record applied (a full
 // Restore). See checkpoint.ts for when a Checkpoint is usable.
 //
 // Changelogs are read by a restore consumer outside the consumer group, with the low-level
@@ -59,7 +59,7 @@ export interface ReadObserver {
 export interface RestoreListener {
   /** A read of a Changelog waited `ms` for the transactions open on it to end. */
   waited(ms: number): void
-  /** The Restore of store `store` begins, with `remaining` Changelog offsets to replay. */
+  /** The Restore of store `store` begins, with `remaining` Changelog offsets to restore from. */
   started(store: string, full: boolean, remaining: number): void
   /** The Restore of `store` has applied `restored` records, and has `remaining` offsets left. */
   progressed(store: string, restored: number, remaining: number): void
@@ -80,8 +80,8 @@ export interface RestoringStore {
 
 /**
  * Restores each store from the Task's partition of its Changelog. A store with a Checkpoint
- * replays the Changelog after it; others (and one whose Checkpoint is outside the Changelog) are
- * wiped, then replay all of it. Keys are decoded with the key Serde and re-encoded as store keys
+ * applies the Changelog after it; others (and one whose Checkpoint is outside the Changelog) are
+ * wiped, then apply all of it. Keys are decoded with the key Serde and re-encoded as store keys
  * (ADR-0015); Tombstones delete. Each chunk is applied in one store transaction. Resolves to the
  * Changelog offset each store has applied up to, by store name.
  *

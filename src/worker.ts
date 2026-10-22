@@ -1218,8 +1218,8 @@ type ProducedOffsets = ReadonlyMap<number, ChangelogOffsets>
 interface CommitResult {
   /**
    * The offset after the last output in each partition that outputs given an explicit partition
-   * (the Changelog records) went to. An offset may be lower than that, never higher: replaying a
-   * Changelog from too early is harmless.
+   * (the Changelog records) went to. An offset may be lower than that, never higher: restoring from
+   * a Changelog offset too early is harmless.
    */
   produced: ProducedOffsets
   /** False if the outputs committed but the offsets didn't, because of a rebalance. */

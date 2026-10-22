@@ -4,7 +4,7 @@ A **Delivery Guarantee** is the processing contract an application runs under. S
 
 ## At-least-once (the default)
 
-Each Worker collects input into batches (every `commitIntervalMs`, or `commitMaxRecords` records), processes them, produces the outputs, and then commits the consumed offsets. After a crash, records since the last commit are processed again, so **outputs can be duplicated**, and an aggregation can count such a record twice. It has lower latency and overhead than exactly-once, and uses the same engine.
+Each Worker collects input into batches (every `commitIntervalMs`, or `commitMaxRecords` records), processes them, produces the outputs, and then commits the consumed offsets. After a crash, records since the last commit are processed again, so **outputs can be duplicated**, and an aggregation can count such a record twice. The same goes for a rebalance: when a Task is taken away mid-batch, the Worker still commits the batch's outputs and the offsets of the partitions it keeps, but not those of the lost partitions, so their uncommitted work is redone by the new owner. It has lower latency and overhead than exactly-once, and uses the same engine.
 
 ## Exactly-once
 

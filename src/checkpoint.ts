@@ -1,5 +1,5 @@
 // Internal: Checkpoints, the Changelog offsets a Task's persistent State Stores have applied up
-// to, kept in the Task's state directory so that Restore replays only what comes after them
+// to, kept in the Task's state directory so that Restore applies only what comes after them
 // (ADR-0009).
 //
 // A Task's Checkpoint is one file, `<stateDir>/<applicationId>/<task>/.checkpoint`:
@@ -23,9 +23,9 @@
 //
 // Under exactly-once a store transaction commits only after the Kafka transaction holding its
 // Changelog records (ADR-0002), so its commit doesn't make the store unclean: the store is then
-// its Changelog up to some offset at or after the Checkpoint, and replaying the Changelog records
+// its Changelog up to some offset at or after the Checkpoint, and applying the Changelog records
 // after the Checkpoint again is harmless (each one sets a key's value). A crash between the Kafka
-// commit and the Checkpoint then only replays that batch; an aborted batch's store transaction is
+// commit and the Checkpoint then only applies that batch again; an aborted batch's store transaction is
 // rolled back, and its Changelog records are skipped by `read_committed` readers.
 
 import {
