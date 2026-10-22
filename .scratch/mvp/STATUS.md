@@ -4,25 +4,20 @@ Integration branch: `mvp`. Plan (2026-10-21): finish ALL remaining tickets befor
 
 ## Merged (27 of 30)
 
-01–18, 21–24, 27–30, plus the aborted-transaction filter fix. Remaining: 19, 20, 25, 26. `mvp` passes typecheck, lint, 277 unit tests, the integration suite (36 tests) and the crash suite (`npm run test:crash`, at defaults and on the two seeds that once failed).
+01–18, 21–24, 27–30, plus the aborted-transaction filter fix. Remaining: 19, 20, 25, 26. `mvp` passes typecheck, lint, 319 unit tests, the integration suite (55 tests) and the crash suite (`npm run test:crash`).
 
 ## Remaining, in order
 
-1. **24** Internal Topic checks (in progress)
-2. **18** Worker threads (App Module, ADR-0013); in parallel later **30** window retention on Kafka and **23** error handlers
-3. **29** Scale out across processes (see its notes: per-process transactional ID, stable committed offsets for new owners, ownership logic under cooperative-sticky)
-4. **19** Restore without blocking other Tasks
-5. **20** Crash suite covers rebalances
-6. **25** Observability
-7. **26** 0.1 release prep (no publishing without the user)
-8. Code review of `mvp` (`/code-review`), one fix agent, worktree cleanup
+1. **19** Restore without blocking other Tasks (in progress)
+2. **20** Crash suite covers rebalances and **25** Observability
+3. **26** 0.1 release prep (no publishing without the user)
+4. Code review of `mvp` (`/code-review`), one fix agent, worktree cleanup
 
 ## Open items for the code review / fix pass
 
 - **Flaky integration tests** under broker load: `at-least-once-crash.test.ts` (once read 0 records), `passthrough.test.ts` "leaves the group on stop and resumes from the committed offsets on restart" (timeout), plus unnamed one-off timeouts. Make waits condition-based and robust.
 - **Client internals:** `src/read-committed.ts` (`ReadCommittedConsumer`) hooks `kGetApi` and relies on the Fetch API's argument order (isolationLevel is argument 4). Re-check on every `@platformatic/kafka` upgrade.
 - Leftover `crash-input-*` topics from diagnosis runs may still be on the local broker (`npm run kafka -- reset` clears everything).
-
 - **Zombie timer writes (from ticket 29):** a zombie Worker whose open transaction holds only timer-driven Changelog writes could still commit them after the new owner has restored. Rare; needs a fix or a documented limitation.
 
 ## Fixed
