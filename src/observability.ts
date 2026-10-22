@@ -164,8 +164,8 @@ interface TaskLabels extends WorkerLabels {
 export type Metric =
   /**
    * Input records a Task finished with: processed, or skipped by an error handler. A Worker counts
-   * them once their batch has committed; under exactly-once a batch that aborts is processed again
-   * and counted again.
+   * them once their batch has committed; the records of a batch that aborts (exactly-once) are
+   * counted when they are processed again.
    */
   | { name: 'records-processed'; type: 'counter'; value: number; labels: TaskLabels }
   /**
