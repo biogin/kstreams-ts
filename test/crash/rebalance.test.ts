@@ -13,7 +13,7 @@
 // gracefully; the input ends with one record per partition, so the survivor opens every Task;
 // once all input is consumed it stops, and the stores in its state directory must be exact.
 //
-// Scenarios (one iteration each by default):
+// Scenarios (two iterations each by default):
 //   scale-up        processes join one by one (own directory, then a shared one)
 //   scale-down      a process killed for good in a shared directory (its Tasks and `.lock` files
 //                   move to a process there), then one stopped gracefully
@@ -30,7 +30,7 @@
 // Run with `KSTREAMS_KAFKA_BROKERS=localhost:9092 npm run test:crash`. Settings (environment):
 //   KSTREAMS_CRASH_SCENARIOS             comma-separated scenarios to run (default all, with
 //                                        crash.test.ts's `kill`)
-//   KSTREAMS_CRASH_REBALANCE_ITERATIONS  iterations per scenario (default 1)
+//   KSTREAMS_CRASH_REBALANCE_ITERATIONS  iterations per scenario (default 2)
 //   KSTREAMS_CRASH_SEED                  base seed; iteration i of each scenario uses seed + i
 //                                        (default: random)
 // A failure names its scenario and seed; rerun it alone with KSTREAMS_CRASH_SCENARIOS=<scenario>
@@ -67,7 +67,7 @@ import {
 const crashApp = new URL('./crash-app.ts', import.meta.url)
 const crashWorkersApp = new URL('./crash-workers-app.ts', import.meta.url)
 
-const iterations = setting('KSTREAMS_CRASH_REBALANCE_ITERATIONS', 1)
+const iterations = setting('KSTREAMS_CRASH_REBALANCE_ITERATIONS', 2)
 
 interface Plan {
   partitions: number
@@ -179,12 +179,17 @@ class Cluster {
     this.#members.delete(name)
     const exit = await member.app.stop()
     if (exit.code !== 0 || exit.signal !== null) {
-      const log = member.app.log()
-      const error = log.split('\n').find((line) => /^\w*Error\b/.test(line)) ?? 'no error printed'
+      // Its output without stack frames, which is enough to tell what failed.
+      const output = member.app
+        .log()
+        .split('\n')
+        .filter((line) => line.trim() !== '' && !/^\s+at /.test(line))
+        .slice(0, 30)
+        .join('\n')
       this.note(`${name} did not stop cleanly`)
       this.stopFailures.push(
         `App Process ${name} did not stop cleanly when stopped gracefully ` +
-          `(${JSON.stringify(exit)}): ${error}${log.includes("Unhandled 'error' event") ? " (unhandled 'error' event)" : ''}`,
+          `(${JSON.stringify(exit)}). Its output:\n${output}`,
       )
     }
   }
