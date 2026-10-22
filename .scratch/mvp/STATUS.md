@@ -4,13 +4,12 @@ Integration branch: `mvp`. Plan (2026-10-21): finish ALL remaining tickets befor
 
 ## Merged (30 of 30)
 
-01–18, 21–24, 27–30, plus the aborted-transaction filter fix. Remaining: 20, 25, 26. (19 merged.) `mvp` passes typecheck, lint, 319 unit tests, the integration suite (55 tests) and the crash suite (`npm run test:crash`).
+All 30 tickets (01–30), plus three fixes: aborted-transaction filter, root-cause error reporting, fetch sessions for the restore consumer. `mvp` passes typecheck, lint, 341 unit tests, the integration suite (63 tests; see the scale-out item below) and the crash suite incl. rebalance scenarios.
 
 ## Remaining
 
-1. Fix in progress: INVALID_FETCH_SESSION_EPOCH after rebalances (crash suite, seeds 1268049969 scale-up, 16853523 kill-restore), branch `fix/fetch-session-epoch`.
-2. Code review of `mvp` (`/code-review`), one fix agent, final full test run, worktree cleanup.
-3. Left for the user: create the remote repository and fill in `repository`, `npm publish`, release tag, check the first CI run on Kafka 3.9.
+1. Code review of `mvp` (`/code-review`), one fix agent, final full test run, worktree cleanup.
+2. Left for the user: create the remote repository and fill in `repository`, `npm publish`, release tag, check the first CI run on Kafka 3.9.
 
 ## Open items for the code review / fix pass
 
@@ -19,6 +18,7 @@ Integration branch: `mvp`. Plan (2026-10-21): finish ALL remaining tickets befor
 - Leftover `crash-input-*` topics from diagnosis runs may still be on the local broker (`npm run kafka -- reset` clears everything).
 - **Zombie timer writes (from ticket 29):** a zombie Worker whose open transaction holds only timer-driven Changelog writes could still commit them after the new owner has restored. Rare; needs a fix or a documented limitation.
 
+- **Possible exactly-once duplicates (TOP PRIORITY):** `test/integration/scale-out.test.ts` once received 2502 records vs 2480 expected (duplicates) after the fetch-session fix merge; passed on rerun. First check whether the test reads outputs with the stock client consumer (which can deliver aborted records, #467) — if so, switch it to our abort-aware reader and rerun many times; if duplicates persist, it's an engine bug in multi-process rebalances.
 - **Silent wrong aggregation (from ticket 26, high priority):** `map` (key change) followed by `groupByKey` doesn't repartition, so records with the same new key can land in different Tasks. Repartition Topics are v1 scope; for 0.1, fail fast when the app is built with a clear message.
 - **Pin `@platformatic/kafka` to an exact version** while `src/read-committed.ts` depends on its internals.
 - **Unverified doc claims (ticket 26):** transaction timeout wording and timers not persisting across restarts come from source comments; verify.
