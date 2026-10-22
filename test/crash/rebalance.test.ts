@@ -110,6 +110,8 @@ class Cluster {
   readonly #started = Date.now()
   /** Graceful stops that failed: problems, but the run goes on (such a stop is like a kill). */
   readonly stopFailures: string[] = []
+  /** App Processes that exited by themselves (not killed or stopped): the run fails at once. */
+  readonly #exited: string[] = []
 
   constructor(
     kafka: Kafka,
@@ -160,7 +162,17 @@ class Cluster {
       { timeoutMs: 60_000 },
     )
     this.#processes.push(app)
-    this.#members.set(name, { directory, app })
+    const member = { directory, app }
+    this.#members.set(name, member)
+    void app.exited.then((exit) => {
+      if (this.#members.get(name) === member) {
+        this.note(`${name} exited by itself`)
+        this.#exited.push(
+          `App Process ${name} exited by itself (${JSON.stringify(exit)}). Its output:\n` +
+            output(app),
+        )
+      }
+    })
   }
 
   /** SIGKILLs `name`; restarts it with the same state directory when `restart`. */
@@ -179,17 +191,10 @@ class Cluster {
     this.#members.delete(name)
     const exit = await member.app.stop()
     if (exit.code !== 0 || exit.signal !== null) {
-      // Its output without stack frames, which is enough to tell what failed.
-      const output = member.app
-        .log()
-        .split('\n')
-        .filter((line) => line.trim() !== '' && !/^\s+at /.test(line))
-        .slice(0, 30)
-        .join('\n')
       this.note(`${name} did not stop cleanly`)
       this.stopFailures.push(
         `App Process ${name} did not stop cleanly when stopped gracefully ` +
-          `(${JSON.stringify(exit)}). Its output:\n${output}`,
+          `(${JSON.stringify(exit)}). Its output:\n${output(member.app)}`,
       )
     }
   }
@@ -206,7 +211,9 @@ class Cluster {
   /** Waits until the committed input offsets advance. */
   async progress(): Promise<void> {
     const before = await consumed(this.#kafka, this.#topics)
-    await progressFrom(this.#kafka, this.#topics, before, () => this.apps())
+    await progressFrom(this.#kafka, this.#topics, before, () => this.apps(), {
+      check: () => this.#check(),
+    })
   }
 
   /**
@@ -222,10 +229,16 @@ class Cluster {
     }
     await this.#input.tail(this.#topics.partitions)
     this.note(`input ended, survivor ${survivor}`)
-    await allConsumed(this.#kafka, this.#topics, this.#input, () => this.apps())
+    await allConsumed(this.#kafka, this.#topics, this.#input, () => this.apps(), {
+      check: () => this.#check(),
+    })
     // A graceful stop commits the last batch and checkpoints the stores.
     await this.stop(survivor)
     return directory
+  }
+
+  #check(): void {
+    if (this.#exited.length > 0) throw new Error(this.#exited.join('\n'))
   }
 
   #member(name: string): Member {
@@ -240,6 +253,26 @@ class Cluster {
     for (const [label, path] of this.#named) if (path === directory) return label
     throw new Error(`unknown state directory ${directory}`)
   }
+}
+
+/**
+ * The output of `app`, short enough for a failure message: without stack frames, except the first
+ * few after "Emitted 'error' event" (where an unhandled 'error' event came from).
+ */
+function output(app: AppProcess): string {
+  let frames = 0
+  const lines: string[] = []
+  for (const line of app.log().split('\n')) {
+    if (line.trim() === '') continue
+    if (/^\s+at /.test(line)) {
+      if (frames > 0) lines.push(line)
+      frames = Math.max(0, frames - 1)
+      continue
+    }
+    frames = line.startsWith("Emitted 'error' event") ? 4 : 0
+    lines.push(line)
+  }
+  return lines.slice(0, 40).join('\n')
 }
 
 /** An open transaction of another producer on a Changelog: Restores wait until it ends. */

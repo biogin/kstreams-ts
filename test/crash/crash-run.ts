@@ -178,17 +178,18 @@ export async function consumed(kafka: Kafka, topics: CrashTopics): Promise<bigin
 
 /**
  * Waits until the committed input offsets pass `before`, polling every `pollMs`; fails after
- * `timeoutMs` with the output of `apps`.
+ * `timeoutMs` with the output of `apps`, or as soon as `check` throws.
  */
 export async function progressFrom(
   kafka: Kafka,
   topics: CrashTopics,
   before: bigint,
   apps: () => AppProcess[],
-  { pollMs = 20, timeoutMs = 90_000 } = {},
+  { pollMs = 20, timeoutMs = 90_000, check = () => {} } = {},
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while ((await consumed(kafka, topics)) <= before) {
+    check()
     if (Date.now() > deadline) {
       throw new Error(`No progress in ${timeoutMs / 1000} s. App output:\n${logs(apps())}`)
     }
@@ -196,16 +197,17 @@ export async function progressFrom(
   }
 }
 
-/** Waits until all of `input` is consumed (committed). */
+/** Waits until all of `input` is consumed (committed); fails early when `check` throws. */
 export async function allConsumed(
   kafka: Kafka,
   topics: CrashTopics,
   input: Input,
   apps: () => AppProcess[],
-  timeoutMs = 120_000,
+  { timeoutMs = 120_000, check = () => {} } = {},
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while ((await consumed(kafka, topics)) !== BigInt(input.sent.length)) {
+    check()
     if (Date.now() > deadline) {
       throw new Error(
         `Only ${await consumed(kafka, topics)} of ${input.sent.length} input records consumed ` +
