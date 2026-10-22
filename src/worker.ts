@@ -1,11 +1,9 @@
 // Internal: a Worker, one consumer-group member that owns its Tasks, its producer and its
 // consumer (ADR-0007). With `workers: 0` the Streams App runs one Worker in the main thread.
 //
-// A Task is created when its first record arrives. Its State Stores are restored from their
-// Changelogs first (from their Checkpoints, or in full; see restore.ts and checkpoint.ts), between
-// batches: a record for a new Task ends the batch it arrives in, and the next batch starts with
-// that Task's Restore, before anything else is processed or produced. So no Kafka transaction or
-// store transaction is open during a Restore.
+// A Task is created when its first record arrives. A Task that has State Stores, or any Task under
+// exactly-once, is first started in the background (see "Starting a Task" below), while the
+// Worker's other Tasks keep processing and committing (ADR-0009).
 //
 // The commit cycle: read records into a batch until the commit interval runs out or the batch is
 // full, and process each record in its Task.
@@ -24,16 +22,31 @@
 // Tasks as it can, and a Task that moves is first revoked from its old owner, then assigned to its
 // new one in a second rebalance.
 //
-// Starting a Task (its first record, under exactly-once or with State Stores) happens between
-// batches too, and waits for the Task's previous owner, which may be another Worker or process:
+// Starting a Task (its first record, under exactly-once or with State Stores) runs in the
+// background, outside the commit cycle, and waits for the Task's previous owner, which may be
+// another Worker or process:
 // - for its Task directory lock, when there is a state directory (state-directory.ts): the
-//   previous owner closes the Task, and so unlocks it, once it notices it lost the Task;
+//   previous owner closes the Task, and so unlocks it, once it notices it lost the Task. Only then
+//   are the Task's State Stores opened;
 // - under exactly-once, for its stable committed offsets (stable-offsets.ts): records before them
 //   were processed and committed already, and are skipped;
-// - for its Changelog partitions to have no transaction left open from before (restore.ts).
-// While a Worker waits for a lock or for stable offsets, it notices partitions it loses, and gives
-// up the wait to deal with them first, so two Workers waiting for each other's Tasks never
-// deadlock.
+// - for its Changelog partitions to have no transaction left open from before, then for its
+//   Restore (restore.ts, from the Checkpoints or in full; see checkpoint.ts).
+// The starting Task is not part of any batch: it processes nothing, so it has no store
+// transaction, and nothing of it is in the Worker's Kafka transaction (which the other Tasks'
+// batches keep using meanwhile); Restore's own per-chunk store transactions never nest. Since the
+// waits don't hold the commit cycle, two Workers waiting for each other's Tasks never deadlock:
+// each goes on, notices what it lost, and closes it.
+//
+// Meanwhile the starting Task's records are held in memory, in arrival order, and processed once
+// it has started (the client can't pause a single partition; ADR-0009). The bound: all starting
+// Tasks of a Worker together hold at most `commitMaxRecords` records, as many as one batch
+// processes. A starting Task that would go over it holds nothing more (it drops every later
+// record, so its held records stay without gaps) and, once started, reads its partitions again:
+// the Worker rewinds its stream to the committed offsets, as after an abort, and drops what it had
+// processed already. Once started, the Task joins the current batch like any Task. A start is
+// cancelled when its partitions are lost, or the Worker stops; the Task's lock is only released
+// once its Restore has stopped writing, and a later start of the same Task waits for that.
 //
 // Rebalances (ADR-0006): the client only reports them after the fact (see ownership.ts). A
 // rebalance that loses partitions ends the batch. Records still buffered for lost partitions are
@@ -41,17 +54,20 @@
 // client delivers again (after a rebalance it rewinds every partition it keeps to its committed
 // offset).
 // - Exactly-once: a batch with records of a lost partition aborts: Kafka abort, then SQLite
-//   rollback. Every Task is then closed, since a rollback doesn't undo Stream Time, timers or
-//   Processor state, and is created again (restored from its Checkpoint) when its records come
-//   back: the Worker reads every partition again from its committed offset. A batch without such
-//   records commits, with the consumer's current group generation.
+//   rollback. Every started Task is then closed, since a rollback doesn't undo Stream Time, timers
+//   or Processor state, and is started again (restored from its Checkpoint) when its records come
+//   back: the Worker reads every partition again from its committed offset. Tasks still starting
+//   had no part in the batch and go on starting. A batch without such records commits, with the
+//   consumer's current group generation.
 // - At-least-once: the batch commits its outputs, and the offsets of the partitions still owned;
 //   the new owner of a lost partition processes its records again.
-// Either way the Tasks of lost partitions are closed; one that comes back is a new Task.
+// Either way the Tasks of lost partitions are closed, and their starts cancelled; one that comes
+// back is a new Task.
 //
-// A graceful stop ends the batch, commits it, closes the Tasks and leaves the group. If that takes
-// longer than the shutdown timeout, the batch is given up (under exactly-once, aborted) and the
-// Worker closes the Tasks and leaves the group anyway.
+// A graceful stop ends the batch, commits it, closes the Tasks, cancels the starts (a Restore stops
+// after its current fetch) and leaves the group. If that takes longer than the shutdown timeout,
+// the batch is given up (under exactly-once, aborted) and the Worker closes the Tasks and leaves
+// the group anyway.
 
 import {
   COOPERATIVE_STICKY_ASSIGNOR,
@@ -277,6 +293,31 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
 
 const TIME_UP = Symbol('time up')
 const INTERRUPTED = Symbol('interrupted')
+const STARTED = Symbol('started')
+
+/** A Task starting in the background (see the top of this file). */
+interface StartingTask {
+  readonly partition: number
+  /** Cancels the start: its waits give up, and its Restore stops. */
+  readonly cancel: AbortController
+  /** Its records, in arrival order, until it has started. */
+  readonly held: ConsumedMessage[]
+  /**
+   * The offset after the last record held, by `topic:partition`: a record the stream delivers
+   * again (after a rewind) isn't held twice.
+   */
+  readonly heldUpTo: Map<string, bigint>
+  /** Whether it dropped records because the bound was reached: it then reads them again. */
+  overflowed: boolean
+  /** Exactly-once: its stable committed offsets, by topic. */
+  stable: ReadonlyMap<string, bigint> | undefined
+  /** Created once its directory is locked; restoring until `started`. */
+  task: Task | undefined
+  /** Set once it has started; the cycle then takes it over. */
+  started: boolean
+  /** Settles once the background start has ended, whether it started, failed or was cancelled. */
+  done: Promise<void>
+}
 
 /** Thrown when a batch would commit the offset of a partition the Worker no longer owns. */
 class PartitionRevokedError extends Error {}
@@ -324,9 +365,21 @@ class CommitCycle {
   readonly #restorer: KafkaChangelogReader | undefined
   /** Exactly-once: reads the stable committed offsets of a new Task's partitions. */
   readonly #stableOffsets: StableOffsetReader | undefined
-  /** One Task per partition number, shared by all the Co-partitioned input topics. */
+  /**
+   * One started Task per partition number, shared by all the Co-partitioned input topics. A Task
+   * is in here or in `#starting`, never in both.
+   */
   readonly #tasks = new Map<number, Task>()
-  /** The Tasks whose directories this Worker has locked. */
+  /** The Tasks starting in the background, by partition. */
+  readonly #starting = new Map<number, StartingTask>()
+  /** Cancelled starts still winding down (their Restores stopping), by partition. */
+  readonly #cancelling = new Map<number, Promise<void>>()
+  /** How many records the starting Tasks hold, together: at most `commitMaxRecords`. */
+  #heldCount = 0
+  /** Settles once a starting Task has started; renewed whenever the cycle takes them over. */
+  #started!: Promise<typeof STARTED>
+  #signalStarted: () => void = () => {}
+  /** The Tasks whose directories this Worker has locked, started or starting. */
   readonly #locked = new Set<number>()
 
   #stopRequested = false
@@ -345,8 +398,8 @@ class CommitCycle {
   /** The last record read from each partition, by `topic:partition`. */
   #lastRead = new Map<string, ConsumedMessage>()
   /**
-   * A record that ended the batch it arrived in (for a new Task, or after partitions were lost);
-   * the next batch starts with it.
+   * A record that ended the batch it arrived in, after partitions were lost; the next batch starts
+   * with it.
    */
   #held: ConsumedMessage | undefined
   /**
@@ -374,6 +427,13 @@ class CommitCycle {
     this.#interrupted = new Promise((resolve) => {
       this.#interrupt = () => resolve(INTERRUPTED)
     })
+    this.#renewStarted()
+  }
+
+  #renewStarted(): void {
+    this.#started = new Promise((resolve) => {
+      this.#signalStarted = () => resolve(STARTED)
+    })
   }
 
   requestStop(): void {
@@ -390,6 +450,7 @@ class CommitCycle {
     this.requestStop()
     await this.#committer.abort().catch(() => {})
     this.#closeTasks()
+    this.#cancelStarts()
   }
 
   /** Closes the stream the cycle reads. */
@@ -422,15 +483,16 @@ class CommitCycle {
       this.#next.catch(() => {})
       // After a failure the stores are left without a new Checkpoint (at-least-once: any).
       this.#closeTasks()
+      this.#cancelStarts()
       this.#ownership.close()
+      // Restores stop after their current fetch; the Worker closes the restore consumer after.
+      await Promise.all(this.#cancelling.values())
     }
   }
 
-  /** Rolls back and closes every Task, and unlocks their directories. */
+  /** Rolls back and closes every started Task, and unlocks their directories. */
   #closeTasks(): void {
-    for (const task of this.#tasks.values()) closeTask(task)
-    this.#tasks.clear()
-    for (const partition of [...this.#locked]) this.#unlock(partition)
+    for (const partition of [...this.#tasks.keys()]) this.#closeTask(partition)
   }
 
   /** Rolls back and closes the Task of `partition`, if open, and unlocks its directory. */
@@ -460,20 +522,10 @@ class CommitCycle {
     const ownership = this.#ownership
     // Lost partitions are dealt with first, by committing (or aborting) the batch so far.
     if (ownership.lostPending) return
-    let count = 0
+    let count = await this.#takeStarted()
     const held = this.#held
     this.#held = undefined
-    if (held !== undefined && this.#accepts(held)) {
-      if (!(await this.#started(held.partition))) {
-        this.#held = held
-        return
-      }
-      // The stable committed offset may be past it.
-      if (this.#accepts(held)) {
-        this.#process(held)
-        count++
-      }
-    }
+    if (held !== undefined && this.#take(held)) count++
     let timer: NodeJS.Timeout | undefined
     const timeUp = new Promise<typeof TIME_UP>((resolve) => {
       timer = setTimeout(() => resolve(TIME_UP), commitIntervalMs)
@@ -483,8 +535,19 @@ class CommitCycle {
     })
     try {
       while (count < commitMaxRecords && this.#failure === undefined) {
-        const result = await Promise.race([this.#next, timeUp, this.#interrupted, lost])
+        const result = await Promise.race([
+          this.#next,
+          timeUp,
+          this.#interrupted,
+          lost,
+          this.#started,
+        ])
         if (result === TIME_UP || result === INTERRUPTED) break
+        if (result === STARTED) {
+          if (ownership.lostPending) break
+          count += await this.#takeStarted()
+          continue
+        }
         if (result.done) throw new Error('The consumer stopped delivering records')
         this.#next = this.#messages.next()
         const message = result.value
@@ -492,22 +555,7 @@ class CommitCycle {
           this.#held = message
           break
         }
-        if (!this.#accepts(message)) continue
-        if (this.#needsStart(message.partition)) {
-          // Start a Task only between batches: nothing of this batch may be produced or written
-          // yet.
-          if (count > 0) {
-            this.#held = message
-            break
-          }
-          if (!(await this.#started(message.partition))) {
-            this.#held = message
-            break
-          }
-          if (!this.#accepts(message)) continue
-        }
-        this.#process(message)
-        count++
+        if (this.#take(message)) count++
       }
     } finally {
       clearTimeout(timer)
@@ -527,7 +575,24 @@ class CommitCycle {
   }
 
   /**
-   * Whether a record for `partition` creates a Task that must be started between batches: under
+   * Takes `message` (one the Worker accepts): processes it in its Task, or holds it while its Task
+   * starts, starting the Task first if needed. Returns whether it was processed.
+   */
+  #take(message: ConsumedMessage): boolean {
+    if (!this.#accepts(message)) return false
+    const { partition } = message
+    let starting = this.#starting.get(partition)
+    if (starting === undefined && this.#needsStart(partition)) starting = this.#start(partition)
+    if (starting !== undefined) {
+      this.#hold(starting, message)
+      return false
+    }
+    this.#process(message)
+    return true
+  }
+
+  /**
+   * Whether a record for `partition` creates a Task that must be started first: under
    * exactly-once, or with State Stores.
    */
   #needsStart(partition: number): boolean {
@@ -537,33 +602,134 @@ class CommitCycle {
     )
   }
 
+  /** Holds `message` for its starting Task, within the bound (see the top of this file). */
+  #hold(starting: StartingTask, message: ConsumedMessage): void {
+    if (starting.overflowed) return
+    const key = partitionKey(message.topic, message.partition)
+    const upTo = starting.heldUpTo.get(key)
+    if (upTo !== undefined && message.offset < upTo) return
+    if (this.#heldCount >= this.#options.commitMaxRecords) {
+      starting.overflowed = true
+      return
+    }
+    starting.held.push(message)
+    starting.heldUpTo.set(key, message.offset + 1n)
+    this.#heldCount++
+  }
+
+  /** Starts the Task of `partition` in the background (see the top of this file). */
+  #start(partition: number): StartingTask {
+    const starting: StartingTask = {
+      partition,
+      cancel: new AbortController(),
+      held: [],
+      heldUpTo: new Map(),
+      overflowed: false,
+      stable: undefined,
+      task: undefined,
+      started: false,
+      done: Promise.resolve(),
+    }
+    const { signal } = starting.cancel
+    starting.done = this.#prepare(starting, this.#cancelling.get(partition)).then(
+      () => {
+        if (signal.aborted) {
+          this.#dispose(starting)
+        } else {
+          starting.started = true
+          this.#signalStarted()
+        }
+      },
+      (error: unknown) => {
+        this.#dispose(starting)
+        if (!signal.aborted) this.#fail(error)
+      },
+    )
+    this.#starting.set(partition, starting)
+    return starting
+  }
+
   /**
-   * Starts the Task of `partition` if needed (see the top of this file): locks its directory,
-   * skips what its stable committed offsets say was processed, creates it and waits for its
-   * Restore. Resolves to false if partitions were lost or the cycle is to end meanwhile; the Task
-   * is then started later, when its record comes again.
+   * Once an earlier, cancelled start of the same Task has wound down: locks the Task's directory,
+   * reads its stable committed offsets, creates it and waits for its Restore. Returns early, with
+   * the Task not started, once the start is cancelled.
    */
-  async #started(partition: number): Promise<boolean> {
-    if (this.#tasks.has(partition)) return true
-    const giveUp = () =>
-      this.#ownership.lostPending || this.#stopRequested || this.#failure !== undefined
+  async #prepare(starting: StartingTask, previous: Promise<void> | undefined): Promise<void> {
+    await previous
+    const { partition } = starting
+    const { signal } = starting.cancel
+    const giveUp = () => signal.aborted
     const { stateDir, applicationId, lockHolder } = this.#options
-    if (stateDir !== undefined && this.#graph.stores.size > 0 && !this.#locked.has(partition)) {
-      if (!(await lockTask(stateDir, applicationId, partition, lockHolder, giveUp))) return false
+    if (stateDir !== undefined && this.#graph.stores.size > 0) {
+      if (!(await lockTask(stateDir, applicationId, partition, lockHolder, giveUp))) return
       this.#locked.add(partition)
     }
     if (this.#stableOffsets !== undefined) {
       const topics = [...this.#graph.sources.keys()]
-      const stable = await this.#stableOffsets.read(topics, partition, giveUp)
-      if (stable === undefined) return false
-      for (const [topic, offset] of stable) {
+      starting.stable = await this.#stableOffsets.read(topics, partition, giveUp)
+      if (starting.stable === undefined) return
+    }
+    if (signal.aborted) return
+    starting.task = this.#createTask(partition, signal)
+    await starting.task.restored()
+  }
+
+  /**
+   * Takes the Tasks that have started over: processes the records they held, after skipping what
+   * their stable committed offsets say was processed, and rewinds the stream for those that
+   * dropped records. Returns how many records were processed.
+   */
+  async #takeStarted(): Promise<number> {
+    this.#renewStarted()
+    let count = 0
+    let rewind = false
+    for (const starting of [...this.#starting.values()]) {
+      if (!starting.started || starting.task === undefined) continue
+      const { partition } = starting
+      this.#starting.delete(partition)
+      this.#heldCount -= starting.held.length
+      this.#tasks.set(partition, starting.task)
+      for (const [topic, offset] of starting.stable ?? []) {
         const key = partitionKey(topic, partition)
         const position = this.#position.get(key)
         if (position === undefined || offset > position) this.#position.set(key, offset)
       }
+      for (const message of starting.held) {
+        if (this.#accepts(message)) {
+          this.#process(message)
+          count++
+        }
+      }
+      rewind ||= starting.overflowed
     }
-    await this.#task(partition).restored()
-    return !this.#ownership.lostPending
+    if (rewind) await this.#rewind()
+    return count
+  }
+
+  /** Cancels the starts of the Tasks of `partitions` (by default, all). */
+  #cancelStarts(partitions?: ReadonlySet<number>): void {
+    for (const starting of [...this.#starting.values()]) {
+      if (partitions !== undefined && !partitions.has(starting.partition)) continue
+      const { partition, done } = starting
+      starting.cancel.abort(new Error(`The start of Task ${partition} was cancelled`))
+      this.#starting.delete(partition)
+      this.#heldCount -= starting.held.length
+      if (starting.started) {
+        this.#dispose(starting)
+      } else {
+        // Winding down: a new start of the Task waits for it.
+        this.#cancelling.set(partition, done)
+        void done.then(() => {
+          if (this.#cancelling.get(partition) === done) this.#cancelling.delete(partition)
+        })
+      }
+    }
+  }
+
+  /** Closes the Task of a start that won't be taken over, and unlocks its directory. */
+  #dispose(starting: StartingTask): void {
+    if (starting.task !== undefined) closeTask(starting.task)
+    this.#unlock(starting.partition)
   }
 
   #process(message: ConsumedMessage): void {
@@ -583,32 +749,38 @@ class CommitCycle {
     this.#work.push(work.catch((error: unknown) => this.#fail(error)))
   }
 
+  /** The started Task of `partition`, created if it needs no start. */
   #task(partition: number): Task {
     let task = this.#tasks.get(partition)
     if (task === undefined) {
-      task = createTask(
-        this.#graph,
-        (topic, record) => this.#committer.produce(toMessage(topic, record)),
-        Date.now,
-        {
-          task: partition,
-          stateDir: this.#options.stateDir,
-          // Exactly-once: store transactions as long as the Kafka transaction.
-          storeTransactions: this.#exactlyOnce,
-          // A Task's State Stores are logged to the Changelog partition of the same number.
-          changelog: (topic, record) =>
-            this.#committer.produce({ ...toMessage(topic, record), partition }),
-          // Every Task starts with a Restore, which the cycle waits for between batches.
-          restore: (stores) => {
-            const restorer = this.#restorer
-            if (restorer === undefined) throw new Error('No restore consumer for State Stores')
-            return restoreStores(stores, partition, restorer)
-          },
-        },
-      )
+      task = this.#createTask(partition)
       this.#tasks.set(partition, task)
     }
     return task
+  }
+
+  /** Creates the Task of `partition`; `signal` cancels its Restore. */
+  #createTask(partition: number, signal?: AbortSignal): Task {
+    return createTask(
+      this.#graph,
+      (topic, record) => this.#committer.produce(toMessage(topic, record)),
+      Date.now,
+      {
+        task: partition,
+        stateDir: this.#options.stateDir,
+        // Exactly-once: store transactions as long as the Kafka transaction.
+        storeTransactions: this.#exactlyOnce,
+        // A Task's State Stores are logged to the Changelog partition of the same number.
+        changelog: (topic, record) =>
+          this.#committer.produce({ ...toMessage(topic, record), partition }),
+        // Every Task with State Stores starts with a Restore, in the background.
+        restore: (stores) => {
+          const restorer = this.#restorer
+          if (restorer === undefined) throw new Error('No restore consumer for State Stores')
+          return restoreStores(stores, partition, restorer, signal)
+        },
+      },
+    )
   }
 
   /**
@@ -667,8 +839,9 @@ class CommitCycle {
   }
 
   /**
-   * Exactly-once: aborts the batch, closes every Task and reads every partition again from its
-   * committed offset.
+   * Exactly-once: aborts the batch, closes every started Task and reads every partition again from
+   * its committed offset. Starting Tasks go on: they had no part in the batch, and what they hold
+   * is not held twice when the stream delivers it again.
    */
   async #abortBatch(lost: ReadonlySet<number>): Promise<void> {
     await this.#committer.abort()
@@ -680,10 +853,14 @@ class CommitCycle {
     if (!this.#stopRequested) await this.#rewind()
   }
 
-  /** Closes the Tasks of the `lost` partitions and forgets how far they were read. */
+  /**
+   * Closes the Tasks of the `lost` partitions, cancels their starts and forgets how far they were
+   * read.
+   */
   #forget(lost: ReadonlySet<number>): void {
     if (lost.size === 0) return
     for (const partition of lost) this.#closeTask(partition)
+    this.#cancelStarts(lost)
     for (const positions of [this.#position, this.#committedPosition]) {
       for (const key of positions.keys()) {
         if (lost.has(Number(key.slice(key.lastIndexOf(':') + 1)))) positions.delete(key)
