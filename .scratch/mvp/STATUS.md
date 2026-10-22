@@ -8,6 +8,7 @@ All 30 tickets (01–30), plus three fixes: aborted-transaction filter, root-cau
 
 ## Remaining
 
+0. **Paused 2026-10-22.** The code review was started and then stopped before reporting; re-run it from scratch: `/code-review` on `mvp` against `main` (spec `.scratch/mvp/spec.md`, open items below).
 1. Code review of `mvp` (`/code-review`), one fix agent, final full test run, worktree cleanup.
 2. Left for the user: create the remote repository and fill in `repository`, `npm publish`, release tag, check the first CI run on Kafka 3.9.
 
@@ -30,6 +31,8 @@ All 30 tickets (01–30), plus three fixes: aborted-transaction filter, root-cau
 ## Upstream
 
 - platformatic/kafka#467 filed by the user; body corrected in place before anyone responded. Local copy: `.scratch/upstream/platformatic-kafka-read-committed-aborted/issue.md`. Upstream fix in progress: **PR platformatic/kafka#470** (open) implements the stateless per-response filter and also fixes the committed-records drop. Once it ships in a release, switch back to the client's filter and delete `src/read-committed.ts` (and its dependency on client internals); keep our read_committed unit/integration tests and the crash suite as regression guards. An optional follow-up comment for #470 (committed-records symptom + suggested regression test) was drafted but not posted.
+
+- **Second client bug, candidate upstream PR (not started):** in `@platformatic/kafka` 2.14, concurrent `fetch()` calls on one Consumer share one fetch session per node with nothing serializing them, so the broker rejects all but one with INVALID_FETCH_SESSION_EPOCH (71). Client lines: `consumer.js` L550–555 (read session), L665/L684–696 (store epoch), L640–643 (drop session). Likely a regression from fetch-session support (platformatic/kafka#315, PR #321). We work around it with `fetchSessions: false` on the restore consumer (`src/read-committed.ts`). The user considered opening a PR directly (e.g. serialize fetches per node); plan: after our code review, fork, failing test + fix, run against the local broker (their suite needs Docker), show the user the diff before pushing.
 
 ## Resuming
 
