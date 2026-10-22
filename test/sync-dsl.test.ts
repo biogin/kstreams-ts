@@ -34,6 +34,10 @@ describe('async functions are rejected when the app is built', () => {
       'map',
       (stream: Untyped) => stream.map(async (key: string, value: string) => ({ key, value })),
     ],
+    [
+      'mapValues',
+      (stream: Untyped) => stream.mapValues(async (_key: string, value: string) => value),
+    ],
     ['peek', (stream: Untyped) => stream.peek(async () => {})],
     [
       'peek',
@@ -61,6 +65,13 @@ describe('a function returning a Promise stops the app on the first record', () 
         stream
           .map((key: string, value: string) => Promise.resolve({ key, value }))
           .to('output', { key: serdes.string, value: serdes.string }),
+    ],
+    [
+      'mapValues',
+      (stream: Untyped) =>
+        stream
+          .mapValues((_key: string, value: string) => Promise.resolve(value))
+          .to('output', { value: serdes.string }),
     ],
     ['peek', (stream: Untyped) => stream.peek(() => Promise.resolve()).to('output')],
   ])('%s', async (operator, define) => {
@@ -123,12 +134,14 @@ describe('AsyncNotAllowedError', () => {
 
 // Type-level tests: checked by `npm run typecheck`, not at runtime.
 describe('async functions fail to compile', () => {
-  it('rejects async callbacks to filter, map and peek', () => {
+  it('rejects async callbacks to filter, map, mapValues and peek', () => {
     const { stream } = stringStream()
     // @ts-expect-error DSL functions must be synchronous
     expect(() => stream.filter(async () => true)).toThrow(AsyncNotAllowedError)
     // @ts-expect-error DSL functions must be synchronous
     expect(() => stream.map(async (key, value) => ({ key, value }))).toThrow(AsyncNotAllowedError)
+    // @ts-expect-error DSL functions must be synchronous
+    expect(() => stream.mapValues(async (_key, value) => value)).toThrow(AsyncNotAllowedError)
     // @ts-expect-error DSL functions must be synchronous
     expect(() => stream.peek(async () => {})).toThrow(AsyncNotAllowedError)
     // @ts-expect-error DSL functions must be synchronous

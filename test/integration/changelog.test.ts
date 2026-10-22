@@ -8,8 +8,7 @@ import {
   stores,
   tumbling,
 } from '../../src/index.js'
-import { keyOf } from '../../src/store-key.js'
-import { windowedSerde, windowKeyEncoding } from '../../src/windows.js'
+import { keyOf, windowedSerde, windowKeyEncoding } from '../support/internals.js'
 import {
   type BytesRecord,
   brokers,

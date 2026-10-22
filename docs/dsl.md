@@ -29,16 +29,18 @@ const orders = app
 Operators:
 
 - `filter(predicate)` keeps records for which it returns true (a type guard narrows the type).
-- `map((key, value) => ({ key, value }))` makes new keys and values, possibly of other types. The record keeps its Event Time. Its result has no Serdes of its own, so `.to()` needs both.
+- `map((key, value) => ({ key, value }))` makes new keys and values, possibly of other types. The record keeps its Event Time. Its result has no Serdes of its own, so `.to()` needs both. Its result counts as **re-keyed**, so `groupByKey()` on it throws (see [Aggregations](#aggregations)).
+- `mapValues((key, value) => value)` makes a new value, possibly of another type, and keeps the key, its key Serde and the Event Time. `.to()` needs a value Serde. Use it instead of `map` when the key doesn't change.
 - `peek(action)` calls `action` for each record (logging, metrics) and passes the record on unchanged.
-- `process(processor)` sends records through a [Processor](./processor-api.md).
+- `process(processor)` sends records through a [Processor](./processor-api.md). A Processor may forward any key, so its output counts as re-keyed too.
 - `to(topic, serdes?)` writes every record to a topic. Serdes you leave out default to the ones the Stream was read with.
 
 ```ts
-// Stateless operators: `map` may change the key and value types.
+// Stateless operators: `map` may change the key and value types, `mapValues` only the value.
 orders
   .map((_id, order) => ({ key: order.customer, value: order.amountCents }))
   .to('amounts', { key: serdes.string, value: serdes.number })
+orders.mapValues((_id, order) => order.amountCents).to('order-amounts', { value: serdes.number })
 ```
 
 Output records get the Event Time of the record that produced them. Output topics are not created for you.
@@ -55,7 +57,7 @@ Do async work (HTTP calls, database lookups) in a [Processor](./processor-api.md
 
 ## Aggregations
 
-`groupByKey()` groups a Stream by its current key; to group by another key `map` first. The aggregation's State Store needs a key Serde, so pass one if the Stream has none (for example after `map`). Then:
+`groupByKey()` groups a Stream by its current key. The aggregation's State Store needs a key Serde, so pass one if the Stream has none. Then:
 
 - `count()` counts records per key.
 - `reduce(reducer)` combines values per key; the first value is stored as is.
@@ -63,11 +65,19 @@ Do async work (HTTP calls, database lookups) in a [Processor](./processor-api.md
 
 Each returns a **Table**: a keyed view where each record is an upsert of the latest value for its key. `table.toStream()` turns its updates back into a Stream, one record per change, carrying the Event Time of the record that caused it. Like Kafka Streams, aggregations skip records with a null key or null value. Returning `null` from `aggregate` or `reduce` deletes the key and forwards a Tombstone.
 
+**Grouping by another key.** Records with the same key must be in the same Task to be aggregated together, and a Task holds the records of one partition number of the input topics. `map` and Processors may change the key, and kstreams-ts doesn't repartition yet (no Repartition Topics), so `groupByKey()` on a re-keyed Stream throws when the app is built. Write the re-keyed records to a topic keyed by the new key and read it back; the topic must have as many partitions as the app's other input topics (they must all be [Co-partitioned](./limitations.md)). `mapValues` doesn't re-key, so grouping after it is fine.
+
 ```ts
-// Aggregations: group by the current key, then count, reduce or aggregate into a Table.
-const perCustomer = orders
+// Re-keying for an aggregation: write to a topic keyed by the new key, then read it back.
+orders
   .map((_id, order) => ({ key: order.customer, value: order }))
-  .groupByKey({ key: serdes.string, value: serdes.json<Order>() })
+  .to('orders-by-customer', orderSerdes)
+
+// Aggregations: group by the current key, then count, reduce or aggregate into a Table.
+const perCustomer = app
+  .stream('orders-by-customer', orderSerdes)
+  .filter((_customer, order): order is Order => order !== null)
+  .groupByKey()
 
 perCustomer.count({ store: 'orders-per-customer' }).toStream().to('order-counts', {
   key: serdes.string,

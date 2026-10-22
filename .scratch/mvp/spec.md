@@ -127,7 +127,7 @@ A TypeScript library for Node.js (≥24) where I define a **Streams App** with a
 
 - Node ≥24 LTS only. ESM-only, strict TypeScript, a single package. Apache-2.0.
 - Kafka client: `@platformatic/kafka`, used directly with no client abstraction layer (ADR-0004). Its transactional offset commit sends the consumer's generation ID and member ID, which gives KIP-447 fencing.
-- State Stores are a pluggable interface, with an in-memory version and SQLite through `better-sqlite3` as the default durable store. Switch to `node:sqlite` once it's stable (ADR-0005).
+- State Stores are a pluggable interface, with an in-memory version and SQLite through `better-sqlite3` as the default durable store when a state directory is configured. Without a state directory, stores default to in-memory (every start is a full Restore) and the App Process ID is random per start. Switch to `node:sqlite` once it's stable (ADR-0005).
 - Serdes: a minimal typed interface. Schema Registry support comes later as a separate package.
 
 ### API
@@ -142,12 +142,12 @@ A TypeScript library for Node.js (≥24) where I define a **Streams App** with a
 
 ### Engine
 
-- **Task** = one partition number across all Co-partitioned input topics. Partition counts are checked at startup.
+- **Task** = one partition number across all Co-partitioned input topics. Partition counts are checked at startup; in 0.1 all input topics of an app must be Co-partitioned.
 - **Worker** = one consumer-group member with its own consumer, one transactional producer covering all its Tasks, and its State Stores (ADR-0007, ADR-0008). Kafka does the load balancing, and no records are sent between threads.
 - **Commit cycle**: a batch per Worker, closed by time or count (default 100 ms). Under exactly-once, the SQLite transaction stays open for the length of the Kafka transaction: process the batch → produce outputs and Changelog entries → add consumed offsets (only the last record per partition) → commit Kafka → commit SQLite with an updated Checkpoint (ADR-0002).
-- **Revoke** under exactly-once aborts the Kafka transaction and rolls back SQLite, because the client has no revoke hook the app can make wait (ADR-0006). Under at-least-once, commit on revoke when possible.
+- **Revoke** under exactly-once aborts the Kafka transaction and rolls back SQLite, because the client has no revoke hook the app can make wait (ADR-0006). Under at-least-once, commit on revoke when possible: the batch's outputs and the offsets of the partitions still owned; the lost partitions' uncommitted work is redone by their new owner.
 - **Graceful shutdown** commits the current batch, writes Checkpoints, closes stores and leaves the group, falling back to abort if the timeout runs out.
-- **Restore**: SQLite files persist in the state directory with Checkpoints, and a missing or unclean Checkpoint means wipe and rebuild. A separate per-Worker restore consumer, outside the group, reads the Changelog with `read_committed`. Only the Task being restored is paused (ADR-0009).
+- **Restore**: SQLite files persist in the state directory with Checkpoints, and a missing or unclean Checkpoint means wipe and rebuild. Without a state directory, stores are in memory and every start restores in full. A separate per-Worker restore consumer, outside the group, reads the Changelog with `read_committed`. Only the Task being restored is paused (ADR-0009).
 - **Assignment**: cooperative-sticky in the MVP. A state-aware assignor using per-member join metadata comes later.
 - **Store key encoding**: deterministic bytes that preserve order regardless of the key Serde, so range scans (windows) work.
 - **Internal Topics** are created automatically by default: compacted, with source partition counts and a configurable replication factor. A wrong partition count on an existing topic is a fatal error. With auto-creation off, the app checks the topics and lists any that are missing.
@@ -158,7 +158,7 @@ A TypeScript library for Node.js (≥24) where I define a **Streams App** with a
 
 ### Defaults (confirmed 2026-10-21)
 
-- Minimum broker: Kafka ≥3.6 with the classic group protocol. KIP-848 is opt-in on Kafka 4.x. CI tests the latest 3.9 and 4.x.
+- Minimum broker: Kafka ≥3.6 with the classic group protocol. KIP-848 is not supported yet (the classic protocol also runs on Kafka 4.x). CI tests the latest 3.9 and 4.x.
 - Output record timestamps inherit the input's Event Time. Window results get the window end.
 - `delete(key)` writes a Changelog tombstone.
 - Window retention = window size plus Grace Period, then entries are dropped and tombstoned.
@@ -183,7 +183,8 @@ Exactly-once (M3) comes before multiple Workers (M4) on purpose: prove exactly-o
 - **Seam 1: the public Streams App API through the Test Driver** (in memory, no Kafka). This is the main seam, and most tests live here: DSL operators and type inference, Processor API, Serdes, the three-layer synchronous check (including type-level tests), aggregations, windows, timers, Stream Time and Grace Period behavior, and error handler routing.
 - **Seam 2: the same public API against real Kafka** (single broker, the latest 3.9 and 4.x). Tests connect to a broker given by an environment variable. Locally, a script downloads Kafka and runs a KRaft broker on Java 17+, because Docker is not available on the development machine. CI can use a Kafka service container. It covers integration tests (topic auto-creation, Restore, rebalances, graceful shutdown) and the **crash test suite** (ADR-0011). Workers run as child processes and are killed from outside with SIGKILL at random times, with no fault-injection hooks inside the engine. Each run compares outputs and State Stores exactly against a reference run: nothing missing, and no duplicates under exactly-once. Precise timings (e.g. between the Kafka commit and the SQLite commit) are covered by running many randomized iterations, not targeted hooks. It runs nightly in CI, and no release claims exactly-once unless it passes.
 - **Seam 3: a State Store contract suite.** One suite runs against every store implementation (in-memory and SQLite), because State Stores are a public, pluggable interface. It covers get, put and delete, range scans in key order across encoded keys, transactional rollback, and Checkpoint persistence.
-- **No mocking of the Kafka client** anywhere. ADR-0004 rules out a client abstraction, and behavior that depends on Kafka is tested against a real broker.
+- **No mocking of the Kafka client** anywhere. ADR-0004 rules out a client abstraction, and behavior that depends on Kafka is tested against a real broker. The one documented exception is the ownership unit test's fake group member (ADR-0016).
+- **Internal modules in tests** (ADR-0016): unit tests may import them to test internal algorithms (aborted-transaction filter, Task assignor, ownership, store-key encoding, Checkpoints, state directory); integration and crash tests reach internals only through `test/support/internals.ts`.
 - **Prior art**: none in this repo yet, since it's new. External references: Kafka Streams' `TopologyTestDriver` (for the shape of seam 1) and Jepsen-style crash testing (for seam 2).
 
 ## Out of Scope

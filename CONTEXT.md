@@ -93,7 +93,7 @@ Rebuilding a State Store from its Changelog before its Task resumes processing.
 _Avoid_: Recovery, rehydration, replay
 
 **Checkpoint**:
-The Changelog offset a local State Store has applied up to; Restore replays only what comes after it.
+The Changelog offset a local State Store has applied up to; Restore applies only what comes after it.
 _Avoid_: Snapshot, savepoint, bookmark
 
 **Internal Topic**:

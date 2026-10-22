@@ -1,7 +1,7 @@
 import { inspect } from 'node:util'
 import { IS_CONTROL, MessagesStreamModes, Producer, stringSerializers } from '@platformatic/kafka'
 import { afterAll, beforeAll, expect, it } from 'vitest'
-import { ReadCommittedConsumer } from '../../src/read-committed.js'
+import { ReadCommittedConsumer } from '../support/internals.js'
 import { brokers, createKafka, describeWithKafka, uniqueName } from './kafka.js'
 
 // 2 KB values and a 1 KB fetch limit: one record batch per fetch response, so an aborted

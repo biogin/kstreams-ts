@@ -8,8 +8,7 @@ import {
   tumbling,
   type Windowed,
 } from '../../src/index.js'
-import { keyValueStore } from '../../src/state-store.js'
-import { windowKeyEncoding } from '../../src/windows.js'
+import { keyValueStore, windowKeyEncoding } from '../support/internals.js'
 import {
   type BytesRecord,
   brokers,

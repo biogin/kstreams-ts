@@ -1,6 +1,10 @@
 import { IS_CONTROL, IS_TRANSACTIONAL, type RecordsBatch } from '@platformatic/kafka'
 import { describe, expect, it } from 'vitest'
-import { type AbortedTransaction, filterAbortedBatches } from '../src/read-committed.js'
+import {
+  type AbortedTransaction,
+  checkFetchArguments,
+  filterAbortedBatches,
+} from '../src/read-committed.js'
 
 const P = 5049n
 const Q = 7001n
@@ -173,5 +177,31 @@ describe('filterAbortedBatches', () => {
     expect(result[1]).toBe(batches[1])
     expect(result[3]).toBe(batches[3])
     expect(batches[0]?.records).toHaveLength(2)
+  })
+})
+
+describe('checkFetchArguments', () => {
+  // As @platformatic/kafka 2.14 calls its Fetch API: maxWaitMs, minBytes, maxBytes,
+  // isolationLevel (read_uncommitted, as ReadCommittedConsumer asks), sessionId, sessionEpoch,
+  // topics, forgottenTopicsData, rackId.
+  const fetchArguments = (): unknown[] => [5000, 1, 10_485_760, 0, 0, -1, [], [], undefined]
+
+  it('accepts the arguments of the supported client version', () => {
+    expect(() => checkFetchArguments(fetchArguments())).not.toThrow()
+    const withRack = fetchArguments()
+    withRack[8] = 'rack-a'
+    expect(() => checkFetchArguments(withRack)).not.toThrow()
+  })
+
+  it.each([
+    ['an extra argument', (args: unknown[]) => args.splice(3, 0, 1000)],
+    ['a missing argument', (args: unknown[]) => args.pop()],
+    ['another isolation level at position 3', (args: unknown[]) => (args[3] = 1)],
+    ['a non-integer session ID', (args: unknown[]) => (args[4] = 'session')],
+    ['topics that are not an array', (args: unknown[]) => (args[6] = new Map())],
+  ])('fails loudly on %s', (_change, change) => {
+    const args = fetchArguments()
+    change(args)
+    expect(() => checkFetchArguments(args)).toThrow(/@platformatic\/kafka 2\.14\.0 exactly/)
   })
 })

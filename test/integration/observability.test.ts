@@ -14,6 +14,7 @@ import {
   type StreamsAppErrorEvent,
   serdes,
 } from '../../src/index.js'
+import { total, withLabels } from '../support/metrics.js'
 import type { WorkersCountParams } from './fixtures/workers-count-app.js'
 import {
   brokers,
@@ -59,29 +60,6 @@ function observe(app: StreamsApp, metrics: Metric[]): Observed {
     .on('restore-end', (event) => observed.restoreEnds.push(event))
     .on('error', (event) => observed.errors.push(event))
   return observed
-}
-
-/** The sum of the counter `name`, over the metrics whose labels match `labels`. */
-function total(
-  metrics: readonly Metric[],
-  name: Metric['name'],
-  labels: Record<string, unknown> = {},
-): number {
-  return withLabels(metrics, name, labels).reduce((sum, metric) => sum + metric.value, 0)
-}
-
-function withLabels(
-  metrics: readonly Metric[],
-  name: Metric['name'],
-  labels: Record<string, unknown> = {},
-): Metric[] {
-  return metrics.filter(
-    (metric) =>
-      metric.name === name &&
-      Object.entries(labels).every(
-        ([label, value]) => (metric.labels as Record<string, unknown>)[label] === value,
-      ),
-  )
 }
 
 /** The last value of the gauge `name` with these labels. */

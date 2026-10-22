@@ -85,12 +85,6 @@ describeWithKafka('scale out across App Processes (exactly-once, 2 Workers each)
     }
   }
 
-  /** The sum of the committed offsets of `input`. */
-  async function consumed(applicationId: string, input: string): Promise<bigint> {
-    const committed = await kafka.committedOffsets(applicationId, input)
-    return [...committed.values()].reduce((sum, offset) => sum + offset, 0n)
-  }
-
   /**
    * Waits until the group is stable with `members` members and every partition assigned; returns
    * the partitions of each member, by client ID.
@@ -177,7 +171,7 @@ describeWithKafka('scale out across App Processes (exactly-once, 2 Workers each)
     try {
       const alone = await balanced(applicationId, input, 2, partitions)
       for (const tasks of alone.values()) expect(tasks).toHaveLength(4)
-      await eventually(async () => (await consumed(applicationId, input)) > 100n, {
+      await eventually(async () => (await kafka.consumed(applicationId, input)) > 100n, {
         timeoutMs: 30_000,
         message: 'progress of the first process',
       })
@@ -189,8 +183,8 @@ describeWithKafka('scale out across App Processes (exactly-once, 2 Workers each)
         expect(tasks, worker).toEqual(expect.arrayContaining(shared.get(worker) ?? []))
         expect(shared.get(worker), worker).toHaveLength(2)
       }
-      let before = await consumed(applicationId, input)
-      await eventually(async () => (await consumed(applicationId, input)) > before + 200n, {
+      let before = await kafka.consumed(applicationId, input)
+      await eventually(async () => (await kafka.consumed(applicationId, input)) > before + 200n, {
         timeoutMs: 30_000,
         message: 'progress with two processes',
       })
@@ -202,8 +196,8 @@ describeWithKafka('scale out across App Processes (exactly-once, 2 Workers each)
         expect(tasks, worker).toEqual(expect.arrayContaining(shared.get(worker) ?? []))
         expect(tasks, worker).toHaveLength(4)
       }
-      before = await consumed(applicationId, input)
-      await eventually(async () => (await consumed(applicationId, input)) > before + 200n, {
+      before = await kafka.consumed(applicationId, input)
+      await eventually(async () => (await kafka.consumed(applicationId, input)) > before + 200n, {
         timeoutMs: 30_000,
         message: 'progress after the second process left',
       })
@@ -211,7 +205,7 @@ describeWithKafka('scale out across App Processes (exactly-once, 2 Workers each)
       await producer.stop()
       total = producer.sent
     }
-    await eventually(async () => (await consumed(applicationId, input)) === BigInt(total), {
+    await eventually(async () => (await kafka.consumed(applicationId, input)) === BigInt(total), {
       timeoutMs: 60_000,
       message: 'every input record to be consumed',
     })

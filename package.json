@@ -34,7 +34,7 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "@platformatic/kafka": "^2.14.0",
+    "@platformatic/kafka": "2.14.0",
     "better-sqlite3": "^13.0.3"
   },
   "devDependencies": {

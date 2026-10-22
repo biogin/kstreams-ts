@@ -3,7 +3,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Producer } from '@platformatic/kafka'
 import { afterEach, beforeEach, expect, it } from 'vitest'
-import { CHECKPOINT_FILE, readCheckpoint } from '../../src/checkpoint.js'
 import {
   createStreamsApp,
   type StateStore,
@@ -14,8 +13,15 @@ import {
   stores,
   tumbling,
 } from '../../src/index.js'
-import { type ChangelogRecord, createChangelogReader } from '../../src/restore.js'
-import { keyValueStore, taskDirectory } from '../../src/state-store.js'
+import {
+  CHECKPOINT_FILE,
+  type ChangelogRecord,
+  createChangelogReader,
+  keyValueStore,
+  readCheckpoint,
+  storedEntries,
+  taskDirectory,
+} from '../support/internals.js'
 import {
   brokers,
   createKafka,
@@ -258,22 +264,12 @@ describeWithKafka('Restore from the Changelog (at-least-once, workers: 0)', () =
 
     // One record replayed (not the four before the Checkpoint, and no wipe), one processed.
     expect(second.run.writes).toBe(2)
-    const local = stores.sqlite()({
-      name: 'latest',
-      applicationId,
-      task: 0,
-      directory: taskDirectory(stateDir, applicationId, 0),
-    })
-    try {
-      expect(keyValueStore(local, strings, { topic: changelog }).all()).toEqual([
-        ['a', '3'],
-        ['b', 'from-changelog'],
-        ['c', '2'],
-        ['d', 'new'],
-      ])
-    } finally {
-      local.close()
-    }
+    expect(storedEntries(stateDir, applicationId, 0, 'latest', serdes.string)).toEqual([
+      ['a', '3'],
+      ['b', 'from-changelog'],
+      ['c', '2'],
+      ['d', 'new'],
+    ])
     expect(readCheckpoint(taskDirectory(stateDir, applicationId, 0))).toEqual(
       new Map([['latest', 6n]]),
     )

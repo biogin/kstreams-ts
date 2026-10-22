@@ -31,20 +31,19 @@ describeWithKafka('Co-partitioned input topics on real Kafka', () => {
       sessionTimeoutMs: 10_000,
       changelogReplicationFactor: 1,
     })
-    const merge = app.processor('merge', (ctx: ProcessorContext<string, string | null>) => ({
-      process(record: StreamRecord<string, string | null>) {
-        ctx.forward(record)
-      },
-    }))
-    app.stream(orders, strings).process(merge)
-    app
-      .stream(customers, strings)
-      .process(merge)
-      .groupByKey({ key: serdes.string })
-      .count()
-      .toStream()
-      .map((key, count) => ({ key, value: String(count) }))
-      .to(output, strings)
+    const counts = app.store('counts', { key: serdes.string, value: serdes.number })
+    const countBoth = app.processor('count', (ctx: ProcessorContext<string, string>) => {
+      const store = ctx.store(counts)
+      return {
+        process(record: StreamRecord<string, string | null>) {
+          const count = (store.get(record.key) ?? 0) + 1
+          store.put(record.key, count)
+          ctx.forward({ key: record.key, value: String(count), timestamp: record.timestamp })
+        },
+      }
+    })
+    app.stream(orders, strings).process(countBoth)
+    app.stream(customers, strings).process(countBoth).to(output, strings)
     apps.push(app)
     return app
   }
@@ -90,6 +89,7 @@ describeWithKafka('Co-partitioned input topics on real Kafka', () => {
 
     const started = app.start()
     await expect(started).rejects.toThrow(/not Co-partitioned/)
+    await expect(started).rejects.toThrow(/all input topics of an app must be Co-partitioned/)
     await expect(started).rejects.toThrow(`"${orders}" has 3 partitions`)
     await expect(started).rejects.toThrow(`"${customers}" has 2 partitions`)
     expect(app.state).toBe('error')

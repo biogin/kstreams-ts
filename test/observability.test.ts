@@ -11,6 +11,7 @@ import {
   type TopicPartition,
   tumbling,
 } from '../src/index.js'
+import { total } from './support/metrics.js'
 
 // Observability on Kafka (Application States while rebalancing and restoring, rebalance and
 // restore events, Worker metrics) is covered by test/integration/observability.test.ts.
@@ -21,11 +22,6 @@ const strings = { key: serdes.string, value: serdes.string }
 function recordingSink(): MetricsSink & { metrics: Metric[] } {
   const metrics: Metric[] = []
   return { metrics, record: (metric) => metrics.push(metric) }
-}
-
-/** The sum of the counter `name` over everything `sink` was given. */
-function total(sink: { metrics: Metric[] }, name: Metric['name']): number {
-  return sink.metrics.filter((metric) => metric.name === name).reduce((a, m) => a + m.value, 0)
 }
 
 describe('Streams App events', () => {
@@ -146,8 +142,8 @@ describe('Test Driver metrics', () => {
       lateRecordsDropped: 1,
     })
     // The app's metrics sink gets the same counts, as Worker 0's Task 0.
-    expect(total(sink, 'records-processed')).toBe(4)
-    expect(total(sink, 'late-records-dropped')).toBe(1)
+    expect(total(sink.metrics, 'records-processed')).toBe(4)
+    expect(total(sink.metrics, 'late-records-dropped')).toBe(1)
     const dropped = sink.metrics.filter((metric) => metric.name === 'records-dropped')
     expect(dropped).toEqual([
       {
