@@ -4,7 +4,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Consumer, FetchIsolationLevels } from '@platformatic/kafka'
+import { COOPERATIVE_STICKY_ASSIGNOR, Consumer, FetchIsolationLevels } from '@platformatic/kafka'
 import { afterEach, beforeEach, expect, it } from 'vitest'
 import {
   createStreamsApp,
@@ -201,8 +201,8 @@ describeWithKafka('revoke and graceful shutdown (workers: 0)', () => {
         message: 'the first batch to commit',
       })
 
-      // Another member joins the group: the eager rebalance revokes every Task of the app, and
-      // the newcomer keeps some of them (it consumes nothing).
+      // Another member joins the group: the cooperative rebalance revokes some Tasks of the app
+      // mid-batch, and the newcomer gets them (it consumes nothing).
       const intruder = new Consumer({
         clientId: uniqueName('intruder'),
         groupId: applicationId,
@@ -210,6 +210,7 @@ describeWithKafka('revoke and graceful shutdown (workers: 0)', () => {
         autocommit: false,
         sessionTimeout: 6_000,
         heartbeatInterval: 1_000,
+        protocols: [{ name: COOPERATIVE_STICKY_ASSIGNOR, version: 3 }],
       })
       consumers.push(intruder)
       const stream = await intruder.consume({

@@ -12,7 +12,7 @@ import {
 
 const port = parentPort
 if (port === null) throw new Error('worker-thread-entry runs in a worker thread only')
-const { appModule, applicationId, workerNumber } = workerData as WorkerThreadData
+const { appModule, applicationId, processId, workerNumber } = workerData as WorkerThreadData
 
 function send(message: FromWorkerThread): void {
   // The error keeps its class and properties across the boundary (see worker-thread.ts).
@@ -26,6 +26,7 @@ try {
   const worker = await startWorkerOf(module.default, {
     appModule,
     applicationId,
+    processId,
     workerNumber,
     onError: (error) => send({ type: 'failed', error }),
   })
