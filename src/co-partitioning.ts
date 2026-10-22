@@ -79,8 +79,9 @@ export async function checkCoPartitioned(
     .join(', ')
   throw new Error(
     `Streams App "${applicationId}" cannot start: its input topics are not Co-partitioned (${listed}). ` +
-      'A Task reads the same partition number from every input topic, so they need the same ' +
-      'partition count. Write the inputs to topics with matching counts (adding partitions ' +
-      'later moves keys to other partitions).',
+      'In kstreams-ts 0.1 all input topics of an app must be Co-partitioned: a Task reads the ' +
+      'same partition number from every input topic, so they need the same partition count ' +
+      '(there are no Repartition Topics yet). Write the inputs to topics with matching counts ' +
+      '(adding partitions later moves keys to other partitions).',
   )
 }

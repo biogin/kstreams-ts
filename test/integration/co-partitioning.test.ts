@@ -89,6 +89,7 @@ describeWithKafka('Co-partitioned input topics on real Kafka', () => {
 
     const started = app.start()
     await expect(started).rejects.toThrow(/not Co-partitioned/)
+    await expect(started).rejects.toThrow(/all input topics of an app must be Co-partitioned/)
     await expect(started).rejects.toThrow(`"${orders}" has 3 partitions`)
     await expect(started).rejects.toThrow(`"${customers}" has 2 partitions`)
     expect(app.state).toBe('error')
