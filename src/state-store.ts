@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import type { Serde, SerdeContext, Serdes } from './serde.js'
 import { openSqliteStore } from './sqlite-store.js'
 import { keyOf, storeKey } from './store-key.js'
+import { UnloggedWriteError } from './sync-dsl.js'
 
 /**
  * A key-value State Store as implementations provide it: keys and values are bytes, already
@@ -206,9 +207,19 @@ export function keyValueStore<K, V>(
         `Cannot write a ${k} key to a State Store: its Changelog "${context.topic}" is compacted, which needs a key`,
       )
     }
-    if (bytes === null) store.delete(key(k))
-    else store.put(key(k), bytes)
-    changelog?.(serdes.key.serialize(k, context), bytes)
+    // Everything that can fail on a key happens before the store changes.
+    const local = key(k)
+    const logged = changelog === undefined ? undefined : serdes.key.serialize(k, context)
+    if (bytes === null) store.delete(local)
+    else store.put(local, bytes)
+    if (changelog === undefined || logged === undefined) return
+    try {
+      changelog(logged, bytes)
+    } catch (cause) {
+      throw new UnloggedWriteError('A State Store write could not be logged to its Changelog', {
+        cause,
+      })
+    }
   }
   const entries = (found: Iterable<[Uint8Array, Uint8Array]>): [K, V][] =>
     Array.from(found, ([k, v]) => [encoding.decode(k, context), value(v)])

@@ -17,9 +17,17 @@ export class AsyncNotAllowedError extends Error {
   }
 }
 
+/**
+ * Internal: a State Store was changed but its Changelog record could not be produced, so skipping
+ * the record would leave state the Changelog doesn't have. It always fails the batch.
+ */
+export class UnloggedWriteError extends Error {
+  override readonly name = 'UnloggedWriteError'
+}
+
 /** Internal: whether `error` must stop the application without going to the error handlers. */
 export function skipsErrorHandlers(error: unknown): boolean {
-  return error instanceof AsyncNotAllowedError
+  return error instanceof AsyncNotAllowedError || error instanceof UnloggedWriteError
 }
 
 /** What a DSL function returning a Promise is told by the compiler. */
