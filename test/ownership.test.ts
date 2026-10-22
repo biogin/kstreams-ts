@@ -2,7 +2,11 @@ import { EventEmitter } from 'node:events'
 import { describe, expect, it } from 'vitest'
 import { type GroupMember, Ownership } from '../src/ownership.js'
 
-/** A consumer-group member as the client reports it: an assignment, a generation and events. */
+/**
+ * A consumer-group member as the client reports it: an assignment, a generation and events. The
+ * documented exception to "no mocking the Kafka client" (ADR-0016): it implements only the
+ * `GroupMember` interface `Ownership` reads, so rebalance interleavings run deterministically.
+ */
 class FakeMember extends EventEmitter implements GroupMember {
   generationId: number
   assignments: { topic: string; partitions: number[] }[]
