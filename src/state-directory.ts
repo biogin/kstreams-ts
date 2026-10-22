@@ -22,20 +22,17 @@
 // A lock file names its holder and the process (PID, and when the host booted). A lock is stale,
 // and taken over, when that process is gone: its PID isn't running, or the host has rebooted
 // since. A lock of this same process is never stale: the Streams App removes the Task locks of its
-// Workers when they have all stopped, even those of a worker thread that was terminated. Taking
-// over a stale lock can race with another process taking it over at the same moment; the loser
-// notices, except in a tiny window where both believe they hold it.
+// Workers when they have all stopped, even those of a worker thread that was terminated.
+//
+// Taking over a stale lock keeps it exclusive throughout, however many contenders race: a lock is
+// only ever created where none is (a hard link, which fails if the name exists), and removed by
+// its holder or, once stale, by whoever holds its claim: a lock file named after the stale lock's
+// content (`.lock.<digest>.claim`), taken the same way. Each lock's content is unique (it has a
+// random nonce), so a contender that saw a lock go stale and claims it late finds another lock in
+// its place, and leaves it be. A claim whose holder died is stale too, and taken over likewise.
 
-import { randomBytes } from 'node:crypto'
-import {
-  linkSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs'
+import { createHash, randomBytes } from 'node:crypto'
+import { linkSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { uptime } from 'node:os'
 import { join } from 'node:path'
 import { taskDirectory } from './state-store.js'
@@ -124,10 +121,24 @@ export function unlockTasksOf(stateDir: string, applicationId: string, processId
     return
   }
   for (const task of tasks) {
-    const lock = join(taskDirectory(stateDir, applicationId, Number(task)), LOCK_FILE)
-    const holder = readLock(lock)
-    if (holder?.pid === process.pid && holder.holder.startsWith(`${processId}/`)) {
-      rmSync(lock, { force: true })
+    const directory = taskDirectory(stateDir, applicationId, Number(task))
+    let names: string[]
+    try {
+      names = readdirSync(directory)
+    } catch {
+      continue
+    }
+    // The Task's lock, and claims of stale ones that a terminated worker thread left behind.
+    const locks = names.filter(
+      (name) =>
+        name === LOCK_FILE || (name.startsWith(`${LOCK_FILE}.`) && name.endsWith(CLAIM_SUFFIX)),
+    )
+    for (const name of locks) {
+      const lock = join(directory, name)
+      const holder = readLock(lock)
+      if (holder?.pid === process.pid && holder.holder.startsWith(`${processId}/`)) {
+        rmSync(lock, { force: true })
+      }
     }
   }
 }
@@ -138,55 +149,77 @@ interface LockHolder {
   booted: number
 }
 
+const CLAIM_SUFFIX = '.claim'
+
 /**
  * Takes the lock `file` for `holder` unless someone else holds it. If `holder` holds it already,
  * returns true when `reentrant`, false otherwise.
  */
-export function tryLock(file: string, holder: string, reentrant = false): boolean {
-  const mine: LockHolder = { holder, pid: process.pid, booted: BOOTED }
+export function tryLock(
+  file: string,
+  holder: string,
+  reentrant = false,
+  files: LockFiles = lockFiles,
+): boolean {
   for (;;) {
     // Written in full under another name first, so nobody ever reads a half-written lock.
+    const mine = { holder, pid: process.pid, booted: BOOTED, nonce: randomBytes(8).toString('hex') }
     const draft = `${file}.${randomBytes(4).toString('hex')}.tmp`
-    writeFileSync(draft, JSON.stringify(mine))
+    files.write(draft, JSON.stringify(mine))
     try {
-      linkSync(draft, file)
+      files.link(draft, file)
       return true
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
     } finally {
-      rmSync(draft, { force: true })
+      files.remove(draft)
     }
-    const content = readContent(file)
+    const content = files.read(file)
     if (content === undefined) continue // just removed
     const current = parseLock(content)
     if (current !== undefined && current.pid === process.pid && current.holder === holder) {
       return reentrant
     }
     if (current !== undefined && !isStale(current)) return false
-    // Stale: move it away, and make sure it was the stale lock that moved.
-    const moved = `${file}.${randomBytes(4).toString('hex')}.stale`
+    // Stale: only the holder of its claim removes it, and only while it is still this very lock.
+    const claim = `${file}.${createHash('sha256').update(content).digest('hex').slice(0, 16)}${CLAIM_SUFFIX}`
+    // Reentrant: a claim of this very holder can only be left over from a terminated worker thread.
+    if (!tryLock(claim, holder, true, files)) return false // another contender takes it over
     try {
-      renameSync(file, moved)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
-      throw error
+      if (files.read(file) === content) files.remove(file)
+    } finally {
+      unlock(claim, holder, files)
     }
-    if (readContent(moved) !== content) {
-      // Someone took it over meanwhile: put their lock back.
-      try {
-        linkSync(moved, file)
-      } catch {
-        // They hold another one by now.
-      }
-    }
-    rmSync(moved, { force: true })
   }
 }
 
 /** Removes the lock `file` if `holder` (in this process) holds it. */
-function unlock(file: string, holder: string): void {
-  const current = readLock(file)
-  if (current?.pid === process.pid && current.holder === holder) rmSync(file, { force: true })
+export function unlock(file: string, holder: string, files: LockFiles = lockFiles): void {
+  const content = files.read(file)
+  const current = content === undefined ? undefined : parseLock(content)
+  if (current?.pid === process.pid && current.holder === holder) files.remove(file)
+}
+
+/**
+ * The file operations of locks. Unit tests run other contenders between them, to check every
+ * interleaving.
+ */
+export interface LockFiles {
+  /** Writes `content` to the new or existing file `path`. */
+  write(path: string, content: string): void
+  /** Links `path` to `existing`; throws EEXIST if `path` exists. */
+  link(existing: string, path: string): void
+  /** The content of `path`, or undefined if it doesn't exist. */
+  read(path: string): string | undefined
+  /** Removes `path`, if it exists. */
+  remove(path: string): void
+}
+
+const lockFiles: LockFiles = {
+  write: (path, content) => writeFileSync(path, content),
+  link: (existing, path) => linkSync(existing, path),
+  read: (path) => readContent(path),
+  remove: (path) => rmSync(path, { force: true }),
 }
 
 function readLock(file: string): LockHolder | undefined {
