@@ -27,6 +27,12 @@ export type FromWorkerThread =
   | { type: 'running' }
   | { type: 'stopped' }
   /**
+   * The running Worker failed, with this root cause; it is closing its clients and reports
+   * `failed` (or `stopped`, if it gave up closing gracefully) once done. Sent first, so that errors
+   * its closing causes, in this thread or others, can't be taken for the cause.
+   */
+  | { type: 'failing'; error: unknown }
+  /**
    * The Worker couldn't start, or stopped because of an error; it has closed its clients. The
    * error is sent as {@link transferableError} made it.
    */
@@ -73,17 +79,24 @@ export function startWorkerThread(options: WorkerThreadOptions): Promise<Worker>
 
   let running = false
   let stopped = false
+  /** The first error: what the Worker reports. */
   let failure: { error: unknown } | undefined
+  /** An uncaught exception in the thread, reported once the thread has exited. */
+  let uncaught: { error: unknown } | undefined
   let onStart: { resolve(worker: Worker): void; reject(error: unknown): void } | undefined
-  let onStopped: (() => void) | undefined
 
-  function fail(error: unknown): void {
+  /** Remembers the first error the Worker reports; later ones are consequences of it. */
+  function report(error: unknown): void {
     if (failure !== undefined || stopped) return
     failure = { error }
-    void thread.terminate()
     if (running) options.onError(error)
     else void exited.then(() => onStart?.reject(error))
-    onStopped?.()
+  }
+
+  /** Reports `error`, unless an earlier one was, and ends the thread. */
+  function end(error: unknown): void {
+    report(error)
+    void thread.terminate()
   }
 
   thread.on('message', (message: FromWorkerThread) => {
@@ -93,15 +106,23 @@ export function startWorkerThread(options: WorkerThreadOptions): Promise<Worker>
     } else if (message.type === 'stopped') {
       stopped = true
       void thread.terminate()
-      onStopped?.()
+    } else if (message.type === 'failing') {
+      report(errorFromThread(message.error))
     } else {
-      fail(errorFromThread(message.error))
+      end(errorFromThread(message.error))
     }
   })
-  // An uncaught exception in the thread, e.g. thrown by the App Module.
-  thread.on('error', fail)
+  // An uncaught exception in the thread, e.g. thrown by the App Module. The thread exits right
+  // after; the messages it sent before are delivered by then (see below), so a root cause it
+  // reported comes first even though the exception arrives on another channel.
+  thread.on('error', (error) => {
+    uncaught ??= { error }
+  })
   void exited.then((code) => {
-    fail(new Error(`Worker ${workerNumber} exited unexpectedly (exit code ${code})`))
+    end(
+      uncaught?.error ??
+        new Error(`Worker ${workerNumber} exited unexpectedly (exit code ${code})`),
+    )
   })
 
   let stopping: Promise<void> | undefined
@@ -112,22 +133,22 @@ export function startWorkerThread(options: WorkerThreadOptions): Promise<Worker>
     },
   }
 
+  /**
+   * Asks a running Worker to stop; a failing one is stopping already. Either reports `stopped` or
+   * `failed`, which ends the thread; one that takes too long is terminated.
+   */
   async function stopThread(): Promise<void> {
     if (failure === undefined && !stopped) {
-      const done = new Promise<void>((resolve) => {
-        onStopped = resolve
-      })
       thread.postMessage({ type: 'stop' } satisfies ToWorkerThread)
-      let timeout: NodeJS.Timeout | undefined
-      const timedOut = new Promise<void>((resolve) => {
-        timeout = setTimeout(resolve, options.shutdownTimeoutMs + STOP_MARGIN_MS)
-      })
-      await Promise.race([done, timedOut])
-      clearTimeout(timeout)
-      if (failure === undefined && !stopped) {
-        fail(new Error(`Worker ${workerNumber} did not stop in time; its thread was terminated`))
-      }
     }
+    let timeout: NodeJS.Timeout | undefined
+    const timedOut = new Promise<boolean>((resolve) => {
+      timeout = setTimeout(() => resolve(true), options.shutdownTimeoutMs + STOP_MARGIN_MS)
+    })
+    const late = await Promise.race([exited.then(() => false), timedOut])
+    clearTimeout(timeout)
+    if (late)
+      end(new Error(`Worker ${workerNumber} did not stop in time; its thread was terminated`))
     await exited
     if (failure !== undefined) throw failure.error
   }

@@ -21,11 +21,25 @@ export interface WorkersCountParams {
   workers: number
   stateDir: string
   failOn?: string
+  /**
+   * The failing Worker's thread also crashes right after, with an uncaught "Connection closed" (as
+   * a Kafka client's unhandled 'error' event while closing would), before its Worker has closed.
+   */
+  crashAfterFail?: boolean
   noAppInWorkers?: boolean
 }
 
-const { applicationId, brokers, input, output, workers, stateDir, failOn, noAppInWorkers } =
-  JSON.parse(process.env.KSTREAMS_APP_PARAMS ?? '{}') as WorkersCountParams
+const {
+  applicationId,
+  brokers,
+  input,
+  output,
+  workers,
+  stateDir,
+  failOn,
+  crashAfterFail,
+  noAppInWorkers,
+} = JSON.parse(process.env.KSTREAMS_APP_PARAMS ?? '{}') as WorkersCountParams
 
 const app = createStreamsApp({
   applicationId,
@@ -40,7 +54,14 @@ const app = createStreamsApp({
 app
   .stream(input, { key: serdes.string, value: serdes.string })
   .peek((_key, value) => {
-    if (value === failOn && firstToFail()) throw new Error('Processor failed on purpose')
+    if (value === failOn && firstToFail()) {
+      if (crashAfterFail) {
+        setImmediate(() => {
+          throw new Error('Connection closed')
+        })
+      }
+      throw new Error('Processor failed on purpose')
+    }
   })
   .groupByKey()
   .count({ store: 'counts' })

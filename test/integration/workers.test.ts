@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, expect, it } from 'vitest'
+import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import type { WorkersCountParams } from './fixtures/workers-count-app.js'
 import { type AppProcess, launchAppModule } from './harness/app-process.js'
 import {
@@ -110,6 +110,41 @@ describeWithKafka('worker threads on real Kafka (exactly-once, workers: 2)', () 
       await eventually(async () => (await kafka.groupMembers(applicationId)) === 0, {
         message: 'both Workers leaving the group',
       })
+    } finally {
+      await expect(app.stop()).rejects.toThrow('Processor failed on purpose')
+      delete process.env.KSTREAMS_APP_PARAMS
+    }
+  })
+
+  it('reports the root cause when a shutdown error reaches the main thread first', async () => {
+    const input = await kafka.createTopic('workers-input', 2)
+    const output = await kafka.createTopic('workers-output', 2)
+    const applicationId = uniqueName('workers-crash')
+    const stateDir = mkdtempSync(join(tmpdir(), 'kstreams-workers-'))
+    directories.push(stateDir)
+    // The failing thread dies of an uncaught "Connection closed" while its Worker is still rolling
+    // back, before it could report `failed`: the race a Kafka client's unhandled 'error' event
+    // during the close caused.
+    const params: WorkersCountParams = {
+      applicationId,
+      brokers,
+      input,
+      output,
+      workers: 2,
+      stateDir,
+      failOn: 'boom',
+      crashAfterFail: true,
+    }
+    process.env.KSTREAMS_APP_PARAMS = JSON.stringify(params)
+    // A fresh instance of the App Module, built from these params.
+    vi.resetModules()
+    const { default: app } = await import('./fixtures/workers-count-app.js')
+    if (app === undefined) throw new Error('The App Module exports no app')
+    try {
+      await app.start()
+      kafka.deleteOnClose(`${applicationId}-counts-changelog`)
+      await kafka.produce(input, [{ key: 'k', value: 'boom', timestamp: now }])
+      await eventually(() => app.state === 'error', { message: 'the error state' })
     } finally {
       await expect(app.stop()).rejects.toThrow('Processor failed on purpose')
       delete process.env.KSTREAMS_APP_PARAMS

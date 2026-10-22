@@ -3,6 +3,7 @@
 
 import { parentPort, workerData } from 'node:worker_threads'
 import { startWorkerOf } from './streams-app.js'
+import type { Worker } from './worker.js'
 import {
   type FromWorkerThread,
   type ToWorkerThread,
@@ -17,27 +18,37 @@ const { appModule, applicationId, processId, workerNumber } = workerData as Work
 function send(message: FromWorkerThread): void {
   // The error keeps its class and properties across the boundary (see worker-thread.ts).
   port?.postMessage(
-    message.type === 'failed' ? { ...message, error: transferableError(message.error) } : message,
+    'error' in message ? { ...message, error: transferableError(message.error) } : message,
   )
+}
+
+let stopping: Promise<void> | undefined
+/** Stops the Worker once, and reports how it ended. */
+function stop(worker: Worker): Promise<void> {
+  stopping ??= worker.stop().then(
+    () => send({ type: 'stopped' }),
+    (error: unknown) => send({ type: 'failed', error }),
+  )
+  return stopping
 }
 
 try {
   const module = (await import(appModule)) as { default?: unknown }
-  const worker = await startWorkerOf(module.default, {
+  const starting = startWorkerOf(module.default, {
     appModule,
     applicationId,
     processId,
     workerNumber,
-    onError: (error) => send({ type: 'failed', error }),
+    // The root cause goes first, before the Worker closes its clients (see `failing`); `failed`
+    // follows once it has closed them.
+    onError: (error) => {
+      send({ type: 'failing', error })
+      void starting.then(stop)
+    },
   })
-  port.on('message', async (message: ToWorkerThread) => {
-    if (message.type !== 'stop') return
-    try {
-      await worker.stop()
-      send({ type: 'stopped' })
-    } catch (error) {
-      send({ type: 'failed', error })
-    }
+  const worker = await starting
+  port.on('message', (message: ToWorkerThread) => {
+    if (message.type === 'stop') void stop(worker)
   })
   send({ type: 'running' })
 } catch (error) {

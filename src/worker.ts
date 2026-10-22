@@ -116,7 +116,11 @@ export interface WorkerOptions {
   stateDir: string | undefined
   /** Names the Worker in the Task directory locks it takes (see state-directory.ts). */
   lockHolder: string
-  /** Called once if the Worker stops because of an error; it has closed its clients by then. */
+  /**
+   * Called once if the Worker stops because of an error, with the first error (the root cause), as
+   * soon as it happens: before the Worker has rolled back and closed its clients, so that what
+   * closing them causes (here or in other Workers) can't be reported before it.
+   */
   onError(error: unknown): void
 }
 
@@ -163,6 +167,14 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
     // partitions each member owns, and the generation it owned them in.
     protocols: [{ name: COOPERATIVE_STICKY_ASSIGNOR, version: 3 }],
     partitionAssigner: assignTasks,
+  })
+  // A failed rejoin of the group in the background is emitted as an 'error' event, which would be
+  // an uncaught exception without a listener. It fails the commit cycle, unless the Worker is
+  // stopping or closing already: then it's a consequence of leaving the group, not an error.
+  let closing = false
+  let onClientError: (error: unknown) => void = () => {}
+  consumer.on('error', (error: unknown) => {
+    if (!closing) onClientError(error)
   })
   let roundRobin = 0
   const producer = new Producer<Bytes, Bytes, Bytes, Bytes>({
@@ -249,18 +261,19 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
     restorer,
     stableOffsets,
   })
+  onClientError = (error) => cycle.clientFailed(error)
   const done = cycle.run().then(
     () => close(),
     async (error: unknown) => {
       await close(true).catch(() => {})
-      options.onError(error)
       throw error
     },
   )
-  // `stop()` reports the error; `onError` already did if nobody calls it.
+  // `stop()` reports the error; the cycle's `onError` already did if nobody calls it.
   done.catch(() => {})
 
   async function close(force = false): Promise<void> {
+    closing = true
     try {
       await cycle.closeStream()
     } finally {
@@ -458,10 +471,24 @@ class CommitCycle {
     await this.#stream.close()
   }
 
-  /** Remembers the first failure and ends the batch, which then fails (fail-fast). */
+  /**
+   * A client failed in the background (e.g. the consumer could not rejoin the group): fails the
+   * Worker, unless it is stopping, when that's a consequence of the stop.
+   */
+  clientFailed(error: unknown): void {
+    if (!this.#stopRequested) this.#fail(error)
+  }
+
+  /**
+   * Remembers the first failure, the root cause, reports it at once, and ends the batch, which
+   * then fails (fail-fast). Later errors are consequences (closed stores, cancelled starts, a
+   * rolled-back transaction) and are dropped, as is everything once a stop gave the batch up.
+   */
   #fail(error: unknown): void {
-    this.#failure ??= { error }
+    if (this.#failure !== undefined || this.#abandoned) return
+    this.#failure = { error }
     this.#interrupt()
+    this.#options.onError(error)
   }
 
   async run(): Promise<void> {
@@ -474,10 +501,13 @@ class CommitCycle {
     } catch (error) {
       // After a stop gave up, what was still running fails against closed stores and clients.
       if (this.#abandoned) return
-      // The error is what the Worker reports, not a failure to abort. A Kafka abort rolls back
-      // the store transactions too; their writes' Changelog records are aborted with it.
+      // The Worker reports its first failure (the root cause), not whatever ended the cycle.
+      this.#fail(error)
+      const failure = this.#failure ?? { error }
+      // Not a failure to abort either. A Kafka abort rolls back the store transactions too; their
+      // writes' Changelog records are aborted with it.
       await this.#committer.abort().catch(() => {})
-      throw error
+      throw failure.error
     } finally {
       // The read still pending when the cycle ends settles once the stream closes.
       this.#next.catch(() => {})
