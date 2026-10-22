@@ -12,6 +12,7 @@ const view = serdes.json<{ path: string }>()
 
 app
   .stream('page-views', { key: serdes.string, value: view })
+  // A record's value can be null (a deletion, or tombstone): skip those.
   .filter((_userId, value): value is { path: string } => value !== null)
   .groupByKey()
   .count({ store: 'views-per-user' })

@@ -1534,9 +1534,9 @@ class AtLeastOnceCommitter implements BatchCommitter {
  * `TransactionTimedOutError`, and so does any step after the broker aborted it for its timeout.
  * The broker answers that with the same epoch errors as fencing by another producer, so an epoch
  * error counts as a timeout only once the transaction has been open for the timeout. The next
- * transaction then takes the transactional ID up again with the epoch the producer had: the
- * broker accepts that only if no other producer took the ID over since, and fences it otherwise,
- * which fails the Worker.
+ * transaction then takes the transactional ID up again with the epoch the producer had (Kafka
+ * 3.x: the one after it, see `#begin`): the broker accepts that only if no other producer took
+ * the ID over since, and fences it otherwise, which fails the Worker.
  */
 class TransactionalCommitter implements BatchCommitter {
   readonly #consumer: Consumer<Bytes, Bytes, Bytes, Bytes>
@@ -1621,11 +1621,27 @@ class TransactionalCommitter implements BatchCommitter {
     if (this.#transaction !== undefined) return this.#transaction
     const retake = this.#retake
     this.#retake = undefined
-    // The client takes the ID up with `retake` if it dropped its epoch after the error; else it
-    // still has the old epoch, and is told to.
-    const transaction = await this.#producer.beginTransaction(retake ?? {})
-    if (retake !== undefined && this.#producer.producerEpoch === retake.producerEpoch) {
-      await this.#producer.initIdempotentProducer(retake)
+    let transaction: Transaction
+    try {
+      transaction =
+        retake === undefined
+          ? await this.#producer.beginTransaction()
+          : await this.#beginRetaking(retake, retake.producerEpoch)
+    } catch (error) {
+      if (
+        retake === undefined ||
+        findErrorBy(error as Error, 'apiId', 'PRODUCER_FENCED') === null
+      ) {
+        throw error
+      }
+      // Kafka 3.x fences a timed-out transaction's epoch for good: it bumps the epoch by one and
+      // forgets the old one, so only the bumped epoch takes the ID up. Another producer that
+      // took the ID over during the transaction left a later epoch (its fence, then its own
+      // bump), which still fences this one.
+      transaction = await this.#beginRetaking(
+        { ...retake, producerEpoch: retake.producerEpoch + 1 },
+        retake.producerEpoch,
+      )
     }
     this.#transaction = transaction
     this.#openedAt = performance.now()
@@ -1634,6 +1650,25 @@ class TransactionalCommitter implements BatchCommitter {
       producerId === undefined || producerEpoch === undefined
         ? undefined
         : { producerId, producerEpoch }
+    return transaction
+  }
+
+  /**
+   * Begins a transaction that takes the transactional ID up with `retake`. The client does that
+   * itself if it dropped its epoch after the error; if it still has the `stale` one, it is told to.
+   */
+  async #beginRetaking(
+    retake: { producerId: bigint; producerEpoch: number },
+    stale: number,
+  ): Promise<Transaction> {
+    const transaction = await this.#producer.beginTransaction(retake)
+    if (this.#producer.producerEpoch !== stale) return transaction
+    try {
+      await this.#producer.initIdempotentProducer(retake)
+    } catch (error) {
+      await transaction.cancel().catch(() => {})
+      throw error
+    }
     return transaction
   }
 

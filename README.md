@@ -2,6 +2,8 @@
 
 Partition-aware stateful stream processing on Kafka for Node.js, with fault-tolerant State Stores and exactly-once processing. Inspired by Kafka Streams' concepts, not its API.
 
+Capitalized terms (Streams App, Task, Worker, State Store, Changelog, Restore, ...) are defined in the glossary, [CONTEXT.md](./CONTEXT.md).
+
 - **Typed DSL and a Processor API.** `filter`, `map`, `groupByKey`, `count`, `aggregate`, `reduce` and tumbling windows, on top of Processors you can also write yourself.
 - **Fault-tolerant state.** Every State Store write goes to a compacted Changelog topic; local state is SQLite. State survives crashes, restarts and rebalances through Restore.
 - **Exactly-once or at-least-once.** Outputs, store updates and consumed offsets commit atomically in one Kafka transaction. The claim is backed by a [crash test suite](./docs/delivery-guarantees.md#the-crash-test-suite) that runs nightly.
@@ -12,7 +14,7 @@ Partition-aware stateful stream processing on Kafka for Node.js, with fault-tole
 
 ## Install
 
-Requires Node.js 24 or later and a Kafka cluster, version 3.6 or later ([broker support](./docs/operations.md#broker-version-support)). The package is ESM only.
+Requires Node.js 24 or later and a Kafka cluster, version 3.6 or later; CI tests Kafka 3.9 and 4.x ([broker support](./docs/operations.md#broker-version-support)). The package is ESM only.
 
 ```sh
 npm install kstreams-ts
@@ -39,6 +41,7 @@ const view = serdes.json<{ path: string }>()
 
 app
   .stream('page-views', { key: serdes.string, value: view })
+  // A record's value can be null (a deletion, or tombstone): skip those.
   .filter((_userId, value): value is { path: string } => value !== null)
   .groupByKey()
   .count({ store: 'views-per-user' })
@@ -48,7 +51,7 @@ app
 export default app
 ```
 
-Start it, and stop it gracefully on SIGTERM so the current batch commits and the app leaves the consumer group:
+Start it from a second file. The file that builds the app only exports it, with no side effects, so it can later serve as the [App Module](./docs/workers.md#the-app-module) that worker threads import. Stop it gracefully on SIGTERM so the current batch commits and the app leaves the consumer group:
 
 ```ts
 import app from './quick-start.js'
@@ -77,11 +80,9 @@ Test it without Kafka, with the [Test Driver](./docs/test-driver.md).
 11. [Operations: state directory, disposable disks, broker versions](./docs/operations.md)
 12. [Known limitations](./docs/limitations.md)
 
-More: the glossary [CONTEXT.md](./CONTEXT.md) defines the terms used here (Streams App, Task, Worker, Changelog, Restore, ...); design decisions are in [docs/adr/](./docs/adr/); examples are in [examples/](./examples/); see the [CHANGELOG](./CHANGELOG.md).
+More: design decisions are in [docs/adr/](./docs/adr/); examples are in [examples/](./examples/); see the [CHANGELOG](./CHANGELOG.md).
 
 ## Development
-
-Requires Node ≥24.
 
 ```sh
 npm install
@@ -114,7 +115,7 @@ The defaults (4 iterations of 5 SIGKILLs) take about 3 minutes. Settings, as env
 - `KSTREAMS_CRASH_KILLS`: SIGKILLs per iteration (default 5).
 - `KSTREAMS_CRASH_SEED`: base seed; iteration `i` (from 0) uses seed + `i` (default: random). The seed fixes the plan (partitions, keys, commit settings, input values, kill strategies and delays), not the broker's timing.
 
-The suite also checks Restore's Changelog reader (`createChangelogReader`) against the log. It once dropped committed records now and then, through the client's read_committed filter (platformatic/kafka#467); reads now go through `src/read-committed.ts`, which filters aborted transactions per fetch response the way the Java client does.
+The suite also checks Restore's Changelog reader (`createChangelogReader`) against the log.
 
 Each iteration prints its seed, plan and kills. A failure names its seed and the command that reruns that iteration alone, e.g. `KSTREAMS_CRASH_SEED=1234 KSTREAMS_CRASH_ITERATIONS=1 KSTREAMS_CRASH_KILLS=5 npm run test:crash`.
 
