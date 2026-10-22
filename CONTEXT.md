@@ -10,6 +10,10 @@ A TypeScript library for partition-aware, stateful stream processing on Kafka fo
 The in-process object, defined by an Application ID, that runs one or more Workers; many processes running the same Streams App form one application.
 _Avoid_: App, client, instance, topology
 
+**App Process**:
+One OS process running a Streams App. Its App Process ID, kept in the state directory and taken again on restart, makes its Workers' transactional IDs unique across processes.
+_Avoid_: Instance, node, pod
+
 **App Module**:
 The module that exports a Streams App definition without side effects, so that each Worker can import it and rebuild the same app.
 _Avoid_: Entry file, worker script, bootstrap
