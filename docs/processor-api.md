@@ -61,7 +61,7 @@ Records carry Tombstones: a Processor reading a topic sees `null` values and dec
 ## Timers
 
 - `'stream-time'` timers fire as the Task's Stream Time advances. One scheduled before the Task saw a record starts counting from the first record's Event Time. Because Stream Time only moves with records, an idle partition fires no Stream Time timers.
-- `'wall-clock-time'` timers fire as wall-clock time passes.
+- `'wall-clock-time'` timers fire as wall-clock time passes (under exactly-once, a Task with nothing committed yet fires them only once it processes a record: see [Delivery Guarantees](delivery-guarantees.md)).
 
 If time jumps over several intervals, the timer fires once, with the current time. Timers fire between records, never during one, and are not persisted: after a restart, or when a rebalance moves a Task to another process, the new Task is created and its supplier schedules them again. A Task kept across a cooperative rebalance keeps its timers. Errors raised by a timer callback stop the app; they aren't given to [error handlers](./error-handlers.md), because there is no record to skip.
 

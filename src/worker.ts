@@ -62,7 +62,10 @@
 //   again from its committed offset. Tasks still starting had no part in the batch and go on
 //   starting. Any other batch commits, with the consumer's current group generation, and with
 //   offsets of every Task that had a part in it (`fencingOffsets` for those with only timer-driven
-//   writes), so the group coordinator fences a Worker that is no longer a member.
+//   writes: their committed offsets, known from what the Worker committed or from the stable
+//   offsets the Task started from), so the group coordinator fences a Worker that is no longer a
+//   member. A Task with nothing committed yet that read no record in the batch keeps its
+//   wall-clock timers due until it has (see `#fenceable`).
 // - At-least-once: the batch commits its outputs, and the offsets of the partitions still owned;
 //   the new owner of a lost partition processes its records again.
 // Either way the Tasks of lost partitions are closed, and their starts cancelled; one that comes
@@ -929,8 +932,11 @@ class CommitCycle {
       this.#tasks.set(partition, starting.task)
       for (const [topic, offset] of starting.stable ?? []) {
         const key = topicPartitionKey(topic, partition)
-        const position = this.#position.get(key)
-        if (position === undefined || offset > position) this.#position.set(key, offset)
+        // Committed already: processed, and an offset to fence the Task's timer-driven writes.
+        for (const positions of [this.#position, this.#committedPosition]) {
+          const position = positions.get(key)
+          if (position === undefined || offset > position) positions.set(key, offset)
+        }
       }
       for (const message of starting.held) {
         if (this.#accepts(message)) {
@@ -1089,7 +1095,9 @@ class CommitCycle {
     const lost = this.#ownership.takeLost()
     if (this.#failure === undefined) {
       for (const [partition, task] of this.#tasks) {
-        if (!lost.has(partition)) this.#track(task.fireWallClockTimers())
+        if (!lost.has(partition) && this.#fenceable(partition)) {
+          this.#track(task.fireWallClockTimers())
+        }
       }
     }
     await Promise.all(this.#work)
@@ -1156,6 +1164,19 @@ class CommitCycle {
     }
     this.#forget(lost)
     if (lost.size > 0 && !this.#stopRequested) await this.#rewind()
+  }
+
+  /**
+   * Whether the transaction can hold an offset of the Task of `partition`, so that its writes are
+   * fenced (see `fencingOffsets`): it read a record in the batch, or has a committed offset.
+   * Exactly-once, a Task that can't (nothing of it committed yet, and no record read) keeps its
+   * wall-clock timers due until it can, rather than commit their writes unfenced.
+   */
+  #fenceable(partition: number): boolean {
+    if (!this.#exactlyOnce) return true
+    const ofTask = (key: TopicPartitionKey) => fromTopicPartitionKey(key).partition === partition
+    if ([...this.#lastRead.keys()].some(ofTask)) return true
+    return [...this.#committedPosition].some(([key, position]) => ofTask(key) && position > 0n)
   }
 
   /**
