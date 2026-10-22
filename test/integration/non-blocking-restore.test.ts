@@ -223,17 +223,20 @@ describeWithKafka('Restore without blocking other Tasks (SQLite, workers: 0)', (
 
   it('a Task revoked during its Restore is given up and restored by its new owner (exactly-once)', async () => {
     const { input, output, applicationId, open } = await prepare('exactly-once')
-    // One state directory for both App Processes: the new owner waits for the Task's lock.
-    const stateDir = stateDirectory()
-    const config = { applicationId, guarantee: 'exactly-once' as const, stateDir }
-    const first = counter(config, input, output)
+    // Each App Process has its own state directory (ADR-0017): the new owner restores in full.
+    const config = () => ({
+      applicationId,
+      guarantee: 'exactly-once' as const,
+      stateDir: stateDirectory(),
+    })
+    const first = counter(config(), input, output)
     await first.start()
     await kafka.produce(input, records('b', RESTORING, 5))
     await kafka.produce(input, records('a', 0, 1))
     await waitForCounts(output, 'a', 2)
 
     // The second App Process takes the highest Task, the restoring one (task-assignor.ts).
-    const second = counter(config, input, output)
+    const second = counter(config(), input, output)
     await second.start()
     await eventually(
       async () => {
