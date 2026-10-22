@@ -2,6 +2,7 @@
 // Module named by the parent, builds the Streams App from the parent's params, starts it and tells
 // the parent over IPC once it is running. SIGTERM stops it gracefully; SIGKILL comes from outside.
 
+import { inspect } from 'node:util'
 import type { StreamsApp } from '../../../src/index.js'
 import type { AppProcessMessage } from './app-process.js'
 
@@ -25,7 +26,7 @@ async function stopAndExit(): Promise<never> {
     await app.stop()
     process.exit(0)
   } catch (error) {
-    console.error(error)
+    console.error(inspect(error, { depth: 8 }))
     process.exit(1)
   }
 }
@@ -37,7 +38,7 @@ process.once('disconnect', () => void stopAndExit())
 try {
   await app.start()
 } catch (error) {
-  console.error(error)
+  console.error(inspect(error, { depth: 8 }))
   process.exit(1)
 }
 send({ type: 'running' })

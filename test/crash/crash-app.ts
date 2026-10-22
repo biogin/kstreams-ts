@@ -3,6 +3,9 @@
 // `counts`; `aggregate()` folds their values into an order-sensitive checksum in `chains`. Each new
 // count and checksum goes to its output topic as a string. Commits are frequent and batches short,
 // so that a kill at a random time often lands near a commit.
+//
+// With worker threads, the App Process runs crash-workers-app.ts instead, which builds this same
+// app with `workers` (ADR-0013).
 
 import { createStreamsApp, type StreamsApp, serdes, stores } from '../../src/index.js'
 
@@ -15,6 +18,8 @@ export interface CrashParams {
   stateDir: string
   commitIntervalMs: number
   commitMaxRecords: number
+  /** Worker threads (only with crash-workers-app.ts); none by default. */
+  workers?: number
 }
 
 /** Keeps checksums well below 2^53, so that they stay exact as doubles. */
@@ -25,16 +30,21 @@ export function nextChain(chain: number, value: string): number {
   return (chain * 31 + Number(value)) % MODULUS
 }
 
-export default function crashApp({
-  applicationId,
-  brokers,
-  input,
-  countsOutput,
-  chainsOutput,
-  stateDir,
-  commitIntervalMs,
-  commitMaxRecords,
-}: CrashParams): StreamsApp {
+/** Builds the crash app; `workerModule` is the App Module worker threads rebuild it from. */
+export default function crashApp(
+  {
+    applicationId,
+    brokers,
+    input,
+    countsOutput,
+    chainsOutput,
+    stateDir,
+    commitIntervalMs,
+    commitMaxRecords,
+    workers = 0,
+  }: CrashParams,
+  workerModule?: string,
+): StreamsApp {
   const app = createStreamsApp({
     applicationId,
     brokers,
@@ -45,6 +55,9 @@ export default function crashApp({
     changelogReplicationFactor: 1,
     commitIntervalMs,
     commitMaxRecords,
+    ...(workers > 0 && workerModule !== undefined
+      ? { workers: { count: workers, module: workerModule } }
+      : {}),
   })
   const grouped = app.stream(input, { key: serdes.string, value: serdes.string }).groupByKey()
   grouped
