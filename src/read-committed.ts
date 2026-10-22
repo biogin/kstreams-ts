@@ -16,6 +16,19 @@
 // no filter of its own. `filterAbortedBatches` runs on every Fetch response instead, before the
 // client (or `consume()`'s stream) sees it. This works for both the low-level `fetch()` and
 // `consume()`, which fetches through the consumer's `fetch()`.
+//
+// Fetch sessions (KIP-227): the client keeps one incremental fetch session per broker node and
+// consumer (`Consumer#fetchSessions`), but doesn't serialize the fetches that use it. Two
+// concurrent `fetch()` calls to the same node read the same session ID and epoch, so the broker
+// rejects the second with INVALID_FETCH_SESSION_EPOCH (71); each also sends only its own
+// partitions and forgets the other's. The client then drops the session and retries, but the
+// other fetches keep re-creating and advancing it, so the retries can fail the same way until
+// `fetch failed N times`. A consumer that fetches concurrently (the restore consumer: one read
+// per restoring Changelog partition) is created with `fetchSessions: false`: every Fetch request
+// is then sessionless (session ID 0, epoch -1, a full fetch that creates no session), so the
+// broker answers with session ID 0 and the client never caches a session. A consumer read by
+// `consume()` keeps its sessions: a stream has at most one fetch in flight per node, and each
+// stream has its own connection pool, which the client keys its cached session by.
 
 import {
   type API,
@@ -23,6 +36,7 @@ import {
   type CallbackWithPromise,
   type Connection,
   Consumer,
+  type ConsumerOptions,
   FetchIsolationLevels,
   type FetchOptions,
   type fetchV17,
@@ -107,21 +121,34 @@ function filterResponse(response: FetchResponse | undefined): void {
 /** Marks the Fetch APIs wrapped by {@link readCommittedFetchApi}. */
 const WRAPPED = Symbol('kstreams.readCommittedFetch')
 const wrappedApis = new WeakMap<FetchApi, FetchApi>()
+const sessionlessApis = new WeakMap<FetchApi, FetchApi>()
+
+/** The session ID and epoch of a sessionless full Fetch request (KIP-227). */
+const NO_SESSION_ID = 0
+const FINAL_EPOCH = -1
 
 /**
  * The client's Fetch API (any version), sending read_committed whatever isolation level it is
- * given and filtering the response with {@link filterAbortedBatches}.
+ * given and filtering the response with {@link filterAbortedBatches}. If `sessionless`, every
+ * request is a sessionless full fetch, whatever session it is given (see the top of this file).
  */
-function readCommittedFetchApi(api: FetchApi): FetchApi {
+function readCommittedFetchApi(api: FetchApi, sessionless: boolean): FetchApi {
   if (WRAPPED in api) return api
-  let wrapped = wrappedApis.get(api)
+  const cache = sessionless ? sessionlessApis : wrappedApis
+  let wrapped = cache.get(api)
   if (wrapped !== undefined) return wrapped
   const send = (connection: Connection, ...args: unknown[]): void => {
     const callback = (
       typeof args.at(-1) === 'function' ? args.pop() : () => {}
     ) as Callback<FetchResponse>
-    // The request arguments: maxWaitMs, minBytes, maxBytes, isolationLevel, ...
+    // The request arguments: maxWaitMs, minBytes, maxBytes, isolationLevel, sessionId,
+    // sessionEpoch, topics, forgottenTopicsData, rackId.
     args[3] = FetchIsolationLevels.READ_COMMITTED
+    if (sessionless) {
+      // The client never has a session then, so it already sends every partition and forgets none.
+      args[4] = NO_SESSION_ID
+      args[5] = FINAL_EPOCH
+    }
     const request = args as unknown as fetchV17.FetchRequest
     api(connection, ...request, (error, response) => {
       try {
@@ -146,8 +173,22 @@ function readCommittedFetchApi(api: FetchApi): FetchApi {
     version: api.version,
     [WRAPPED]: true,
   }) as FetchApi
-  wrappedApis.set(api, wrapped)
+  cache.set(api, wrapped)
   return wrapped
+}
+
+/** Options of a {@link ReadCommittedConsumer}: the client's, plus `fetchSessions`. */
+export type ReadCommittedConsumerOptions<Key, Value, HeaderKey, HeaderValue> = ConsumerOptions<
+  Key,
+  Value,
+  HeaderKey,
+  HeaderValue
+> & {
+  /**
+   * Whether Fetch requests use incremental fetch sessions (the default). Set it to false for a
+   * consumer whose `fetch()` is called concurrently: see the top of this file.
+   */
+  fetchSessions?: boolean
 }
 
 /**
@@ -161,6 +202,16 @@ export class ReadCommittedConsumer<
   HeaderKey = Buffer,
   HeaderValue = Buffer,
 > extends Consumer<Key, Value, HeaderKey, HeaderValue> {
+  readonly #sessionless: boolean
+
+  constructor({
+    fetchSessions = true,
+    ...options
+  }: ReadCommittedConsumerOptions<Key, Value, HeaderKey, HeaderValue>) {
+    super(options)
+    this.#sessionless = !fetchSessions
+  }
+
   override fetch(
     options: FetchOptions<Key, Value, HeaderKey, HeaderValue>,
     callback: CallbackWithPromise<FetchResponse>,
@@ -191,7 +242,7 @@ export class ReadCommittedConsumer<
         callback(error)
         return
       }
-      const wrapped = readCommittedFetchApi(api as unknown as FetchApi)
+      const wrapped = readCommittedFetchApi(api as unknown as FetchApi, this.#sessionless)
       callback(null, wrapped as unknown as API<RequestArguments, ResponseType>)
     })
   }

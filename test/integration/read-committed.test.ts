@@ -1,3 +1,4 @@
+import { inspect } from 'node:util'
 import { IS_CONTROL, MessagesStreamModes, Producer, stringSerializers } from '@platformatic/kafka'
 import { afterAll, beforeAll, expect, it } from 'vitest'
 import { ReadCommittedConsumer } from '../../src/read-committed.js'
@@ -128,5 +129,59 @@ describeWithKafka('ReadCommittedConsumer', () => {
     } finally {
       await consumer.close(true)
     }
+  })
+
+  // Concurrent fetch() calls to one node share the client's fetch session (see read-committed.ts).
+  // With no retries, one collision is enough to fail.
+  async function concurrentFetches(fetchSessions: boolean | undefined) {
+    const consumer = new ReadCommittedConsumer({
+      clientId: uniqueName('read-committed-concurrent'),
+      groupId: uniqueName('read-committed-concurrent'),
+      bootstrapBrokers: brokers,
+      retries: 0,
+      ...(fetchSessions === undefined ? {} : { fetchSessions }),
+    })
+    try {
+      const metadata = await consumer.metadata({ topics: [topic] })
+      const found = metadata.topics.get(topic)
+      const fetch = () =>
+        consumer.fetch({
+          node: found?.partitions[0]?.leader ?? -1,
+          maxWaitTime: 100,
+          topics: [
+            {
+              topicId: found?.id ?? '',
+              partitions: [
+                {
+                  partition: 0,
+                  fetchOffset: 0n,
+                  currentLeaderEpoch: -1,
+                  lastFetchedEpoch: -1,
+                  partitionMaxBytes: MAX_BYTES,
+                },
+              ],
+            },
+          ],
+        })
+      // The first fetch opens a session (unless sessionless); the next two use it at once.
+      await fetch()
+      return await Promise.allSettled([fetch(), fetch(), fetch()])
+    } finally {
+      await consumer.close(true)
+    }
+  }
+
+  it('fetch() called concurrently succeeds with fetchSessions: false', async () => {
+    const results = await concurrentFetches(false)
+    expect(results.map((result) => result.status)).toEqual(['fulfilled', 'fulfilled', 'fulfilled'])
+  })
+
+  // Documents the client's behavior that `fetchSessions: false` works around; if this starts to
+  // fail after a client upgrade, the client may serialize fetches now (see read-committed.ts).
+  it('fetch() called concurrently with fetch sessions fails with INVALID_FETCH_SESSION_EPOCH', async () => {
+    const results = await concurrentFetches(undefined)
+    const failed = results.filter((result) => result.status === 'rejected')
+    expect(failed.length).toBeGreaterThan(0)
+    expect(inspect(failed[0]?.reason, { depth: 8 })).toContain('INVALID_FETCH_SESSION_EPOCH')
   })
 })

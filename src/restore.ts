@@ -208,6 +208,9 @@ export function createChangelogReader({
     groupId: `${clientId}-restore`,
     bootstrapBrokers: brokers,
     isolationLevel: FetchIsolationLevels.READ_COMMITTED,
+    // Restores of several Changelog partitions fetch concurrently through this one consumer, and
+    // the client's fetch sessions don't support concurrent fetches (see read-committed.ts).
+    fetchSessions: false,
   })
 
   async function offset(
