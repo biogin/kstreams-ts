@@ -54,7 +54,6 @@ import {
   consumed,
   createCrashTopics,
   expectKilled,
-  expectStopped,
   Input,
   type Kafka,
   logs,
@@ -109,6 +108,8 @@ class Cluster {
   readonly #named = new Map<string, string>()
   readonly #members = new Map<string, Member>()
   readonly #started = Date.now()
+  /** Graceful stops that failed: problems, but the run goes on (such a stop is like a kill). */
+  readonly stopFailures: string[] = []
 
   constructor(
     kafka: Kafka,
@@ -176,7 +177,16 @@ class Cluster {
     const member = this.#member(name)
     this.note(`stop ${name}`)
     this.#members.delete(name)
-    await expectStopped(member.app, `when stopping ${name}`)
+    const exit = await member.app.stop()
+    if (exit.code !== 0 || exit.signal !== null) {
+      const log = member.app.log()
+      const error = log.split('\n').find((line) => /^\w*Error\b/.test(line)) ?? 'no error printed'
+      this.note(`${name} did not stop cleanly`)
+      this.stopFailures.push(
+        `App Process ${name} did not stop cleanly when stopped gracefully ` +
+          `(${JSON.stringify(exit)}): ${error}${log.includes("Unhandled 'error' event") ? " (unhandled 'error' event)" : ''}`,
+      )
+    }
   }
 
   /** The names of the running App Processes. */
@@ -462,7 +472,8 @@ describeWithKafka('crash suite: exactly-once across rebalances (SQLite, several 
     }
     journal.push(`${input.sent.length} records`)
 
-    expect(await checkResults(topics, input.sent, stateDir, journal)).toEqual([])
+    const problems = await checkResults(topics, input.sent, stateDir, journal)
+    expect([...cluster.stopFailures, ...problems]).toEqual([])
   }
 
   const selected = Object.entries(scenarios).filter(([name]) => scenarioSelected(name))
