@@ -73,7 +73,11 @@ export interface StreamsAppConfig {
    * the batch, in milliseconds. Defaults to 100.
    */
   commitIntervalMs?: number
-  /** A batch is committed early once it has this many input records. Defaults to 1000. */
+  /**
+   * A batch is committed early once it has this many input records. Defaults to 1000. It also
+   * bounds how many records a Worker holds in memory for its Tasks whose State Stores are
+   * restoring; records past it are fetched again once the Restore is done.
+   */
   commitMaxRecords?: number
   /**
    * How long the consumer group waits for a member that stopped sending heartbeats before moving

@@ -32,13 +32,15 @@ export interface ChangelogReader {
    * stable offset, once the transactions open at the call have ended), skipping aborted ones. Calls `apply` with the records,
    * in offset order, a chunk at a time. Resolves to the offset after the last one read: where a
    * later read would continue. Resolves to undefined, reading nothing, when `from` is outside the
-   * partition (before its start or past its end).
+   * partition (before its start or past its end). Once `signal` is aborted, stops reading and
+   * rejects with its reason.
    */
   read(
     topic: string,
     partition: number,
     apply: (records: ChangelogRecord[]) => void,
     from?: bigint,
+    signal?: AbortSignal,
   ): Promise<bigint | undefined>
 }
 
@@ -59,18 +61,25 @@ export interface RestoringStore {
  * wiped, then replay all of it. Keys are decoded with the key Serde and re-encoded as store keys
  * (ADR-0015); Tombstones delete. Each chunk is applied in one store transaction. Resolves to the
  * Changelog offset each store has applied up to, by store name.
+ *
+ * Once `signal` is aborted (the Task was revoked, or the Worker stops), no further chunk is applied
+ * and it rejects with the signal's reason. The stores are then partly restored: a Task whose
+ * Restore was cancelled must be closed without a new Checkpoint.
  */
 export async function restoreStores(
   stores: readonly RestoringStore[],
   partition: number,
   reader: ChangelogReader,
+  signal?: AbortSignal,
 ): Promise<Map<string, bigint>> {
   const restored = new Map<string, bigint>()
   for (const { node, store, checkpoint } of stores) {
+    signal?.throwIfAborted()
     const topic = node.changelogTopic
     const context = { topic }
     const encoding = node.keyEncoding ?? singleKeyEncoding(node.serdes.key)
-    const apply = (records: ChangelogRecord[]) =>
+    const apply = (records: ChangelogRecord[]) => {
+      signal?.throwIfAborted()
       inTransaction(store, () => {
         for (const { key, value } of records) {
           if (key === null) {
@@ -83,14 +92,18 @@ export async function restoreStores(
           else store.put(storeKey, value)
         }
       })
+    }
     let offset =
-      checkpoint === undefined ? undefined : await reader.read(topic, partition, apply, checkpoint)
+      checkpoint === undefined
+        ? undefined
+        : await reader.read(topic, partition, apply, checkpoint, signal)
     if (offset === undefined) {
+      signal?.throwIfAborted()
       inTransaction(store, () => {
         // Collected first: a store must not be written while it is iterated.
         for (const key of Array.from(store.all(), ([key]) => key)) store.delete(key)
       })
-      offset = await reader.read(topic, partition, apply)
+      offset = await reader.read(topic, partition, apply, undefined, signal)
       if (offset === undefined)
         throw new Error(`Cannot read Changelog "${topic}" partition ${partition}`)
     }
@@ -181,7 +194,7 @@ export function createChangelogReader({
   }
 
   return {
-    async read(topic, partition, apply, from) {
+    async read(topic, partition, apply, from, signal) {
       // With read_committed, the latest offset is the last stable offset: every aborted
       // transaction before it has its marker. It must reach the end as of now (read_uncommitted):
       // see the top of this file.
@@ -193,15 +206,17 @@ export function createChangelogReader({
       )
       let end = await offset(topic, partition, ListOffsetTimestamps.LATEST)
       while (end < written) {
-        await new Promise((resolve) => setTimeout(resolve, TRANSACTION_POLL_MS))
+        await sleep(TRANSACTION_POLL_MS, signal)
         end = await offset(topic, partition, ListOffsetTimestamps.LATEST)
       }
+      signal?.throwIfAborted()
       const start = await offset(topic, partition, ListOffsetTimestamps.EARLIEST)
       if (from !== undefined && (from < start || from > end)) return undefined
       let position = from ?? start
       let target = await leader(topic, partition, false)
       let retries = 0
       while (position < end) {
+        signal?.throwIfAborted()
         const response = await consumer.fetch({
           node: target.node,
           isolationLevel: FetchIsolationLevels.READ_COMMITTED,
@@ -232,7 +247,7 @@ export function createChangelogReader({
           if (fetched.errorCode === OFFSET_OUT_OF_RANGE) {
             position = await offset(topic, partition, ListOffsetTimestamps.EARLIEST)
           } else if (RETRIABLE_FETCH_ERRORS.has(fetched.errorCode)) {
-            await new Promise((resolve) => setTimeout(resolve, FETCH_RETRY_DELAY_MS))
+            await sleep(FETCH_RETRY_DELAY_MS, signal)
             target = await leader(topic, partition, true)
           } else {
             throw new Error(
@@ -261,4 +276,23 @@ export function createChangelogReader({
     },
     close: () => consumer.close(true),
   }
+}
+
+/** Waits `ms`; rejects with `signal`'s reason as soon as it is aborted. */
+function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason)
+      return
+    }
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(signal?.reason)
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
 }

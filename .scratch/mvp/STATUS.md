@@ -4,11 +4,11 @@ Integration branch: `mvp`. Plan (2026-10-21): finish ALL remaining tickets befor
 
 ## Merged (27 of 30)
 
-01–18, 21–24, 27–30, plus the aborted-transaction filter fix. Remaining: 19, 20, 25, 26. `mvp` passes typecheck, lint, 319 unit tests, the integration suite (55 tests) and the crash suite (`npm run test:crash`).
+01–18, 21–24, 27–30, plus the aborted-transaction filter fix. Remaining: 20, 25, 26. (19 merged.) `mvp` passes typecheck, lint, 319 unit tests, the integration suite (55 tests) and the crash suite (`npm run test:crash`).
 
 ## Remaining, in order
 
-1. **19** Restore without blocking other Tasks (in progress)
+1. ~~**19** Restore without blocking other Tasks~~ (done, merged)
 2. **20** Crash suite covers rebalances and **25** Observability
 3. **26** 0.1 release prep (no publishing without the user)
 4. Code review of `mvp` (`/code-review`), one fix agent, worktree cleanup

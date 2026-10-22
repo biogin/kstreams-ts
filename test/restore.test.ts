@@ -198,6 +198,51 @@ describe('restoreStores', () => {
     expect(view.all()).toEqual([['a', '1']])
   })
 
+  it('stops when cancelled: no further chunk or store is applied, and it rejects', async () => {
+    const first = openStore()
+    const second = openStore()
+    const other = 'app-other-changelog'
+    const cancel = new AbortController()
+    const reader = fakeReader(
+      {
+        [`${topic}:0`]: [
+          { key: bytes('a'), value: bytes('1') },
+          { key: bytes('b'), value: bytes('2') },
+        ],
+        [`${other}:0`]: [{ key: bytes('z'), value: bytes('9') }],
+      },
+      1,
+    )
+    const read = reader.read.bind(reader)
+    reader.read = (topic, partition, apply, from, signal) =>
+      read(
+        topic,
+        partition,
+        (records) => {
+          apply(records)
+          // The Task is revoked while its first chunk is applied.
+          cancel.abort(new Error('revoked'))
+        },
+        from,
+        signal,
+      )
+
+    await expect(
+      restoreStores(
+        [
+          { node: node(), store: first },
+          { node: node({ name: 'other', changelogTopic: other }), store: second },
+        ],
+        0,
+        reader,
+        cancel.signal,
+      ),
+    ).rejects.toThrow('revoked')
+    expect(keyValueStore(first, strings, context).all()).toEqual([['a', '1']])
+    expect(keyValueStore(second, strings, { topic: other }).all()).toEqual([])
+    expect(reader.reads).toEqual([`${topic}:0`])
+  })
+
   it('rejects a Changelog record without a key', async () => {
     await expect(
       restoreStores(
