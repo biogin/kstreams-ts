@@ -37,7 +37,7 @@
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:crash": "vitest run --config vitest.crash.config.ts",
     "kafka": "scripts/kafka-local.sh",
-    "prepack": "npm run build"
+    "prepare": "npm run build"
   },
   "dependencies": {
     "@platformatic/kafka": "2.14.0",
