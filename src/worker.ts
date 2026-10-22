@@ -79,6 +79,15 @@
 // the batch is given up (under exactly-once, aborted) and the Worker closes the Tasks and leaves
 // the group anyway.
 //
+// Exactly-once, a batch's transaction must end before the transaction timeout, or the broker
+// aborts it and the Worker's producer epoch with it. The batch reads records for at most the
+// timeout minus a margin (`transactionBudget`). Queued async work can still outlast that, so the
+// Worker learns how many records a batch can process within the budget and admits no more
+// (`#maxBatchRecords`). A batch that still runs too long is aborted (by the Worker if it can still
+// see it coming, else by the broker) and read again, like a batch aborted by a rebalance, and the
+// producer takes up its transactional ID again with its last epoch: the broker then fences it if
+// another producer took the ID over since (a zombie), which stays fatal (`TransactionalCommitter`).
+//
 // Observability (observability.ts): the Worker reports its state, events and metrics through
 // `WorkerOptions.report`. Its state is `rebalancing` from the client's `consumer:group:rebalance`
 // (a rebalance began) to its `consumer:group:join` (it completed), else `restoring` while a Task
@@ -142,6 +151,10 @@ export interface WorkerOptions {
   transactionalId: string | undefined
   commitIntervalMs: number
   commitMaxRecords: number
+  /** Exactly-once: the transaction timeout, after which the broker aborts an open transaction. */
+  transactionTimeoutMs: number
+  /** The most bytes of records one produce request carries (see `splitBySize`). */
+  maxProduceBytes: number
   sessionTimeoutMs: number
   /** How long `stop()` may take to commit the current batch before it gives the batch up. */
   shutdownTimeoutMs: number
@@ -177,8 +190,23 @@ export interface Worker {
   stop(): Promise<void>
 }
 
-/** How much longer than the commit interval a transaction may stay open. */
+/** The most of the transaction timeout a batch keeps in reserve, after it stops reading. */
 const TRANSACTION_TIMEOUT_MARGIN_MS = 10_000
+/** The most of the transaction timeout a batch keeps in reserve for committing. */
+const COMMIT_MARGIN_MS = 1_000
+
+/**
+ * Exactly-once: how long a batch may read records and process them: the transaction timeout less
+ * a margin for the processing still queued and for committing.
+ */
+export function transactionBudget(timeoutMs: number): number {
+  return timeoutMs - Math.min(TRANSACTION_TIMEOUT_MARGIN_MS, timeoutMs / 2)
+}
+
+/** Exactly-once: how long a transaction may have been open and still be committed. */
+function commitDeadline(timeoutMs: number): number {
+  return timeoutMs - Math.min(COMMIT_MARGIN_MS, timeoutMs / 10)
+}
 /** How often the consumer lag is measured, at most. */
 const LAG_INTERVAL_MS = 2_000
 
@@ -233,7 +261,7 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
           transactionalId,
           // The client also sends this as the transaction timeout, after which the broker aborts
           // an open transaction. It must outlast a batch (the client default is 5 s).
-          timeout: options.commitIntervalMs + TRANSACTION_TIMEOUT_MARGIN_MS,
+          timeout: options.transactionTimeoutMs,
           // Without these the client asks the broker for producer ID 0 / epoch 0, which the broker
           // rejects as fenced once the transactional ID was used before (any restart).
           producerId: -1n,
@@ -297,8 +325,13 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
     consumer,
     createCommitter: (fail, owns) =>
       transactionalId === undefined
-        ? new AtLeastOnceCommitter(consumer, producer)
-        : new TransactionalCommitter(consumer, producer, fail, owns),
+        ? new AtLeastOnceCommitter(consumer, producer, options.maxProduceBytes)
+        : new TransactionalCommitter(consumer, producer, {
+            maxBytes: options.maxProduceBytes,
+            timeoutMs: options.transactionTimeoutMs,
+            fail,
+            owns,
+          }),
     stream,
     // While a stream is open, opening another joins no group: it starts from the committed
     // offsets of the partitions the consumer has.
@@ -352,6 +385,7 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
 const TIME_UP = Symbol('time up')
 const INTERRUPTED = Symbol('interrupted')
 const STARTED = Symbol('started')
+const PROGRESS = Symbol('progress')
 
 /** A Task starting in the background (see the top of this file). */
 interface StartingTask {
@@ -379,6 +413,25 @@ interface StartingTask {
 
 /** Thrown when a batch would commit the offset of a partition the Worker no longer owns. */
 class PartitionRevokedError extends Error {}
+
+/**
+ * Exported for the unit tests (ADR-0016). Exactly-once: the batch's transaction outlived (or was
+ * about to outlive) the transaction timeout. The batch is aborted and read again.
+ */
+export class TransactionTimedOutError extends Error {}
+
+/**
+ * The errors a broker answers a producer with once its epoch was bumped: by the broker aborting
+ * its transaction after the timeout, or by another producer taking its transactional ID over.
+ */
+const EPOCH_ERRORS = ['INVALID_PRODUCER_EPOCH', 'PRODUCER_FENCED', 'TRANSACTION_ABORTABLE']
+
+/** Whether `error` is (or contains) one of `EPOCH_ERRORS`. */
+function isEpochError(error: unknown): boolean {
+  return (
+    error instanceof Error && EPOCH_ERRORS.some((id) => findErrorBy(error, 'apiId', id) !== null)
+  )
+}
 
 /**
  * Whether `error` means the group moved on (a rebalance) while the batch was committing, so the
@@ -431,7 +484,7 @@ export class CommitCycle {
   readonly #starting = new Map<number, StartingTask>()
   /** Cancelled starts still winding down (their Restores stopping), by partition. */
   readonly #cancelling = new Map<number, Promise<void>>()
-  /** How many records the starting Tasks hold, together: at most `commitMaxRecords`. */
+  /** How many records the starting Tasks hold, together: at most as many as a batch reads. */
   #heldCount = 0
   /** Settles once a starting Task has started; renewed whenever the cycle takes them over. */
   #started!: Promise<typeof STARTED>
@@ -447,6 +500,21 @@ export class CommitCycle {
   #interrupt: () => void = () => {}
   /** Ends the current batch early, when partitions are lost. */
   #endBatch: () => void = () => {}
+
+  /** When the current batch began (`performance.now()`), and how many records it processed. */
+  #batchStartedAt = 0
+  #batchRecords = 0
+  /** How many of the current batch's records are processed, and when its first one was taken. */
+  #batchSettled = 0
+  #batchFirstAt: number | undefined
+  /** Settles once one of the batch's records is processed; renewed each time. */
+  #progress!: Promise<typeof PROGRESS>
+  #signalProgress: () => void = () => {}
+  /**
+   * Exactly-once: the most records a batch reads, learned from how long batches took, so that
+   * they stay within the transaction timeout (see `#fitBatch`). At most `commitMaxRecords`.
+   */
+  #maxBatchRecords: number
 
   /** The first error a Task or a send raised. Stops the Worker (fail-fast). */
   #failure: { error: unknown } | undefined
@@ -497,6 +565,7 @@ export class CommitCycle {
     this.#graph = graph
     this.#options = options
     this.#exactlyOnce = options.transactionalId !== undefined
+    this.#maxBatchRecords = options.commitMaxRecords
     this.#restorer = clients.restorer
     this.#stableOffsets = clients.stableOffsets
     this.#openStream = clients.openStream
@@ -528,6 +597,7 @@ export class CommitCycle {
       this.#interrupt = () => resolve(INTERRUPTED)
     })
     this.#renewStarted()
+    this.#renewProgress()
     this.#updateState()
   }
 
@@ -647,6 +717,15 @@ export class CommitCycle {
     }
   }
 
+  #renewProgress(): void {
+    this.#progress = new Promise((resolve) => {
+      this.#signalProgress = () => {
+        this.#renewProgress()
+        resolve(PROGRESS)
+      }
+    })
+  }
+
   #renewStarted(): void {
     this.#started = new Promise((resolve) => {
       this.#signalStarted = () => resolve(STARTED)
@@ -756,23 +835,33 @@ export class CommitCycle {
    * fails, partitions are lost or a stop is requested.
    */
   async #readBatch(): Promise<void> {
-    const { commitIntervalMs, commitMaxRecords } = this.#options
+    this.#batchStartedAt = performance.now()
+    this.#batchRecords = 0
+    this.#batchSettled = 0
+    this.#batchFirstAt = undefined
+    const { commitIntervalMs, commitMaxRecords, transactionTimeoutMs } = this.#options
+    // Exactly-once, within the transaction timeout (see the top of this file).
+    const maxRecords = this.#exactlyOnce ? this.#maxBatchRecords : commitMaxRecords
+    const readMs = this.#exactlyOnce
+      ? Math.min(commitIntervalMs, transactionBudget(transactionTimeoutMs))
+      : commitIntervalMs
     const ownership = this.#ownership
     // Lost partitions are dealt with first, by committing (or aborting) the batch so far.
     if (ownership.lostPending) return
-    let count = await this.#takeStarted()
-    const held = this.#held
-    this.#held = undefined
-    if (held !== undefined && this.#take(held)) count++
     let timer: NodeJS.Timeout | undefined
     const timeUp = new Promise<typeof TIME_UP>((resolve) => {
-      timer = setTimeout(() => resolve(TIME_UP), commitIntervalMs)
+      timer = setTimeout(() => resolve(TIME_UP), readMs)
     })
     const lost = new Promise<typeof INTERRUPTED>((resolve) => {
       this.#endBatch = () => resolve(INTERRUPTED)
     })
+    const until = [timeUp, this.#interrupted, lost]
     try {
-      while (count < commitMaxRecords && this.#failure === undefined) {
+      let count = await this.#takeStarted(until)
+      const held = this.#held
+      this.#held = undefined
+      if (held !== undefined && this.#take(held)) count++
+      while (count < maxRecords && this.#failure === undefined) {
         const result = await Promise.race([
           this.#next,
           timeUp,
@@ -783,13 +872,18 @@ export class CommitCycle {
         if (result === TIME_UP || result === INTERRUPTED) break
         if (result === STARTED) {
           if (ownership.lostPending) break
-          count += await this.#takeStarted()
+          count += await this.#takeStarted(until)
           continue
         }
         if (result.done) throw new Error('The consumer stopped delivering records')
         this.#next = this.#messages.next()
         const message = result.value
         if (ownership.lostPending) {
+          this.#held = message
+          break
+        }
+        // Exactly-once: the next batch starts with it if the batch can't take it in time.
+        if (this.#exactlyOnce && !(await this.#admits(until))) {
           this.#held = message
           break
         }
@@ -846,7 +940,7 @@ export class CommitCycle {
     const key = topicPartitionKey(message.topic, message.partition)
     const upTo = starting.heldUpTo.get(key)
     if (upTo !== undefined && message.offset < upTo) return
-    if (this.#heldCount >= this.#options.commitMaxRecords) {
+    if (this.#heldCount >= this.#maxBatchRecords) {
       starting.overflowed = true
       return
     }
@@ -920,12 +1014,15 @@ export class CommitCycle {
   /**
    * Takes the Tasks that have started over: processes the records they held, after skipping what
    * their stable committed offsets say was processed, and rewinds the stream for those that
-   * dropped records. Returns how many records were processed.
+   * dropped records. Exactly-once, a held record the batch can't take in time (see `#admits`,
+   * waiting at most until one of `until` settles) is dropped too, and read again. Returns how many
+   * records were processed.
    */
-  async #takeStarted(): Promise<number> {
+  async #takeStarted(until: Promise<unknown>[]): Promise<number> {
     this.#renewStarted()
     let count = 0
     let rewind = false
+    let full = false
     for (const starting of [...this.#starting.values()]) {
       if (!starting.started || starting.task === undefined) continue
       const { partition } = starting
@@ -941,6 +1038,11 @@ export class CommitCycle {
         }
       }
       for (const message of starting.held) {
+        if (!full && this.#exactlyOnce) full = !(await this.#admits(until))
+        if (full) {
+          rewind = true
+          break
+        }
         if (this.#accepts(message)) {
           this.#process(message)
           count++
@@ -987,8 +1089,18 @@ export class CommitCycle {
       timestamp: Number(message.timestamp),
     }
     const task = this.#task(message.partition)
+    this.#batchRecords++
     this.#contribute(message.partition, this.#taskEpochs.get(task) ?? -1)
-    this.#track(task.process(message.topic, record, message.offset))
+    this.#batchFirstAt ??= performance.now()
+    const work = task.process(message.topic, record, message.offset)
+    this.#track(work)
+    work.then(
+      () => {
+        this.#batchSettled++
+        this.#signalProgress()
+      },
+      () => {},
+    )
     const key = topicPartitionKey(message.topic, message.partition)
     this.#lastRead.set(key, message)
     this.#position.set(key, message.offset + 1n)
@@ -1105,6 +1217,7 @@ export class CommitCycle {
     await Promise.all(this.#work)
     this.#work = []
     if (this.#failure !== undefined) throw this.#failure.error
+    if (this.#exactlyOnce) this.#fitBatch(performance.now() - this.#batchStartedAt)
 
     const lastRead = [...this.#lastRead.values()]
     this.#lastRead = new Map()
@@ -1133,9 +1246,16 @@ export class CommitCycle {
     try {
       result = await this.#committer.commit(committing, guard)
     } catch (error) {
-      // Exactly-once: partitions were lost while the batch was committing.
-      if (!this.#exactlyOnce || this.#abandoned || !isRebalanceError(error)) throw error
-      await this.#abortBatch(new Set([...lost, ...this.#ownership.takeLost()]))
+      // Exactly-once: partitions were lost while the batch was committing, or its transaction
+      // outlived the transaction timeout.
+      const timedOut = error instanceof TransactionTimedOutError
+      if (!this.#exactlyOnce || this.#abandoned || !(timedOut || isRebalanceError(error))) {
+        throw error
+      }
+      await this.#abortBatch(
+        new Set([...lost, ...this.#ownership.takeLost()]),
+        timedOut ? 'transaction-timeout' : 'rebalance',
+      )
       return
     }
     // A stop that gave up has closed (and rolled back) the stores: no Checkpoint for them.
@@ -1169,6 +1289,45 @@ export class CommitCycle {
   }
 
   /**
+   * Exactly-once: whether the batch can take one more record and still have processed everything
+   * within the transaction budget, at the pace its records have been processed so far. Records
+   * still being processed (queued behind slow async Processors) count; until one is done, the
+   * pace is unknown, and the batch waits for one (or for `until`, which ends the batch).
+   */
+  async #admits(until: Promise<unknown>[]): Promise<boolean> {
+    const budget = transactionBudget(this.#options.transactionTimeoutMs)
+    for (;;) {
+      const now = performance.now()
+      const unsettled = this.#batchRecords - this.#batchSettled
+      if (unsettled === 0) return true
+      if (this.#batchSettled > 0) {
+        const perRecord = (now - (this.#batchFirstAt ?? now)) / this.#batchSettled
+        return now - this.#batchStartedAt + (unsettled + 1) * perRecord <= budget
+      }
+      if ((await Promise.race([this.#progress, ...until])) !== PROGRESS) return false
+    }
+  }
+
+  /**
+   * Exactly-once: adjusts `#maxBatchRecords` to a batch that took `ms` until its processing was
+   * done. One that took longer than the transaction budget (slow async work queued behind each
+   * other) makes the next ones smaller, aiming at half the budget; one that read as many records
+   * as it could in less than half the budget lets them grow again, at most doubling.
+   */
+  #fitBatch(ms: number): void {
+    const records = this.#batchRecords
+    if (records === 0) return
+    const budget = transactionBudget(this.#options.transactionTimeoutMs)
+    const fit = Math.floor((records * budget) / 2 / Math.max(ms, 1))
+    if (ms > budget) {
+      this.#maxBatchRecords = Math.max(1, Math.min(fit, records - 1))
+    } else if (records >= this.#maxBatchRecords && ms < budget / 2) {
+      const grown = Math.max(this.#maxBatchRecords + 1, Math.min(fit, this.#maxBatchRecords * 2))
+      this.#maxBatchRecords = Math.min(this.#options.commitMaxRecords, grown)
+    }
+  }
+
+  /**
    * Whether the transaction can hold an offset of the Task of `partition`, so that its writes are
    * fenced (see `fencingOffsets`): it read a record in the batch, or has a committed offset.
    * Exactly-once, a Task that can't (nothing of it committed yet, and no record read) keeps its
@@ -1186,8 +1345,8 @@ export class CommitCycle {
    * its committed offset. Starting Tasks go on: they had no part in the batch, and what they hold
    * is not held twice when the stream delivers it again.
    */
-  async #abortBatch(lost: ReadonlySet<number>): Promise<void> {
-    if (await this.#committer.abort()) this.#countAbort('rebalance')
+  async #abortBatch(lost: ReadonlySet<number>, reason: AbortReason = 'rebalance'): Promise<void> {
+    if (await this.#committer.abort()) this.#countAbort(reason)
     // Rolled back, a Task would still have the batch's Stream Time, timers and Processor state.
     this.#closeTasks()
     this.#held = undefined
@@ -1313,14 +1472,17 @@ export interface BatchCommitter {
 class AtLeastOnceCommitter implements BatchCommitter {
   readonly #consumer: Consumer<Bytes, Bytes, Bytes, Bytes>
   readonly #producer: Producer<Bytes, Bytes, Bytes, Bytes>
+  readonly #maxBytes: number
   #outputs: Output[] = []
 
   constructor(
     consumer: Consumer<Bytes, Bytes, Bytes, Bytes>,
     producer: Producer<Bytes, Bytes, Bytes, Bytes>,
+    maxBytes: number,
   ) {
     this.#consumer = consumer
     this.#producer = producer
+    this.#maxBytes = maxBytes
   }
 
   produce(output: Output): void {
@@ -1331,10 +1493,11 @@ class AtLeastOnceCommitter implements BatchCommitter {
     const outputs = this.#outputs
     this.#outputs = []
     const empty = outputs.length === 0 && lastRead.length === 0
-    let produced: ProducedOffsets = new Map()
-    if (outputs.length > 0) {
-      const result = await this.#producer.send({ messages: outputs })
-      produced = producedOffsets(outputs, result.offsets ?? [])
+    const produced = new Map<number, Map<string, bigint>>()
+    // One request after the other, so that each partition's outputs keep their order.
+    for (const messages of splitBySize(outputs, this.#maxBytes)) {
+      const result = await this.#producer.send({ messages })
+      mergeProduced(produced, producedOffsets(messages, result.offsets ?? []))
     }
     if (lastRead.length > 0) {
       try {
@@ -1365,11 +1528,30 @@ class AtLeastOnceCommitter implements BatchCommitter {
  * Sends the outputs into a Kafka transaction as they come, then adds the consumed offsets to it
  * and commits it (ADR-0002, ADR-0008). A transaction is only begun once there is something to
  * send or commit: the broker rejects ending an empty one.
+ *
+ * A transaction about to outlive the transaction timeout isn't committed: `commit` throws a
+ * `TransactionTimedOutError`, and so does any step after the broker aborted it for its timeout.
+ * The broker answers that with the same epoch errors as fencing by another producer, so an epoch
+ * error counts as a timeout only once the transaction has been open for the timeout. The next
+ * transaction then takes the transactional ID up again with the epoch the producer had: the
+ * broker accepts that only if no other producer took the ID over since, and fences it otherwise,
+ * which fails the Worker.
  */
 class TransactionalCommitter implements BatchCommitter {
   readonly #consumer: Consumer<Bytes, Bytes, Bytes, Bytes>
   readonly #producer: Producer<Bytes, Bytes, Bytes, Bytes>
+  readonly #maxBytes: number
+  readonly #timeoutMs: number
   #transaction: Transaction | undefined
+  /** When the open transaction began (`performance.now()`). */
+  #openedAt: number | undefined
+  /** The producer ID and epoch the open transaction began with. */
+  #epoch: { producerId: bigint; producerEpoch: number } | undefined
+  /**
+   * After a transaction the broker aborted for its timeout: the producer ID and epoch to take the
+   * transactional ID up again with.
+   */
+  #retake: { producerId: bigint; producerEpoch: number } | undefined
   /** Outputs waiting for the next send. */
   #pending: Output[] = []
   /** The chain of sends: one at a time, so outputs keep their order. */
@@ -1387,13 +1569,21 @@ class TransactionalCommitter implements BatchCommitter {
   constructor(
     consumer: Consumer<Bytes, Bytes, Bytes, Bytes>,
     producer: Producer<Bytes, Bytes, Bytes, Bytes>,
-    fail: (error: unknown) => void,
-    owns: (topic: string, partition: number) => boolean,
+    options: {
+      /** The most bytes of records in one produce request. */
+      maxBytes: number
+      /** The transaction timeout the producer was created with. */
+      timeoutMs: number
+      fail: (error: unknown) => void
+      owns: (topic: string, partition: number) => boolean
+    },
   ) {
     this.#consumer = consumer
     this.#producer = producer
-    this.#fail = fail
-    this.#owns = owns
+    this.#maxBytes = options.maxBytes
+    this.#timeoutMs = options.timeoutMs
+    this.#fail = options.fail
+    this.#owns = options.owns
   }
 
   produce(output: Output): void {
@@ -1411,17 +1601,64 @@ class TransactionalCommitter implements BatchCommitter {
     if (messages.length === 0 || this.#sendFailure !== undefined) return
     try {
       const transaction = await this.#begin()
-      const result = await transaction.send({ messages })
-      mergeProduced(this.#produced, producedOffsets(messages, result.offsets ?? []))
+      // One request after the other, so that each partition's outputs keep their order.
+      for (const chunk of splitBySize(messages, this.#maxBytes)) {
+        const result = await transaction.send({ messages: chunk })
+        mergeProduced(this.#produced, producedOffsets(chunk, result.offsets ?? []))
+      }
     } catch (error) {
-      this.#sendFailure = { error }
-      this.#fail(error)
+      const failure = this.#timedOut(error)
+      this.#sendFailure = { error: failure }
+      // A timed-out batch is aborted and read again once its processing is done.
+      if (!(failure instanceof TransactionTimedOutError)) this.#fail(failure)
     }
   }
 
   async #begin(): Promise<Transaction> {
-    this.#transaction ??= await this.#producer.beginTransaction()
-    return this.#transaction
+    if (this.#transaction !== undefined) return this.#transaction
+    const retake = this.#retake
+    this.#retake = undefined
+    // The client takes the ID up with `retake` if it dropped its epoch after the error; else it
+    // still has the old epoch, and is told to.
+    const transaction = await this.#producer.beginTransaction(retake ?? {})
+    if (retake !== undefined && this.#producer.producerEpoch === retake.producerEpoch) {
+      await this.#producer.initIdempotentProducer(retake)
+    }
+    this.#transaction = transaction
+    this.#openedAt = performance.now()
+    const { producerId, producerEpoch } = this.#producer
+    this.#epoch =
+      producerId === undefined || producerEpoch === undefined
+        ? undefined
+        : { producerId, producerEpoch }
+    return transaction
+  }
+
+  /** How long the open transaction has been open, in milliseconds (0 if none is). */
+  #openMs(): number {
+    return this.#openedAt === undefined ? 0 : performance.now() - this.#openedAt
+  }
+
+  /**
+   * `error` as a `TransactionTimedOutError` if it means the broker aborted the transaction for its
+   * timeout: an epoch error once the transaction has been open (`openMs`) that long. Else `error`.
+   */
+  #timedOut(error: unknown, openMs = this.#openMs()): unknown {
+    if (error instanceof TransactionTimedOutError) return error
+    if (!isEpochError(error) || openMs < this.#timeoutMs) return error
+    return new TransactionTimedOutError(
+      `The broker aborted the batch's transaction, open for ${Math.round(openMs)} ms, past the transaction timeout (${this.#timeoutMs} ms)`,
+      { cause: error },
+    )
+  }
+
+  /**
+   * After the broker aborted `transaction` for its timeout: drops it, and has the next
+   * transaction take the transactional ID up again with the epoch it began with.
+   */
+  async #retakeAfter(transaction: Transaction): Promise<void> {
+    this.#retake = this.#epoch
+    await transaction.cancel().catch(() => {})
   }
 
   async commit(lastRead: ConsumedMessage[], guard?: CommitGuard): Promise<CommitResult> {
@@ -1436,23 +1673,46 @@ class TransactionalCommitter implements BatchCommitter {
     await this.#sending
     if (this.#sendFailure !== undefined) throw this.#sendFailure.error
     check()
-    const offsets = [...lastRead, ...(guard?.fencing ?? [])]
-    if (offsets.length > 0) {
-      const transaction = await this.#begin()
-      check()
-      await transaction.addConsumer(this.#consumer)
-      // One offset per partition, and one at a time: the client merges concurrent offset commits.
-      for (const message of offsets) {
+    // The broker may abort the transaction any moment now: abort it first, and read it again.
+    const openMs = this.#openMs()
+    if (openMs >= commitDeadline(this.#timeoutMs)) {
+      throw new TransactionTimedOutError(
+        `The batch's transaction has been open for ${Math.round(openMs)} ms, too close to the transaction timeout (${this.#timeoutMs} ms) to commit`,
+      )
+    }
+    try {
+      const offsets = [...lastRead, ...(guard?.fencing ?? [])]
+      if (offsets.length > 0) {
+        const transaction = await this.#begin()
         check()
-        await transaction.addOffset(this.#withCurrentGroup(message))
+        await transaction.addConsumer(this.#consumer)
+        // One offset per partition, and one at a time: the client merges concurrent offset
+        // commits.
+        for (const message of offsets) {
+          check()
+          await transaction.addOffset(this.#withCurrentGroup(message))
+        }
       }
+    } catch (error) {
+      // The transaction is still open: `abort` ends it.
+      throw this.#timedOut(error)
     }
     check()
     const transaction = this.#transaction
     const produced = this.#produced
+    const committingMs = this.#openMs()
     this.#transaction = undefined
+    this.#openedAt = undefined
     this.#produced = new Map()
-    await transaction?.commit()
+    try {
+      await transaction?.commit()
+    } catch (error) {
+      const failure = this.#timedOut(error, committingMs)
+      if (failure instanceof TransactionTimedOutError && transaction !== undefined) {
+        await this.#retakeAfter(transaction)
+      }
+      throw failure
+    }
     return { produced, offsetsCommitted: true, empty: transaction === undefined }
   }
 
@@ -1487,10 +1747,20 @@ class TransactionalCommitter implements BatchCommitter {
     await this.#sending
     this.#pending = []
     this.#produced = new Map()
+    this.#sendFailure = undefined
     const transaction = this.#transaction
+    const openMs = this.#openMs()
     this.#transaction = undefined
-    await transaction?.abort()
-    return transaction !== undefined
+    this.#openedAt = undefined
+    if (transaction === undefined) return false
+    try {
+      await transaction.abort()
+    } catch (error) {
+      // Unless the broker aborted it already, for its timeout.
+      if (!(this.#timedOut(error, openMs) instanceof TransactionTimedOutError)) throw error
+      await this.#retakeAfter(transaction)
+    }
+    return true
   }
 }
 
@@ -1530,6 +1800,42 @@ function producedOffsets(
     byTopic.set(topic, next)
   }
   return produced
+}
+
+/** Roughly what a record adds to a produce request besides its key, value and headers. */
+const RECORD_OVERHEAD_BYTES = 70
+
+/** About how many bytes `output` takes in a produce request. */
+function sizeOf(output: Output): number {
+  let size = RECORD_OVERHEAD_BYTES + (output.key?.length ?? 0) + (output.value?.length ?? 0)
+  if (output.headers instanceof Map) {
+    for (const [name, value] of output.headers) size += name.length + value.length
+  }
+  return size
+}
+
+/**
+ * Exported for the unit tests (ADR-0016). Splits `outputs`, in order, into runs of at most
+ * `maxBytes` (a record larger than that alone): one produce request writes one record batch per
+ * partition, which the broker rejects above its `max.message.bytes`. Bounding the whole request
+ * bounds each partition's batch, whichever partition the partitioner picks.
+ */
+export function splitBySize(outputs: readonly Output[], maxBytes: number): Output[][] {
+  const runs: Output[][] = []
+  let run: Output[] = []
+  let bytes = 0
+  for (const output of outputs) {
+    const size = sizeOf(output)
+    if (run.length > 0 && bytes + size > maxBytes) {
+      runs.push(run)
+      run = []
+      bytes = 0
+    }
+    run.push(output)
+    bytes += size
+  }
+  if (run.length > 0) runs.push(run)
+  return runs
 }
 
 /** Adds `more` to `produced`, keeping the higher offset: later sends write later offsets. */

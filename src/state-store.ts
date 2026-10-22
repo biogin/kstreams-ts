@@ -217,7 +217,8 @@ export function keyValueStore<K, V>(
   const value = (bytes: Uint8Array) => serdes.value.deserialize(bytes, context)
   /** Writes `bytes` (null deletes) under `k`, and to the Changelog if there is one. */
   const write = (k: K, bytes: Uint8Array | null) => {
-    if (changelog !== undefined && (k === null || k === undefined)) {
+    // Rejected with or without a Changelog, so the Test Driver (which has none) behaves as on Kafka.
+    if (k === null || k === undefined) {
       throw new Error(
         `Cannot write a ${k} key to a State Store: its Changelog "${context.topic}" is compacted, which needs a key`,
       )

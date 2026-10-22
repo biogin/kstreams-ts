@@ -84,7 +84,7 @@ A metric's `type` says how to aggregate it: `counter` (`value` is an increment),
 | `records-processed` | counter | `worker`, `task` | Input records a Task finished with (processed, or skipped by an error handler). Counted once their batch has committed; the records of an aborted batch are counted when processed again. Throughput is the rate of this counter. |
 | `records-dropped` | counter | `worker`, `task`, `kind` | Records an error handler skipped (`kind`: `deserialization` or `processing`). |
 | `late-records-dropped` | counter | `worker`, `task` | Records windowed aggregations dropped for arriving after the Grace Period. |
-| `aborts` | counter | `worker`, `reason` | Kafka transactions aborted (exactly-once). `reason`: `rebalance`, `error` or `shutdown-timeout`. |
+| `aborts` | counter | `worker`, `reason` | Kafka transactions aborted (exactly-once). `reason`: `rebalance`, `error`, `shutdown-timeout` or `transaction-timeout` (the batch outlived `transactionTimeoutMs` and is processed again). |
 | `commit-duration` | duration | `worker` | How long committing a batch took: producing or flushing outputs, committing offsets and the transaction, store transactions and Checkpoints. Not reported for a batch with nothing to commit. |
 | `consumer-lag` | gauge | `worker`, `topic`, `partition` | Records of an owned input partition from its committed offset to its last stable offset (as `read_committed` readers see it). Sampled every 2 seconds. |
 | `records-restored` | counter | `worker`, `task`, `store` | Changelog records a Restore applied. |

@@ -85,10 +85,26 @@ describe('Streams App configuration', () => {
     ['shutdownTimeoutMs', Number.NaN],
     ['changelogReplicationFactor', 0],
     ['changelogReplicationFactor', 1.5],
+    ['maxProduceBytes', 0],
+    ['transactionTimeoutMs', 0],
+    ['transactionTimeoutMs', 1_000.5],
   ])('rejects %s: %s', (option, value) => {
     expect(() => createStreamsApp({ applicationId: 'commit', [option]: value })).toThrow(
       new RegExp(`${option} must be a positive`),
     )
+  })
+
+  it('rejects a transaction timeout no longer than the commit interval', () => {
+    expect(() =>
+      createStreamsApp({
+        applicationId: 'timeout',
+        commitIntervalMs: 5_000,
+        transactionTimeoutMs: 5_000,
+      }),
+    ).toThrow(/transactionTimeoutMs \(5000\) must be longer than commitIntervalMs \(5000\)/)
+    expect(() =>
+      createStreamsApp({ applicationId: 'timeout', commitIntervalMs: 0.5 }),
+    ).not.toThrow()
   })
 
   it('rejects an empty broker list', () => {

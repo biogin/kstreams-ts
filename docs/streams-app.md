@@ -31,6 +31,8 @@ The Application ID is the one name everything derives from: the consumer group, 
 | `workers` | `0` | Number of Workers in worker threads, or `{ count, module }`. `0` runs one Worker in the main thread. See [workers](./workers.md). |
 | `commitIntervalMs` | `100` | How long a Worker collects records into a batch before it produces the outputs and commits. Lower means lower latency and more overhead. |
 | `commitMaxRecords` | `1000` | A batch commits early at this many input records. It also bounds how many records a Worker holds for Tasks that are still restoring. |
+| `transactionTimeoutMs` | `commitIntervalMs` + `10000` | Exactly-once: the transaction timeout. Must be longer than `commitIntervalMs` and at most the broker's `transaction.max.timeout.ms`. Batches are kept within it; see [delivery guarantees](./delivery-guarantees.md#async-processors-stretch-transactions). |
+| `maxProduceBytes` | `900000` | The most bytes of records one produce request carries; a larger batch is written in several requests, in order. Keep it below the broker's (or topics') `max.message.bytes` (default about 1 MB). |
 | `sessionTimeoutMs` | `45000` | How long the consumer group waits for a silent member before moving its Tasks. |
 | `shutdownTimeoutMs` | `30000` | How long `stop()` may take to finish and commit the current batch before giving it up. |
 | `changelogReplicationFactor` | `3` | Replication factor of the Changelogs the app creates. Use `1` on a single-broker cluster. |

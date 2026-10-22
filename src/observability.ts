@@ -131,6 +131,11 @@ export type AbortReason =
   | 'error'
   /** `stop()` ran out of `shutdownTimeoutMs` and gave the batch up. */
   | 'shutdown-timeout'
+  /**
+   * The batch's transaction outlived (or was about to outlive) `transactionTimeoutMs`; the batch
+   * is processed again, in smaller batches.
+   */
+  | 'transaction-timeout'
 
 /** What a starting Task waited for (see the `wait-duration` metric). */
 export type WaitKind =
@@ -284,11 +289,22 @@ export class Listeners {
   emit<E extends StreamsAppEventName>(event: E, payload: StreamsAppEvents[E]): void {
     for (const listener of [...(this.#listeners.get(event) ?? [])]) {
       try {
-        ;(listener as (payload: StreamsAppEvents[E]) => void)(payload)
+        ignoreRejection((listener as (payload: StreamsAppEvents[E]) => unknown)(payload))
       } catch {
         // A listener's bug must not break the app (see `StreamsApp.on`).
       }
     }
+  }
+}
+
+/**
+ * Ignores the rejection of `result` if it is a Promise (or other thenable): an async listener or
+ * metrics sink is ignored like a throwing one, instead of leaving an unhandled rejection that
+ * would stop the process.
+ */
+function ignoreRejection(result: unknown): void {
+  if (typeof (result as PromiseLike<unknown> | undefined)?.then === 'function') {
+    Promise.resolve(result).catch(() => {})
   }
 }
 
@@ -347,7 +363,7 @@ export function taskCounterMetrics(
 export function recordMetric(sink: MetricsSink | undefined, metric: Metric): void {
   if (sink === undefined) return
   try {
-    sink.record(metric)
+    ignoreRejection((sink.record as (metric: Metric) => unknown)(metric))
   } catch {
     // A sink's bug must not break the app (see `MetricsSink`).
   }

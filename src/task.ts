@@ -12,7 +12,7 @@ import type {
   TimerCallback,
   TimerType,
 } from './processor-graph.js'
-import type { StreamRecord } from './record.js'
+import { checkTimestamp, type StreamRecord } from './record.js'
 import type { RestoringStore } from './restore.js'
 import {
   DeserializationError,
@@ -549,7 +549,10 @@ function createContext(
   schedule: ProcessorContext<unknown, unknown>['schedule'],
 ): ProcessorContext<unknown, unknown> {
   return {
-    forward,
+    forward(record) {
+      checkTimestamp(record.timestamp)
+      forward(record)
+    },
     store: store as ProcessorContext<unknown, unknown>['store'],
     schedule,
   }

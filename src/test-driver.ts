@@ -1,7 +1,7 @@
 import { deadLetterTopicsOf } from './error-handlers.js'
 import { recordMetric, taskCounterMetrics } from './observability.js'
 import type { OutputRecord } from './processor-graph.js'
-import type { StreamRecord } from './record.js'
+import { checkTimestamp, type StreamRecord } from './record.js'
 import {
   serdes as builtInSerdes,
   deserializeNullable,
@@ -44,8 +44,8 @@ export interface TestDriver {
   /**
    * Moves the Test Driver's wall-clock time (which starts at 0) forward by `ms` and fires the
    * wall-clock timers that are then due. Records already piped are processed first. Wall-clock
-   * time never affects Stream Time: only record timestamps do. Rejects if `ms` is negative, or
-   * with the error a timer raised, which stops the Streams App like a failed record.
+   * time never affects Stream Time: only record timestamps do. Rejects if `ms` is negative or not
+   * an integer, or with the error a timer raised, which stops the Streams App like a failed record.
    */
   advanceWallClockTime(ms: number): Promise<void>
   /**
@@ -92,7 +92,10 @@ export interface TestDriverOptions {
 }
 
 export interface PipeOptions {
-  /** Event Time of the record. Defaults to the Test Driver's wall-clock time, which starts at 0. */
+  /**
+   * Event Time of the record, an integer number of milliseconds. Defaults to the Test Driver's
+   * wall-clock time, which starts at 0.
+   */
   timestamp?: number
 }
 
@@ -205,6 +208,13 @@ export function createTestDriver(app: StreamsApp, options: TestDriverOptions = {
       const context = { topic }
       return {
         pipe(k, v, options = {}) {
+          if (options.timestamp !== undefined) {
+            try {
+              checkTimestamp(options.timestamp)
+            } catch (error) {
+              return Promise.reject(error)
+            }
+          }
           return runOnTask(() => {
             const offset = offsets.get(topic) ?? 0n
             offsets.set(topic, offset + 1n)
@@ -224,6 +234,11 @@ export function createTestDriver(app: StreamsApp, options: TestDriverOptions = {
 
     async advanceWallClockTime(ms) {
       if (!(ms >= 0)) throw new Error(`Wall-clock time cannot move backwards (got ${ms} ms)`)
+      if (!Number.isSafeInteger(ms)) {
+        throw new TypeError(
+          `Wall-clock time moves by an integer number of milliseconds (got ${ms})`,
+        )
+      }
       wallClockTime += ms
       await runOnTask(() => task.fireWallClockTimers())
     },

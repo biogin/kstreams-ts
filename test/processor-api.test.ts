@@ -130,6 +130,45 @@ describe('Processor API in the Test Driver', () => {
         .map((r) => r.value),
     ).toEqual(['1'])
   })
+
+  it('fails the record when a Processor forwards a timestamp that is not an integer', async () => {
+    const appForwarding = (timestamp: number, skip: boolean) => {
+      const app = createStreamsApp({
+        applicationId: 'bad-timestamp',
+        ...(skip ? { errorHandlers: { processing: () => 'continue' as const } } : {}),
+      })
+      const p = app.processor('p', (ctx: ProcessorContext<string, string | null>) => ({
+        process(record: StreamRecord<string, string | null>) {
+          ctx.forward({ ...record, timestamp: record.value === 'bad' ? timestamp : 5 })
+        },
+      }))
+      app.stream('input', strings).process(p).to('output', strings)
+      return createTestDriver(app)
+    }
+    for (const timestamp of [1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 64]) {
+      const driver = appForwarding(timestamp, true)
+      const input = driver.input<string, string>('input')
+      await input.pipe('k', 'bad')
+      await input.pipe('k', 'good')
+      // The bad record is a processing error (skipped here), as it would be on Kafka.
+      expect(driver.output('output').readAll()).toEqual([{ key: 'k', value: 'good', timestamp: 5 }])
+      expect(driver.metrics().recordsDropped).toBe(1)
+
+      await expect(
+        appForwarding(timestamp, false).input<string, string>('input').pipe('k', 'bad'),
+      ).rejects.toThrow(`A record's timestamp must be an integer number of milliseconds`)
+    }
+  })
+
+  it('rejects piping a record whose timestamp is not an integer', async () => {
+    const app = createStreamsApp({ applicationId: 'bad-pipe-timestamp' })
+    app.stream('input', strings).to('output', strings)
+    const driver = createTestDriver(app)
+    await expect(
+      driver.input<string, string>('input').pipe('k', 'v', { timestamp: 0.5 }),
+    ).rejects.toThrow(/timestamp must be an integer/)
+    await expect(driver.advanceWallClockTime(0.5)).rejects.toThrow(/integer/)
+  })
 })
 
 describe('async Processors', () => {
