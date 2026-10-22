@@ -218,5 +218,35 @@ export function describeStateStoreContract(implementation: string, open: () => S
         expect(() => s.begin()).toThrow(/transaction/i)
       })
     })
+
+    describe('Buffers and mutation', () => {
+      it('keeps stored bytes apart from the Buffers given to put', () => {
+        const s = store()
+        const key = Buffer.from('k')
+        const value = Buffer.from('abc')
+        s.put(key, value)
+        value[0] = 0x7a
+        key[0] = 0x7a
+        expect(s.get(text('k'))).toEqual(text('abc'))
+        expect([...s.all()].map(([k]) => k)).toEqual([text('k')])
+      })
+
+      it('returns bytes that can be changed without changing the store', () => {
+        const s = store()
+        s.put(text('k'), text('abc'))
+        const got = s.get(text('k'))
+        got?.fill(0)
+        for (const [k, v] of s.all()) {
+          k.fill(0)
+          v.fill(0)
+        }
+        for (const [k, v] of s.range(undefined, undefined)) {
+          k.fill(0)
+          v.fill(0)
+        }
+        expect(s.get(text('k'))).toEqual(text('abc'))
+        expect([...s.all()]).toEqual([[text('k'), text('abc')]])
+      })
+    })
   })
 }

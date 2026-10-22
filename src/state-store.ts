@@ -257,6 +257,9 @@ interface Entry {
   value: Uint8Array
 }
 
+/** A copy sharing no memory with `bytes`; `.slice()` on a Node Buffer would share it. */
+const copy = (bytes: Uint8Array): Uint8Array => Uint8Array.from(bytes)
+
 class InMemoryStore implements StateStore {
   /** Entries by key as hex, whose string order is the key byte order. */
   readonly #entries = new Map<string, Entry>()
@@ -264,13 +267,14 @@ class InMemoryStore implements StateStore {
   #undo: Map<string, Entry | undefined> | undefined
 
   get(key: Uint8Array): Uint8Array | undefined {
-    return this.#entries.get(hex(key))?.value.slice()
+    const found = this.#entries.get(hex(key))
+    return found === undefined ? undefined : copy(found.value)
   }
 
   put(key: Uint8Array, value: Uint8Array): void {
     const id = hex(key)
     this.#remember(id)
-    this.#entries.set(id, { key: key.slice(), value: value.slice() })
+    this.#entries.set(id, { key: copy(key), value: copy(value) })
   }
 
   delete(key: Uint8Array): void {
@@ -289,7 +293,7 @@ class InMemoryStore implements StateStore {
     return [...this.#entries]
       .filter(([id]) => (low === undefined || id >= low) && (high === undefined || id < high))
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-      .map(([, { key, value }]) => [key.slice(), value.slice()])
+      .map(([, { key, value }]) => [copy(key), copy(value)])
   }
 
   begin(): void {
