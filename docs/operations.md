@@ -11,13 +11,14 @@
 `stateDir` is where this App Process keeps:
 
 - the SQLite State Stores and their Checkpoints, in `<stateDir>/<applicationId>/<task>/`;
-- its **App Process ID** (`<stateDir>/<applicationId>/processes/`), used in the transactional IDs, and a liveness file (`<incarnation>.alive`) it keeps an OS file lock on while it runs;
-- a `.lock` file per Task directory while a Worker has the Task open.
+- its **App Process ID** (`<stateDir>/<applicationId>/process-id`), used in the transactional IDs;
+- `<stateDir>/.lock`, which it keeps an OS file lock on while it runs, so no other process uses the directory meanwhile;
+- a `.lock` file per Task directory while one of its Workers has the Task open.
 
 Rules:
 
 - **Keep it across restarts** and give it **its own directory per process**. A restart then takes its old App Process ID, so crashed transactions are fenced at once, and restores only the Changelog after each Checkpoint.
-- Processes that share one host may share a state directory; they take different App Process IDs and lock Tasks. Stale locks of dead processes are taken over. Containers on one host may share one too (each typically runs as PID 1 in its own PID namespace): their liveness is told by the liveness files' OS locks, not PIDs, so the directory must be on a local file system with POSIX advisory locks (a bind mount of a host directory; not NFS without locking). Never share a state directory across hosts.
+- **Processes never share a state directory** ([ADR-0017](./adr/0017-one-state-directory-per-app-process.md)). A process that starts on a state directory another live process uses fails with `stateDir <path> is in use by another process; give each process its own stateDir`. Once that process is gone, however it ended, the OS has released its lock and the directory can be used again. The lock needs a file system with POSIX advisory locks (a local file system; not NFS without locking).
 - **Do not copy, restore from a backup, or edit** a state directory by hand. A store whose Checkpoint is missing or unclean is wiped and fully restored, which is safe, but you gain nothing from copies; the Changelog is the source of truth and the only backup you need.
 - Size disks for the SQLite files of the Tasks a process may own, including after a rebalance when it takes over Tasks from a failed process.
 - Without a `stateDir`, State Stores are in memory: every start is a full Restore, and each start gets a new, random App Process ID, so a crashed process's open transactions are only aborted by their timeout and the new owners of its Tasks wait for that.

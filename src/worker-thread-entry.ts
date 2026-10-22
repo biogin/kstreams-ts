@@ -3,7 +3,6 @@
 
 import { parentPort, workerData } from 'node:worker_threads'
 import type { WorkerReport } from './observability.js'
-import { adoptProcessIncarnation } from './state-directory.js'
 import { startWorkerOf } from './streams-app.js'
 import type { Worker } from './worker.js'
 import {
@@ -15,9 +14,7 @@ import {
 
 const port = parentPort
 if (port === null) throw new Error('worker-thread-entry runs in a worker thread only')
-const { appModule, applicationId, processId, incarnation, workerNumber } =
-  workerData as WorkerThreadData
-adoptProcessIncarnation(incarnation)
+const { appModule, applicationId, processId, workerNumber } = workerData as WorkerThreadData
 
 function send(message: FromWorkerThread): void {
   flush()

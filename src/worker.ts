@@ -25,7 +25,8 @@
 // Starting a Task (its first record, under exactly-once or with State Stores) runs in the
 // background, outside the commit cycle, and waits for the Task's previous owner, which may be
 // another Worker or process:
-// - for its Task directory lock, when there is a state directory (state-directory.ts): the
+// - for its Task directory lock, when there is a state directory (state-directory.ts) and the
+//   previous owner is a Worker of this process (each process has its own state directory): the
 //   previous owner closes the Task, and so unlocks it, once it notices it lost the Task. Only then
 //   are the Task's State Stores opened;
 // - under exactly-once, for its stable committed offsets (stable-offsets.ts): records before them

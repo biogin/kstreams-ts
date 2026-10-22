@@ -53,6 +53,6 @@ Things to know:
 
 To scale out, start more processes with the same Application ID and the same definition. Kafka's consumer group spreads the Tasks over all Workers of all processes, with cooperative-sticky assignment, so a rebalance moves as few Tasks as possible and they keep their local State Stores. When a Task moves, the new owner waits for the old one to close it, then restores whatever its local copy lacks (everything, if it never owned the Task before; see [operations](./operations.md#state-directory)).
 
-- Each **App Process** keeps an App Process ID in its state directory, which makes its Workers' transactional IDs unique across processes and stable across restarts. Processes on one host may share a state directory; they lock Task directories while a Task is open.
-- Give each process (container, host) its own state directory, kept across restarts if you can.
+- Each **App Process** keeps an App Process ID in its state directory, which makes its Workers' transactional IDs unique across processes and stable across restarts. Its Workers lock a Task's directory while they have the Task open.
+- Give each process (container, host) its own state directory, kept across restarts if you can: a process can't start on a state directory another live process uses ([ADR-0017](./adr/0017-one-state-directory-per-app-process.md)).
 - Standby replicas and a state-aware assignor are not in 0.1, so a Task that moves to a Worker without its State Stores does a full Restore (see [known limitations](./limitations.md)).

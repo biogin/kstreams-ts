@@ -2,7 +2,7 @@
 // Tasks over all their Workers, with cooperative-sticky assignment, and stay exact under
 // exactly-once while processes come and go.
 
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { type Consumer, type Message, Producer } from '@platformatic/kafka'
@@ -124,7 +124,7 @@ describeWithKafka('scale out across App Processes (exactly-once, 2 Workers each)
     }
   }
 
-  it('2 processes × 2 Workers share the Tasks with exact counts, even with one state directory', async () => {
+  it('2 processes × 2 Workers share the Tasks with exact counts', async () => {
     const partitions = 8
     const input = await kafka.createTopic('scale-out-input', partitions)
     const output = await kafka.createTopic('scale-out-output', partitions)
@@ -133,12 +133,10 @@ describeWithKafka('scale out across App Processes (exactly-once, 2 Workers each)
     const start = Date.now()
     await kafka.produce(input, records(400, 0, start))
 
-    // Both processes use the same state directory, as if on one host by mistake: they get
-    // different App Process IDs, and lock the Task directories they use.
-    const stateDir = stateDirectory()
+    // Each process has its own state directory (ADR-0017), and its own App Process ID.
     const [a, b] = await Promise.all([
-      launch({ applicationId, input, output, stateDir }),
-      launch({ applicationId, input, output, stateDir }),
+      launch({ applicationId, input, output, stateDir: stateDirectory() }),
+      launch({ applicationId, input, output, stateDir: stateDirectory() }),
     ])
     const assigned = await balanced(applicationId, input, 4, partitions)
     for (const tasks of assigned.values()) expect(tasks).toHaveLength(2)
@@ -147,11 +145,6 @@ describeWithKafka('scale out across App Processes (exactly-once, 2 Workers each)
       [...assigned.keys()].map((clientId) => clientId.slice(applicationId.length + 1, -9)),
     )
     expect(processIds.size).toBe(2)
-    expect(
-      readdirSync(join(stateDir, applicationId, 'processes')).filter((f) =>
-        /^[0-9a-f]{12}$/.test(f),
-      ),
-    ).toHaveLength(2)
 
     await kafka.produce(input, records(400, 400, start))
     await expectExactCounts(output, 800)

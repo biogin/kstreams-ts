@@ -14,6 +14,7 @@ First release, a beta: the public API may still change before 1.0.
 - Record timestamps must be safe integers (milliseconds) in both the Test Driver and on Kafka.
 - Exactly-once processing (one Kafka transaction per batch) and at-least-once processing.
 - Worker threads rebuilt from an App Module, scale-out across processes with cooperative-sticky assignment, graceful shutdown.
+- One state directory per App Process ([ADR-0017](./docs/adr/0017-one-state-directory-per-app-process.md)): a process holds an OS file lock on its `stateDir` while it runs, and `start()` fails if another live process uses it. Processes can't share a `stateDir`.
 - Error handlers (`deadLetter`, custom handlers); fail-fast by default.
 - Observability: Application State, typed events, a metrics sink with ten metrics, including consumer lag and Restore progress.
 - Test Driver: an in-memory harness with Serdes, State Store reads, wall-clock time and metrics.

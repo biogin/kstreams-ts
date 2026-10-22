@@ -1,3 +1,4 @@
+import { join } from 'node:path'
 import { checkErrorHandlers, type ErrorHandlers } from './error-handlers.js'
 import {
   type ApplicationState,
@@ -16,8 +17,8 @@ import { serdes as builtInSerdes, type Serde, type Serdes } from './serde.js'
 import {
   claimProcessIdentity,
   type ProcessIdentity,
+  removeTaskLocks,
   taskLockHolder,
-  unlockTasksOf,
 } from './state-directory.js'
 import {
   defaultStoreSupplier,
@@ -801,7 +802,7 @@ class Runtime {
 
   /**
    * Once every Worker has stopped: removes the Task locks they still hold (a terminated worker
-   * thread can't), and gives the App Process ID up.
+   * thread can't), and gives the App Process ID and the state directory up.
    */
   #releaseIdentity(): void {
     const identity = this.#identity
@@ -809,10 +810,11 @@ class Runtime {
     this.#identity = undefined
     const { stateDir, applicationId } = this.#settings
     try {
-      if (stateDir !== undefined) unlockTasksOf(stateDir, applicationId, identity.id)
-      identity.release()
+      if (stateDir !== undefined) removeTaskLocks(join(stateDir, applicationId))
     } catch {
-      // A lock left behind is stale once this process is gone.
+      // A Task lock left behind is removed by the next process to start on the state directory.
+    } finally {
+      identity.release()
     }
   }
 

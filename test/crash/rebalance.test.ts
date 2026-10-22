@@ -5,27 +5,27 @@
 // duplicate.
 //
 // Each scenario runs the crash app (crash-app.ts, exactly-once, two SQLite State Stores) in several
-// App Processes with the same Application ID. Each process has a state directory, its own or
-// shared with others (one host); a killed process may be restarted with its directory (it then
-// takes its old App Process ID, so its producers fence its zombie's) or stay dead (its Tasks move
-// to other processes, which wait out its open transactions, and take over its Task `.lock` files
-// where they share its directory). At the end every process but one, the survivor, stops
-// gracefully; the input ends with one record per partition, so the survivor opens every Task;
-// once all input is consumed it stops, and the stores in its state directory must be exact.
+// App Processes with the same Application ID. Each process has a state directory of its own
+// (ADR-0017); a killed process may be restarted with its directory (it then takes its old App
+// Process ID, so its producers fence its zombie's) or stay dead (its Tasks move to other
+// processes, which wait out its open transactions; a later process may start on its directory).
+// At the end every process but one, the survivor, stops gracefully; the input ends with one
+// record per partition, so the survivor opens every Task; once all input is consumed it stops,
+// and the stores in its state directory must be exact.
 //
 // Scenarios (two iterations each by default):
-//   scale-up        processes join one by one (own directory, then a shared one)
-//   scale-down      a process killed for good in a shared directory (its Tasks and `.lock` files
-//                   move to a process there), then one stopped gracefully
-//   kill-rebalance  rounds of a process joining or stopping, with a kill while the group
-//                   rebalances; a killed process is restarted or stays dead (its Tasks move)
+//   scale-up        processes join one by one
+//   scale-down      a process killed for good (its Tasks move), then one stopped gracefully
+//   kill-rebalance  rounds of a process joining (in a fresh directory or a gone process's) or
+//                   stopping, with a kill while the group rebalances; a killed process is
+//                   restarted or stays dead (its Tasks move)
 //   kill-restore    kills while Tasks restore in the background (ticket 19): Restores held open by
 //                   a gate (an open, later aborted, transaction on every Changelog partition) so
 //                   their held records overflow `commitMaxRecords` and starts get cancelled when
-//                   another process takes the Tasks over in the same directory; then a full
-//                   Restore of a large Changelog into a fresh directory, killed at a random time
-//   workers         2 worker threads per process: kills, a process killed for good in a shared
-//                   directory, and a kill while a process joins
+//                   another process takes the Tasks over; then a full Restore of a large
+//                   Changelog into a fresh directory, killed at a random time
+//   workers         2 worker threads per process: kills, a process killed for good, and a kill
+//                   while a process joins
 //
 // Run with `KSTREAMS_KAFKA_BROKERS=localhost:9092 npm run test:crash`. Settings (environment):
 //   KSTREAMS_CRASH_SCENARIOS             comma-separated scenarios to run (default all, with
@@ -155,6 +155,8 @@ class Cluster {
     if (this.#members.has(name)) throw new Error(`${name} is already running`)
     this.note(`launch ${name} (directory ${label})`)
     const directory = this.directory(label)
+    // One state directory per App Process (ADR-0017): only a gone process's may be taken again.
+    if (!this.free(label)) throw new Error(`directory ${label} is in use`)
     const workers = this.#params.workers ?? 0
     const app = await launchAppModule(
       workers > 0 ? crashWorkersApp : crashApp,
@@ -197,6 +199,12 @@ class Cluster {
           `(${JSON.stringify(exit)}). Its output:\n${output(member.app)}`,
       )
     }
+  }
+
+  /** Whether no running App Process uses the state directory called `label`. */
+  free(label: string): boolean {
+    const directory = this.#named.get(label)
+    return [...this.#members.values()].every((member) => member.directory !== directory)
   }
 
   /** The names of the running App Processes. */
@@ -309,7 +317,7 @@ const scenarios: Record<string, ScenarioDefinition> = {
       await cluster.launch('B', 'b')
       await cluster.progress()
       await delay(between(random, 0, 1_000))
-      await cluster.launch('C', 'a')
+      await cluster.launch('C', 'c')
       await cluster.progress()
       return pick(random, cluster.live())
     },
@@ -319,10 +327,10 @@ const scenarios: Record<string, ScenarioDefinition> = {
     async steps({ cluster, random }) {
       await cluster.launch('A', 'a')
       await cluster.launch('B', 'b')
-      await cluster.launch('C', 'a')
+      await cluster.launch('C', 'c')
       await cluster.progress()
       await delay(between(random, 0, 1_000))
-      // C's Tasks move to A (C's `.lock` files there are stale) or B; both wait out C's open
+      // C's Tasks move to A or B; both wait out C's open
       // transactions, since nobody takes C's App Process ID.
       await cluster.kill('C', { restart: false })
       await cluster.progress()
@@ -346,7 +354,10 @@ const scenarios: Record<string, ScenarioDefinition> = {
         let changed: string
         if (live.length <= 2) {
           changed = `P${next++}`
-          rebalancing = cluster.launch(changed, pick(random, ['a', 'b', `fresh-${round}`]))
+          rebalancing = cluster.launch(
+            changed,
+            pick(random, [...['a', 'b'].filter((label) => cluster.free(label)), `fresh-${round}`]),
+          )
         } else {
           changed = pick(random, live)
           rebalancing = cluster.stop(changed)
@@ -381,9 +392,9 @@ const scenarios: Record<string, ScenarioDefinition> = {
       if (action === 'kill-restoring') {
         await cluster.kill('B', { restart: true })
       } else if (action === 'cancel-start') {
-        // C takes some of B's starting Tasks over in B's directory: B cancels their starts and
-        // releases their locks, C waits for the locks; a kill comes meanwhile.
-        const joining = cluster.launch('C', 'b')
+        // C takes some of B's starting Tasks over: B cancels their starts, and C restores them
+        // itself; a kill comes meanwhile.
+        const joining = cluster.launch('C', 'c')
         await delay(between(random, 0, 1_500))
         const killing = cluster.kill(pick(random, ['B', 'A']), { restart: true })
         await Promise.all([joining, killing])
@@ -413,10 +424,10 @@ const scenarios: Record<string, ScenarioDefinition> = {
       await delay(between(random, 0, 1_000))
       await cluster.kill('A', { restart: true })
       await cluster.progress()
-      await cluster.launch('B', 'a')
+      await cluster.launch('B', 'b')
       await cluster.progress()
       await delay(between(random, 0, 1_000))
-      // B's Tasks move to A's Workers, which take over B's stale `.lock` files.
+      // B's Tasks move to A's Workers.
       await cluster.kill('B', { restart: false })
       await cluster.progress()
       const joining = cluster.launch('C', 'c')
