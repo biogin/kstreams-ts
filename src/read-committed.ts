@@ -17,6 +17,10 @@
 // client (or `consume()`'s stream) sees it. This works for both the low-level `fetch()` and
 // `consume()`, which fetches through the consumer's `fetch()`.
 //
+// The Fetch API is called with positional arguments, which `readCommittedFetchApi` rewrites; it
+// checks their shape on every request (`checkFetchArguments`), and package.json pins the client to
+// the one version this was checked against. Re-check both on every client upgrade.
+//
 // Fetch sessions (KIP-227): the client keeps one incremental fetch session per broker node and
 // consumer (`Consumer#fetchSessions`), but doesn't serialize the fetches that use it. Two
 // concurrent `fetch()` calls to the same node read the same session ID and epoch, so the broker
@@ -118,6 +122,51 @@ function filterResponse(response: FetchResponse | undefined): void {
   }
 }
 
+/** The `@platformatic/kafka` version whose Fetch API argument order this file relies on. */
+export const SUPPORTED_CLIENT_VERSION = '2.14.0'
+
+/**
+ * Throws unless `args` look like the arguments the client (2.14) passes to its Fetch API, which
+ * {@link readCommittedFetchApi} rewrites by position: maxWaitMs, minBytes, maxBytes,
+ * isolationLevel, sessionId, sessionEpoch, topics, forgottenTopicsData, rackId. The client asks
+ * for read_uncommitted (see {@link ReadCommittedConsumer.fetch}), so position 3 must hold exactly
+ * that. A client upgrade that changes the order must fail loudly rather than send a wrong request
+ * or, worse, read aborted records.
+ */
+export function checkFetchArguments(args: readonly unknown[]): void {
+  const [
+    maxWaitMs,
+    minBytes,
+    maxBytes,
+    isolationLevel,
+    sessionId,
+    sessionEpoch,
+    topics,
+    forgotten,
+  ] = args
+  const rackId = args[8]
+  const fits =
+    args.length === 9 &&
+    typeof maxWaitMs === 'number' &&
+    typeof minBytes === 'number' &&
+    typeof maxBytes === 'number' &&
+    isolationLevel === FetchIsolationLevels.READ_UNCOMMITTED &&
+    Number.isInteger(sessionId) &&
+    Number.isInteger(sessionEpoch) &&
+    Array.isArray(topics) &&
+    Array.isArray(forgotten) &&
+    (rackId === undefined || rackId === null || typeof rackId === 'string')
+  if (!fits) {
+    throw new Error(
+      `Unexpected Fetch API arguments from @platformatic/kafka: kstreams-ts rewrites them by position and supports @platformatic/kafka ${SUPPORTED_CLIENT_VERSION} exactly (see src/read-committed.ts). Got ${args.length} arguments: ${args.map(describe).join(', ')}`,
+    )
+  }
+}
+
+function describe(value: unknown): string {
+  return Array.isArray(value) ? 'array' : value === null ? 'null' : typeof value
+}
+
 /** Marks the Fetch APIs wrapped by {@link readCommittedFetchApi}. */
 const WRAPPED = Symbol('kstreams.readCommittedFetch')
 const wrappedApis = new WeakMap<FetchApi, FetchApi>()
@@ -141,8 +190,12 @@ function readCommittedFetchApi(api: FetchApi, sessionless: boolean): FetchApi {
     const callback = (
       typeof args.at(-1) === 'function' ? args.pop() : () => {}
     ) as Callback<FetchResponse>
-    // The request arguments: maxWaitMs, minBytes, maxBytes, isolationLevel, sessionId,
-    // sessionEpoch, topics, forgottenTopicsData, rackId.
+    try {
+      checkFetchArguments(args)
+    } catch (error) {
+      callback(error as Error)
+      return
+    }
     args[3] = FetchIsolationLevels.READ_COMMITTED
     if (sessionless) {
       // The client never has a session then, so it already sends every partition and forgets none.
