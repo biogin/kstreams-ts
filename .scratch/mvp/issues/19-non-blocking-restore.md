@@ -21,3 +21,8 @@ Spec: [../spec.md](../spec.md). Glossary: [CONTEXT.md](../../../CONTEXT.md). ADR
 ## Notes from ticket 18
 
 - Shared `stateDir` across Workers with no per-Task directory lock (see ticket 29 note); non-blocking Restore must not open a Task's stores before the previous owner has closed them.
+
+## Notes from ticket 29
+
+- Starting a Task now waits inside the commit cycle on three things: the per-Task `.lock`, stable committed offsets (src/stable-offsets.ts) and no open earlier transaction on the Changelog partition. Non-blocking Restore must move all three out of the commit cycle.
+- An exactly-once abort still closes and restores every Task, including kept ones; consider restoring only what changed.

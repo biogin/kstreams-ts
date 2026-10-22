@@ -10,3 +10,7 @@
 - [ ] Same exact-comparison oracle as ticket 17
 
 Spec: [../spec.md](../spec.md). Glossary: [CONTEXT.md](../../../CONTEXT.md). ADRs: [docs/adr/](../../../docs/adr/)
+
+## Notes from ticket 29
+
+- Cover a SIGKILLed process whose Tasks move to a different process (the new owner waits out the dead process's transaction timeout), and taking over a `.lock` left behind by a dead process.

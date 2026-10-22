@@ -20,3 +20,7 @@ Spec: [../spec.md](../spec.md). Glossary: [CONTEXT.md](../../../CONTEXT.md). ADR
 
 - Count and report records skipped by error handlers (a dropped-records metric, as in Kafka Streams), and emit typed error events carrying the rebuilt error class from worker threads.
 - Records skipped by a handler do not advance Stream Time; outputs a record forwarded before it failed are kept (as in Kafka Streams). Document both in the user docs (ticket 26).
+
+## Notes from ticket 29
+
+- Rebalance rounds are visible in Ownership (src/ownership.ts). Waits on Task locks, unstable offsets and open Changelog transactions are silent today; expose them as metrics/events.

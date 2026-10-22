@@ -2,9 +2,9 @@
 
 Integration branch: `mvp`. Plan (2026-10-21): finish ALL remaining tickets before any release, then one code review over everything and a fix pass, then release prep (ticket 26) as 0.1 beta. No rush; the earlier M3 stop is dropped.
 
-## Merged (22 of 30)
+## Merged (27 of 30)
 
-01–17, 21, 22, 27, 28, plus the aborted-transaction filter fix (`fix/aborted-txn-filter`). `mvp` passes typecheck, lint, 277 unit tests, the integration suite (36 tests) and the crash suite (`npm run test:crash`, at defaults and on the two seeds that once failed).
+01–18, 21–24, 27–30, plus the aborted-transaction filter fix. Remaining: 19, 20, 25, 26. `mvp` passes typecheck, lint, 277 unit tests, the integration suite (36 tests) and the crash suite (`npm run test:crash`, at defaults and on the two seeds that once failed).
 
 ## Remaining, in order
 
@@ -22,6 +22,8 @@ Integration branch: `mvp`. Plan (2026-10-21): finish ALL remaining tickets befor
 - **Flaky integration tests** under broker load: `at-least-once-crash.test.ts` (once read 0 records), `passthrough.test.ts` "leaves the group on stop and resumes from the committed offsets on restart" (timeout), plus unnamed one-off timeouts. Make waits condition-based and robust.
 - **Client internals:** `src/read-committed.ts` (`ReadCommittedConsumer`) hooks `kGetApi` and relies on the Fetch API's argument order (isolationLevel is argument 4). Re-check on every `@platformatic/kafka` upgrade.
 - Leftover `crash-input-*` topics from diagnosis runs may still be on the local broker (`npm run kafka -- reset` clears everything).
+
+- **Zombie timer writes (from ticket 29):** a zombie Worker whose open transaction holds only timer-driven Changelog writes could still commit them after the new owner has restored. Rare; needs a fix or a documented limitation.
 
 ## Fixed
 
