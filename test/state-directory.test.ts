@@ -14,6 +14,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   adoptProcessIncarnation,
   claimProcessIdentity,
+  holdLiveness,
   type LockFiles,
   livenessIn,
   lockTask,
@@ -398,6 +399,44 @@ describe('liveness files', () => {
     expect(liveness.alive('other')).toBe(false)
     expect(liveness.alive('missing')).toBe(false)
     expect(liveness.alive('../escape')).toBe(false)
+  })
+
+  it("are never removed by another process's startup cleanup while being taken", () => {
+    /** What another process sees of the liveness file `file`: whether it is locked (held). */
+    const seenByAnother = (file: string): string =>
+      spawnSync(
+        process.execPath,
+        [
+          '-e',
+          `try {
+            const db = new (require('better-sqlite3'))(${JSON.stringify(file)}, { fileMustExist: true, timeout: 0 })
+            db.prepare('SELECT count(*) FROM sqlite_master').get()
+            process.stdout.write('readable')
+          } catch (error) {
+            process.stdout.write(error.code === 'SQLITE_CANTOPEN' ? 'missing' : 'locked')
+          }`,
+        ],
+        { cwd: process.cwd(), encoding: 'utf8' },
+      ).stdout
+    for (const step of ['create', 'lock', 'publish'] as const) {
+      const dir = stateDir()
+      // Before `step`, a starting process removes the liveness files of processes that are gone.
+      const release = holdLiveness(dir, (current) => {
+        if (current !== step) return
+        const liveness = livenessIn(dir)
+        for (const name of readdirSync(dir)) {
+          if (name.endsWith('.alive')) liveness.alive(name.slice(0, -'.alive'.length))
+        }
+      })
+      try {
+        expect(
+          { step, seen: seenByAnother(join(dir, `${processIncarnation()}.alive`)) },
+          `cleanup before ${step}`,
+        ).toEqual({ step, seen: 'locked' })
+      } finally {
+        release()
+      }
+    }
   })
 
   it('are held by an App Process while it has its ID, and recorded in its locks', async () => {
