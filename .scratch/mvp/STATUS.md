@@ -2,16 +2,15 @@
 
 Integration branch: `mvp`. Plan (2026-10-21): finish ALL remaining tickets before any release, then one code review over everything and a fix pass, then release prep (ticket 26) as 0.1 beta. No rush; the earlier M3 stop is dropped.
 
-## Merged (29 of 30)
+## Merged (30 of 30)
 
 01–18, 21–24, 27–30, plus the aborted-transaction filter fix. Remaining: 20, 25, 26. (19 merged.) `mvp` passes typecheck, lint, 319 unit tests, the integration suite (55 tests) and the crash suite (`npm run test:crash`).
 
-## Remaining, in order
+## Remaining
 
-1. ~~**19** Restore without blocking other Tasks~~ (done, merged)
-2. **20** Crash suite covers rebalances and **25** Observability
-3. **26** 0.1 release prep (no publishing without the user)
-4. Code review of `mvp` (`/code-review`), one fix agent, worktree cleanup
+1. Fix in progress: INVALID_FETCH_SESSION_EPOCH after rebalances (crash suite, seeds 1268049969 scale-up, 16853523 kill-restore), branch `fix/fetch-session-epoch`.
+2. Code review of `mvp` (`/code-review`), one fix agent, final full test run, worktree cleanup.
+3. Left for the user: create the remote repository and fill in `repository`, `npm publish`, release tag, check the first CI run on Kafka 3.9.
 
 ## Open items for the code review / fix pass
 
@@ -19,6 +18,10 @@ Integration branch: `mvp`. Plan (2026-10-21): finish ALL remaining tickets befor
 - **Client internals:** `src/read-committed.ts` (`ReadCommittedConsumer`) hooks `kGetApi` and relies on the Fetch API's argument order (isolationLevel is argument 4). Re-check on every `@platformatic/kafka` upgrade.
 - Leftover `crash-input-*` topics from diagnosis runs may still be on the local broker (`npm run kafka -- reset` clears everything).
 - **Zombie timer writes (from ticket 29):** a zombie Worker whose open transaction holds only timer-driven Changelog writes could still commit them after the new owner has restored. Rare; needs a fix or a documented limitation.
+
+- **Silent wrong aggregation (from ticket 26, high priority):** `map` (key change) followed by `groupByKey` doesn't repartition, so records with the same new key can land in different Tasks. Repartition Topics are v1 scope; for 0.1, fail fast when the app is built with a clear message.
+- **Pin `@platformatic/kafka` to an exact version** while `src/read-committed.ts` depends on its internals.
+- **Unverified doc claims (ticket 26):** transaction timeout wording and timers not persisting across restarts come from source comments; verify.
 
 ## Fixed
 
