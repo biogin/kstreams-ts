@@ -53,12 +53,16 @@
 // dropped, and so are records fetched during a partition's earlier ownership, and records the
 // client delivers again (after a rebalance it rewinds every partition it keeps to its committed
 // offset).
-// - Exactly-once: a batch with records of a lost partition aborts: Kafka abort, then SQLite
-//   rollback. Every started Task is then closed, since a rollback doesn't undo Stream Time, timers
-//   or Processor state, and is started again (restored from its Checkpoint) when its records come
-//   back: the Worker reads every partition again from its committed offset. Tasks still starting
-//   had no part in the batch and go on starting. A batch without such records commits, with the
-//   consumer's current group generation.
+// - Exactly-once: a batch that anything of a Task whose ownership was interrupted had a part in
+//   (records it processed, outputs, Changelog writes, timer-driven writes; see `Ownership.epoch`)
+//   aborts: Kafka abort, then SQLite rollback. This is checked after the batch's processing, after
+//   each wait while committing, and right before the commit. Every started Task is then closed,
+//   since a rollback doesn't undo Stream Time, timers or Processor state, and is started again
+//   (restored from its Checkpoint) when its records come back: the Worker reads every partition
+//   again from its committed offset. Tasks still starting had no part in the batch and go on
+//   starting. Any other batch commits, with the consumer's current group generation, and with
+//   offsets of every Task that had a part in it (`fencingOffsets` for those with only timer-driven
+//   writes), so the group coordinator fences a Worker that is no longer a member.
 // - At-least-once: the batch commits its outputs, and the offsets of the partitions still owned;
 //   the new owner of a lost partition processes its records again.
 // Either way the Tasks of lost partitions are closed, and their starts cancelled; one that comes
@@ -442,6 +446,14 @@ class CommitCycle {
   #work: Promise<void>[] = []
   /** The last record read from each partition, by `topic:partition`. */
   #lastRead = new Map<TopicPartitionKey, ConsumedMessage>()
+  /**
+   * The Tasks that have a part in the batch, by partition number: they processed a record of it,
+   * or wrote outputs or Changelog records into it (from a timer too). Each with the ownership
+   * epoch it was created under (see `Ownership.epoch`), or -1 if Tasks of two epochs took part.
+   */
+  #contributors = new Map<number, number>()
+  /** The ownership epoch each Task was created under. */
+  #taskEpochs = new WeakMap<Task, number>()
   /**
    * A record that ended the batch it arrived in, after partitions were lost; the next batch starts
    * with it.
@@ -963,10 +975,18 @@ class CommitCycle {
       value: message.value ?? null,
       timestamp: Number(message.timestamp),
     }
-    this.#track(this.#task(message.partition).process(message.topic, record, message.offset))
+    const task = this.#task(message.partition)
+    this.#contribute(message.partition, this.#taskEpochs.get(task) ?? -1)
+    this.#track(task.process(message.topic, record, message.offset))
     const key = topicPartitionKey(message.topic, message.partition)
     this.#lastRead.set(key, message)
     this.#position.set(key, message.offset + 1n)
+  }
+
+  /** Notes that the Task of `partition`, created under ownership epoch `epoch`, has a part in the batch. */
+  #contribute(partition: number, epoch: number): void {
+    const known = this.#contributors.get(partition)
+    this.#contributors.set(partition, known === undefined || known === epoch ? epoch : -1)
   }
 
   /** Keeps a Task's work for the commit, remembering the first failure. */
@@ -986,9 +1006,16 @@ class CommitCycle {
 
   /** Creates the Task of `partition`; `signal` cancels its Restore. */
   #createTask(partition: number, signal?: AbortSignal): Task {
-    return createTask(
+    // Every write of the Task gives it a part in the batch, under the epoch it was created in: a
+    // Task left over from an ownership that has ended must not commit anything (ADR-0006).
+    const epoch = this.#ownership.epoch(partition)
+    const produce = (output: Output) => {
+      this.#contribute(partition, epoch)
+      this.#committer.produce(output)
+    }
+    const task = createTask(
       this.#graph,
-      (topic, record) => this.#committer.produce(toMessage(topic, record)),
+      (topic, record) => produce(toMessage(topic, record)),
       Date.now,
       {
         task: partition,
@@ -996,8 +1023,7 @@ class CommitCycle {
         // Exactly-once: store transactions as long as the Kafka transaction.
         storeTransactions: this.#exactlyOnce,
         // A Task's State Stores are logged to the Changelog partition of the same number.
-        changelog: (topic, record) =>
-          this.#committer.produce({ ...toMessage(topic, record), partition }),
+        changelog: (topic, record) => produce({ ...toMessage(topic, record), partition }),
         // Every Task with State Stores starts with a Restore, in the background.
         restore: (stores) => {
           const restorer = this.#restorer
@@ -1012,6 +1038,8 @@ class CommitCycle {
         },
       },
     )
+    this.#taskEpochs.set(task, epoch)
+    return task
   }
 
   /** Reports the Restore of Task `task` as events and metrics. */
@@ -1067,10 +1095,22 @@ class CommitCycle {
 
     const lastRead = [...this.#lastRead.values()]
     this.#lastRead = new Map()
-    // Exactly-once: a transaction with records of a lost partition must not commit (ADR-0006).
-    if (this.#exactlyOnce && lastRead.some(({ partition }) => lost.has(partition))) {
-      await this.#abortBatch(lost)
-      return
+    const contributors = this.#contributors
+    this.#contributors = new Map()
+    let guard: CommitGuard | undefined
+    if (this.#exactlyOnce) {
+      // A transaction with anything of a Task whose ownership was interrupted since (records,
+      // outputs, Changelog records, timer-driven writes alike) must not commit (ADR-0006). The
+      // committer checks again after each of its own waits, up to the commit.
+      const ownedThroughout = () => this.#ownership.ownedThroughout(contributors)
+      if (!ownedThroughout() || lastRead.some(({ partition }) => lost.has(partition))) {
+        await this.#abortBatch(new Set([...lost, ...this.#ownership.takeLost()]))
+        return
+      }
+      guard = {
+        ownedThroughout,
+        fencing: fencingOffsets(contributors.keys(), lastRead, this.#committedPosition),
+      }
     }
     const committing = this.#exactlyOnce
       ? lastRead
@@ -1078,7 +1118,7 @@ class CommitCycle {
     const committingSince = performance.now()
     let result: CommitResult
     try {
-      result = await this.#committer.commit(committing)
+      result = await this.#committer.commit(committing, guard)
     } catch (error) {
       // Exactly-once: partitions were lost while the batch was committing.
       if (!this.#exactlyOnce || this.#abandoned || !isRebalanceError(error)) throw error
@@ -1188,6 +1228,41 @@ interface CommitResult {
   empty: boolean
 }
 
+/** Exactly-once: what keeps a batch from committing after its Tasks' ownership was interrupted. */
+interface CommitGuard {
+  /** Whether every Task with a part in the batch has been owned throughout since. */
+  ownedThroughout(): boolean
+  /**
+   * Offsets to commit again with the batch, for the Tasks with a part in it but no record read
+   * (only timer-driven writes): every transaction commits offsets of each of its Tasks, so that
+   * the group coordinator checks the Worker's membership and generation before it commits.
+   */
+  fencing: ConsumedMessage[]
+}
+
+/**
+ * Exactly-once: for each Task (partition number) in `tasks` with no record in `lastRead`, a
+ * message standing for the last record committed from each of its partitions, from
+ * `committedPosition` (the offset after it). Committing it again changes nothing, but the
+ * transaction's offset commit then fences a Worker that is no longer the Task's owner. A
+ * partition with nothing committed yet gets none.
+ */
+export function fencingOffsets(
+  tasks: Iterable<number>,
+  lastRead: readonly { partition: number }[],
+  committedPosition: ReadonlyMap<TopicPartitionKey, bigint>,
+): ConsumedMessage[] {
+  const read = new Set(lastRead.map(({ partition }) => partition))
+  const unread = new Set([...tasks].filter((task) => !read.has(task)))
+  const fencing: ConsumedMessage[] = []
+  for (const [key, position] of committedPosition) {
+    const { topic, partition } = fromTopicPartitionKey(key)
+    if (!unread.has(partition) || position <= 0n) continue
+    fencing.push({ topic, partition, offset: position - 1n, metadata: {} } as ConsumedMessage)
+  }
+  return fencing
+}
+
 /** Commits a batch under one Delivery Guarantee. */
 interface BatchCommitter {
   /** Takes an output of the current batch. */
@@ -1197,7 +1272,7 @@ interface BatchCommitter {
    * read from each partition). Rejects if any part of it failed, except that at-least-once may
    * leave the offsets uncommitted after a rebalance.
    */
-  commit(lastRead: ConsumedMessage[]): Promise<CommitResult>
+  commit(lastRead: ConsumedMessage[], guard?: CommitGuard): Promise<CommitResult>
   /** Gives up on the current batch. Resolves to whether a Kafka transaction was aborted. */
   abort(): Promise<boolean>
 }
@@ -1220,7 +1295,7 @@ class AtLeastOnceCommitter implements BatchCommitter {
     this.#outputs.push(output)
   }
 
-  async commit(lastRead: ConsumedMessage[]): Promise<CommitResult> {
+  async commit(lastRead: ConsumedMessage[], _guard?: CommitGuard): Promise<CommitResult> {
     const outputs = this.#outputs
     this.#outputs = []
     const empty = outputs.length === 0 && lastRead.length === 0
@@ -1317,15 +1392,30 @@ class TransactionalCommitter implements BatchCommitter {
     return this.#transaction
   }
 
-  async commit(lastRead: ConsumedMessage[]): Promise<CommitResult> {
+  async commit(lastRead: ConsumedMessage[], guard?: CommitGuard): Promise<CommitResult> {
+    // Ownership may be interrupted during any wait: check after each, and right before the commit.
+    const check = () => {
+      if (guard !== undefined && !guard.ownedThroughout()) {
+        throw new PartitionRevokedError(
+          'A Task of the batch lost its partitions during the batch; aborting its transaction',
+        )
+      }
+    }
     await this.#sending
     if (this.#sendFailure !== undefined) throw this.#sendFailure.error
-    if (lastRead.length > 0) {
+    check()
+    const offsets = [...lastRead, ...(guard?.fencing ?? [])]
+    if (offsets.length > 0) {
       const transaction = await this.#begin()
+      check()
       await transaction.addConsumer(this.#consumer)
       // One offset per partition, and one at a time: the client merges concurrent offset commits.
-      for (const message of lastRead) await transaction.addOffset(this.#withCurrentGroup(message))
+      for (const message of offsets) {
+        check()
+        await transaction.addOffset(this.#withCurrentGroup(message))
+      }
     }
+    check()
     const transaction = this.#transaction
     const produced = this.#produced
     this.#transaction = undefined

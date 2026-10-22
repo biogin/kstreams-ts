@@ -8,9 +8,18 @@ Each Worker collects input into batches (every `commitIntervalMs`, or `commitMax
 
 ## Exactly-once
 
-With `guarantee: 'exactly-once'`, a batch's **outputs, Changelog writes and consumed offsets commit atomically in one Kafka transaction** ([ADR-0002](./adr/0002-exactly-once-designed-in-from-day-one.md)). State Store writes stay in a store transaction (SQLite) until the Kafka transaction has committed, and are rolled back if it aborts. After any crash, rebalance or restart, each input record's effect appears exactly once in the outputs and State Stores. Each Worker has one transactional producer covering all its Tasks ([ADR-0008](./adr/0008-one-transactional-producer-per-worker.md)); fencing comes from the consumer group generation and member ID sent with the offset commit (KIP-447).
+With `guarantee: 'exactly-once'`, a batch's **outputs, Changelog writes and consumed offsets commit atomically in one Kafka transaction** ([ADR-0002](./adr/0002-exactly-once-designed-in-from-day-one.md)). State Store writes stay in a store transaction (SQLite) until the Kafka transaction has committed, and are rolled back if it aborts. After any crash, rebalance or restart, each input record's effect appears exactly once in the outputs and State Stores. Each Worker has one transactional producer covering all its Tasks ([ADR-0008](./adr/0008-one-transactional-producer-per-worker.md)).
 
 A rebalance that takes a Task away mid-batch aborts the open transaction ([ADR-0006](./adr/0006-abort-on-revoke.md)); the new owner resumes from the last committed offsets.
+
+#### Fencing: how a Worker that lost a Task is kept from committing
+
+A Worker that lost a Task (a "zombie", e.g. one that missed a rebalance during a long pause) must not commit anything of that Task once the new owner may have started. Two mechanisms work together:
+
+- **In the Worker:** every Task has an ownership epoch, which changes each time one of its partitions is lost, even if it is assigned back right away. The open transaction remembers every Task that has anything in it: records it processed, outputs, Changelog writes, timer-driven writes alike. If any of these Tasks' epoch has changed, the Worker aborts the transaction and rolls back the State Stores instead of committing. It checks after processing the batch, after each wait while committing, and right before the commit.
+- **At the broker (KIP-447):** every transaction commits consumed offsets with the consumer group's generation and member ID, and the group coordinator rejects them from a member that is no longer in the current generation, which fails the transaction. A Task that only wrote from a timer in the batch (no record read) gets its committed offsets committed again, so its transaction is fenced the same way.
+
+A Worker that was dropped from the group entirely is fenced by the coordinator even when it hasn't noticed yet. And a commit already under way when a Task moves is safe either way: since every transaction holds offsets of each of its Tasks, the new owner waits for those offsets to be stable (the transaction to end) before it starts the Task, then restores what it committed.
 
 ### What you must do
 
@@ -40,7 +49,7 @@ Transactional IDs are `<applicationId>-<processId>-worker-<n>` ([ADR-0008](./adr
 
 #### A workaround for the client's read_committed
 
-The Kafka client (`@platformatic/kafka`) mis-handled aborted transactions in `read_committed` (platformatic/kafka#467, fix proposed in #470). The library works around it in `src/read-committed.ts`, filtering aborted records per fetch response like the Java client, for both Restore and the input path. It relies on client internals, so it is re-checked on every `@platformatic/kafka` upgrade, and goes away once the client fixes the problem.
+The Kafka client (`@platformatic/kafka`) mis-handled aborted transactions in `read_committed` (platformatic/kafka#467, fix proposed in #470). The library works around it in `src/read-committed.ts`, filtering aborted records per fetch response like the Java client, for both Restore and the input path. It relies on client internals, so `@platformatic/kafka` is pinned to the exact version it was checked against, it checks the shape of the client's Fetch arguments on every request (failing loudly on a mismatch), and it goes away once the client fixes the problem.
 
 #### Produce errors stop the app
 

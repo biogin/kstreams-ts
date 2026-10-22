@@ -44,6 +44,8 @@ export class Ownership {
   #owned: Map<TopicPartitionKey, number>
   /** Partition numbers lost since the last `takeLost`. */
   #lost = new Set<number>()
+  /** How often each partition number has been lost: its ownership epoch (see `epoch`). */
+  #losses = new Map<number, number>()
   readonly #onLost: () => void
   readonly #onRound: (round: OwnershipRound) => void
   readonly #onJoin = () => this.#assigned()
@@ -95,6 +97,26 @@ export class Ownership {
     return since !== undefined && typeof fetchedIn === 'number' && fetchedIn >= since
   }
 
+  /**
+   * The ownership epoch of the Task of partition number `partition`: it changes each time one of
+   * the Task's partitions is lost, even if it is assigned again right away. Work done under one
+   * epoch belongs to an ownership that has ended once the epoch has changed.
+   */
+  epoch(partition: number): number {
+    return this.#losses.get(partition) ?? 0
+  }
+
+  /**
+   * Whether each Task in `epochs` (partition number → the epoch its work was done under) has been
+   * owned throughout since: its epoch hasn't changed. A batch may only commit if so (ADR-0006).
+   */
+  ownedThroughout(epochs: ReadonlyMap<number, number>): boolean {
+    for (const [partition, epoch] of epochs) {
+      if (this.epoch(partition) !== epoch) return false
+    }
+    return true
+  }
+
   /** Whether partitions were lost since the last `takeLost`. */
   get lostPending(): boolean {
     return this.#lost.size > 0
@@ -134,7 +156,9 @@ export class Ownership {
     const revoked: TopicPartitionKey[] = []
     for (const [key, since] of this.#owned) {
       if (owned.get(key) !== since) {
-        this.#lost.add(fromTopicPartitionKey(key).partition)
+        const { partition } = fromTopicPartitionKey(key)
+        this.#lost.add(partition)
+        this.#losses.set(partition, (this.#losses.get(partition) ?? 0) + 1)
         revoked.push(key)
       }
     }

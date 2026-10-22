@@ -16,7 +16,6 @@
 - A Task restores when its first record arrives, so a quiet Task starts late; there is no limit on concurrent Restores.
 - Disposable disks mean a [full Restore on every start](./operations.md#disposable-disks).
 - A skipped record (error handler) does not advance Stream Time.
-- A zombie Worker whose open transaction holds only timer-driven Changelog writes could still commit them after the new owner has restored. This is rare; it is a known gap in the fencing and is on the list for a fix.
 - Exactly-once relies on a workaround for the Kafka client's `read_committed` (`src/read-committed.ts`) until platformatic/kafka#470 ships.
 - Java Kafka Streams formats and topology names are not compatible, and will not be ([ADR-0003](./adr/0003-no-java-kafka-streams-compatibility.md)). Node.js 24 or later only (no Bun or Deno).
 - 0.1 is a beta: the API may change before 1.0.
