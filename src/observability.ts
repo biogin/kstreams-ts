@@ -131,6 +131,11 @@ export type AbortReason =
   | 'error'
   /** `stop()` ran out of `shutdownTimeoutMs` and gave the batch up. */
   | 'shutdown-timeout'
+  /**
+   * The batch's transaction outlived (or was about to outlive) `transactionTimeoutMs`; the batch
+   * is processed again, in smaller batches.
+   */
+  | 'transaction-timeout'
 
 /** What a starting Task waited for (see the `wait-duration` metric). */
 export type WaitKind =

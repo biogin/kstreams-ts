@@ -99,6 +99,15 @@ export interface StreamsAppConfig {
    */
   maxProduceBytes?: number
   /**
+   * Exactly-once: the transaction timeout, in milliseconds, after which the broker aborts a
+   * transaction still open. Defaults to `commitIntervalMs` + 10000; it must be longer than
+   * `commitIntervalMs` and at most the broker's `transaction.max.timeout.ms` (default 15 minutes).
+   * A Worker keeps each batch's transaction well within it: it reads a batch for at most the
+   * timeout minus a margin, and shrinks its batches when their processing (e.g. slow async
+   * Processors) takes too long. A batch that still outlives it is aborted and processed again.
+   */
+  transactionTimeoutMs?: number
+  /**
    * How long the consumer group waits for a member that stopped sending heartbeats before moving
    * its Tasks to other members, in milliseconds. Defaults to 45000.
    */
@@ -527,6 +536,7 @@ interface RuntimeSettings {
   commitIntervalMs: number
   commitMaxRecords: number
   maxProduceBytes: number
+  transactionTimeoutMs: number
   sessionTimeoutMs: number
   shutdownTimeoutMs: number
   changelogReplicationFactor: number
@@ -548,11 +558,23 @@ function runtimeSettings(config: StreamsAppConfig): RuntimeSettings {
   if (brokers !== undefined && brokers.length === 0) {
     throw new Error('brokers must list at least one broker (host:port)')
   }
+  const commitIntervalMs = positive('commitIntervalMs', config.commitIntervalMs ?? 100)
+  const transactionTimeoutMs = positive(
+    'transactionTimeoutMs',
+    config.transactionTimeoutMs ?? Math.ceil(commitIntervalMs) + 10_000,
+    true,
+  )
+  if (transactionTimeoutMs <= commitIntervalMs) {
+    throw new Error(
+      `transactionTimeoutMs (${transactionTimeoutMs}) must be longer than commitIntervalMs (${commitIntervalMs})`,
+    )
+  }
   return {
     applicationId: config.applicationId,
     guarantee,
     brokers,
-    commitIntervalMs: positive('commitIntervalMs', config.commitIntervalMs ?? 100),
+    commitIntervalMs,
+    transactionTimeoutMs,
     commitMaxRecords: positive('commitMaxRecords', config.commitMaxRecords ?? 1000, true),
     maxProduceBytes: positive('maxProduceBytes', config.maxProduceBytes ?? 900_000, true),
     sessionTimeoutMs: positive('sessionTimeoutMs', config.sessionTimeoutMs ?? 45_000),

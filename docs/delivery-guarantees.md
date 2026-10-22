@@ -35,9 +35,11 @@ A Task awaits an async Processor before handling the next record, and the whole 
 
 - `read_committed` readers don't see the batch's outputs until it commits, so end-to-end latency grows by the batch's processing time.
 - A long-open transaction holds back the last stable offset of its partitions, and with it the readers behind it, including consumer lag in [metrics](./observability.md#metrics).
-- A transaction that stays open longer than the producer's transaction timeout is aborted by the broker, and the batch cannot commit.
+- The broker aborts a transaction that stays open longer than `transactionTimeoutMs` (default `commitIntervalMs` + 10 s).
 
-Keep async work fast, bound its latency with timeouts, lower `commitMaxRecords` so batches stay short, and use the DSL (synchronous) where you can.
+A Worker keeps each batch within that timeout. It stops taking records into a batch once the records it has taken (those still queued behind a slow Processor included, at the pace the batch has processed so far) would not be processed in time, and commits what it has. It also learns from batches that took too long and makes the next ones smaller. A batch that still outlives the timeout (one record slower than the timeout, say) is aborted and processed again, like a batch aborted by a rebalance; it shows as an `aborts` metric with `reason: 'transaction-timeout'`. Its async side effects then happen again. When the broker aborted the transaction itself, the Worker takes its transactional ID up again with its last producer epoch, which the broker refuses if another producer took the ID over in the meantime (a zombie Worker): that fencing still stops the app. The broker reports both with the same epoch errors, so the Worker tells them apart by how long the transaction had been open.
+
+Keep async work fast, bound its latency with timeouts well below `transactionTimeoutMs`, and use the DSL (synchronous) where you can. Raise `transactionTimeoutMs` (up to the broker's `transaction.max.timeout.ms`, 15 minutes by default) if single records can take longer.
 
 #### Disposable disks mean a full Restore
 

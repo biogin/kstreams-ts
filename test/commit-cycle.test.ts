@@ -9,6 +9,7 @@ import {
   type CommitCycleClients,
   type CommitGuard,
   type Stream,
+  TransactionTimedOutError,
   type WorkerOptions,
 } from '../src/worker.js'
 
@@ -79,6 +80,8 @@ class FakeCommitter implements BatchCommitter {
   aborts = 0
   onCommit: () => void = () => {}
   onAbort: () => void = () => {}
+  /** Thrown by the next commit with outputs, instead of committing. */
+  failNext: unknown
 
   produce(): void {
     this.outputs++
@@ -86,6 +89,11 @@ class FakeCommitter implements BatchCommitter {
 
   async commit(_lastRead: unknown[], guard?: CommitGuard) {
     const empty = this.outputs === 0
+    if (!empty && this.failNext !== undefined) {
+      const error = this.failNext
+      this.failNext = undefined
+      throw error
+    }
     this.outputs = 0
     if (!empty && guard !== undefined) {
       this.commits.push(guard)
@@ -147,6 +155,7 @@ function setUp(stable: bigint, onTick: () => void = () => {}) {
     commitIntervalMs: 20,
     commitMaxRecords: 100,
     maxProduceBytes: 900_000,
+    transactionTimeoutMs: 10_020,
     sessionTimeoutMs: 10_000,
     shutdownTimeoutMs: 1_000,
     changelogReplicationFactor: 1,
@@ -209,6 +218,31 @@ describe('a Task that writes only from a timer (exactly-once)', () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(committer.commits).toEqual([])
     // The Task was closed: a record of its partition now starts a new one, which commits.
+    const committed = new Promise<void>((resolve) => {
+      committer.onCommit = resolve
+    })
+    stream().push(0, 210n)
+    await committed
+    cycle.requestStop()
+    await running
+    expect(processors()).toBe(2)
+    expect(committer.aborts).toBe(1)
+  })
+})
+
+describe('a batch whose transaction timed out (exactly-once)', () => {
+  it('is aborted and read again, like after a rebalance, instead of failing the Worker', async () => {
+    const { cycle, committer, stream, processors } = setUp(200n)
+    committer.failNext = new TransactionTimedOutError('timed out')
+    const aborted = new Promise<void>((resolve) => {
+      committer.onAbort = resolve
+    })
+    const running = cycle.run()
+    stream().push(0, 210n)
+    await aborted
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(committer.commits).toEqual([])
+    // The Task was closed and the stream rewound: the record comes again and commits.
     const committed = new Promise<void>((resolve) => {
       committer.onCommit = resolve
     })
