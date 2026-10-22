@@ -11,6 +11,7 @@ import {
   type TopicPartition,
   tumbling,
 } from '../src/index.js'
+import { Listeners, recordMetric } from '../src/observability.js'
 import { total } from './support/metrics.js'
 
 // Observability on Kafka (Application States while rebalancing and restoring, rebalance and
@@ -159,5 +160,49 @@ describe('Test Driver metrics', () => {
         labels: { worker: 0, task: 0, kind: 'deserialization' },
       },
     ])
+  })
+})
+
+describe('async listeners and metrics sinks', () => {
+  /** Collects the unhandled rejections reported while `run` executes and one turn of the event loop. */
+  async function unhandledRejectionsDuring(run: () => void): Promise<unknown[]> {
+    const rejections: unknown[] = []
+    const listener = (reason: unknown) => rejections.push(reason)
+    process.on('unhandledRejection', listener)
+    try {
+      run()
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    } finally {
+      process.off('unhandledRejection', listener)
+    }
+    return rejections
+  }
+
+  it('ignores a listener whose returned Promise rejects', async () => {
+    const listeners = new Listeners()
+    listeners.on('state', (async () => {
+      throw new Error('listener bug')
+    }) as unknown as () => void)
+    const rejections = await unhandledRejectionsDuring(() =>
+      listeners.emit('state', { state: 'running', previous: 'created' } as StateChangeEvent),
+    )
+    expect(rejections).toEqual([])
+  })
+
+  it('ignores a metrics sink whose record() returns a rejecting Promise', async () => {
+    const sink: MetricsSink = {
+      record: (async () => {
+        throw new Error('sink bug')
+      }) as unknown as MetricsSink['record'],
+    }
+    const rejections = await unhandledRejectionsDuring(() =>
+      recordMetric(sink, {
+        name: 'records-processed',
+        type: 'counter',
+        value: 1,
+        labels: { worker: 0, task: 0 },
+      }),
+    )
+    expect(rejections).toEqual([])
   })
 })
