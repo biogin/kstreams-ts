@@ -75,16 +75,43 @@ describe('groupByKey().count()', () => {
     expect(second.store<string, number>('counts').get('alice')).toBeUndefined()
   })
 
-  it('needs a key Serde when the Stream has none, e.g. after map', async () => {
-    const app = createStreamsApp({ applicationId: 'count-serdes' })
+  it('refuses to group a Stream re-keyed by map, since it is not repartitioned', () => {
+    const app = createStreamsApp({ applicationId: 'count-rekeyed' })
     const byPage = app.stream('clicks', strings).map((user, page) => ({ key: page, value: user }))
-    expect(() => byPage.groupByKey()).toThrow(/key Serde/)
+    const filtered = byPage.filter(() => true)
 
-    byPage.groupByKey({ key: serdes.string }).count({ store: 'per-page' })
+    for (const stream of [byPage, filtered]) {
+      expect(() => stream.groupByKey({ key: serdes.string })).toThrow(
+        /Repartitioning isn't supported yet; write to a topic keyed by the new key and read it back/,
+      )
+    }
+  })
+
+  it('refuses to group the output of a Processor, which may forward any key', () => {
+    const app = createStreamsApp({ applicationId: 'count-processor' })
+    const forward = app.processor('forward', (ctx: ProcessorContext<string, string | null>) => ({
+      process(record: StreamRecord<string, string | null>) {
+        ctx.forward(record)
+      },
+    }))
+    const output = app.stream('clicks', strings).process(forward)
+
+    expect(() => output.groupByKey({ key: serdes.string })).toThrow(/Repartitioning/)
+  })
+
+  it('groups after mapValues, which keeps the key and its Serde', async () => {
+    const app = createStreamsApp({ applicationId: 'count-map-values' })
+    app
+      .stream('clicks', strings)
+      .mapValues((_user, page) => page?.length ?? 0)
+      .groupByKey({ value: serdes.number })
+      .reduce((total, length) => total + length, { store: 'lengths' })
     const driver = createTestDriver(app)
-    await driver.input<string, string>('clicks').pipe('alice', 'home')
+    const input = driver.input<string, string>('clicks')
+    await input.pipe('alice', 'home')
+    await input.pipe('alice', 'about')
 
-    expect(driver.store<string, number>('per-page').all()).toEqual([['home', 1]])
+    expect(driver.store<string, number>('lengths').all()).toEqual([['alice', 9]])
   })
 
   it('uses the State Store supplier it is given', async () => {

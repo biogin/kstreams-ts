@@ -13,10 +13,9 @@ const view = serdes.json<{ path: string }>()
 app
   .stream('page-views', { key: serdes.string, value: view })
   .filter((_userId, value): value is { path: string } => value !== null)
-  .map((_userId, value) => ({ key: value.path, value }))
-  .groupByKey({ key: serdes.string, value: view })
-  .count({ store: 'views-per-path' })
+  .groupByKey()
+  .count({ store: 'views-per-user' })
   .toStream()
-  .to('views-per-path', { key: serdes.string, value: serdes.number })
+  .to('views-per-user', { key: serdes.string, value: serdes.number })
 
 export default app

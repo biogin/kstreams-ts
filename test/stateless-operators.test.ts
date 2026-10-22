@@ -87,6 +87,49 @@ describe('map', () => {
   })
 })
 
+describe('mapValues', () => {
+  it('turns each value into a new value, keeping the key, its Serde and the timestamp', async () => {
+    const { app, stream } = stringStream()
+    const lengths = stream.mapValues((key, value) => `${key}:${value?.length ?? 0}`)
+    expectTypeOf(lengths).toEqualTypeOf<Stream<string, string>>()
+    lengths.to('output', { value: serdes.string })
+
+    const driver = createTestDriver(app)
+    await driver.input<string, string>('input').pipe('k', 'abc', { timestamp: 7 })
+
+    expect(driver.output('output').read()).toEqual({ key: 'k', value: 'k:3', timestamp: 7 })
+  })
+
+  it('passes Tombstones to the mapper, and a null result forwards a Tombstone', async () => {
+    const seen: (string | null)[] = []
+    const { app, stream } = stringStream()
+    stream
+      .mapValues((_key, value) => {
+        seen.push(value)
+        return value === null ? null : value.toUpperCase()
+      })
+      .to('output', { value: serdes.string })
+
+    const driver = createTestDriver(app)
+    const input = driver.input<string, string>('input')
+    await input.pipe('a', 'x', { timestamp: 1 })
+    await input.pipe('a', null, { timestamp: 2 })
+
+    expect(seen).toEqual(['x', null])
+    expect(driver.output('output').readAll()).toEqual([
+      { key: 'a', value: 'X', timestamp: 1 },
+      { key: 'a', value: null, timestamp: 2 },
+    ])
+  })
+
+  it('drops the value Serde, so .to() needs one', () => {
+    const { stream } = stringStream()
+    expect(() => stream.mapValues((_key, value) => value).to('no-value-serde')).toThrow(
+      /value Serde.*"no-value-serde"/,
+    )
+  })
+})
+
 describe('peek', () => {
   it('sees every record and passes it on unchanged', () => {
     const seen: string[] = []

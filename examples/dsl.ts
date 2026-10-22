@@ -14,15 +14,22 @@ const orders = app
   .filter((_id, order): order is Order => order !== null)
   .peek((id, order) => console.log('order', id, order.amountCents))
 
-// Stateless operators: `map` may change the key and value types.
+// Stateless operators: `map` may change the key and value types, `mapValues` only the value.
 orders
   .map((_id, order) => ({ key: order.customer, value: order.amountCents }))
   .to('amounts', { key: serdes.string, value: serdes.number })
+orders.mapValues((_id, order) => order.amountCents).to('order-amounts', { value: serdes.number })
+
+// Re-keying for an aggregation: write to a topic keyed by the new key, then read it back.
+orders
+  .map((_id, order) => ({ key: order.customer, value: order }))
+  .to('orders-by-customer', orderSerdes)
 
 // Aggregations: group by the current key, then count, reduce or aggregate into a Table.
-const perCustomer = orders
-  .map((_id, order) => ({ key: order.customer, value: order }))
-  .groupByKey({ key: serdes.string, value: serdes.json<Order>() })
+const perCustomer = app
+  .stream('orders-by-customer', orderSerdes)
+  .filter((_customer, order): order is Order => order !== null)
+  .groupByKey()
 
 perCustomer.count({ store: 'orders-per-customer' }).toStream().to('order-counts', {
   key: serdes.string,

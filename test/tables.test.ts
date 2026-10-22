@@ -131,7 +131,7 @@ describe('groupByKey().reduce()', () => {
 
   it('stores with the value Serde given to reduce, else the one of the grouped Stream', async () => {
     const { app, stream } = orderStream('reduce-serdes')
-    const amounts = stream.map((key, order) => ({ key, value: order?.amount ?? 0 }))
+    const amounts = stream.mapValues((_key, order) => order?.amount ?? 0)
     expect(() => amounts.groupByKey({ key: serdes.string }).reduce((a, b) => a + b)).toThrow(
       /value Serde/,
     )

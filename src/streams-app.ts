@@ -259,8 +259,19 @@ export interface Stream<K, V> {
   /**
    * Turns each record into a new key and value, which may have other types. The record keeps its
    * timestamp. The resulting Stream has no Serdes of its own, so `.to()` must be given both.
+   *
+   * The resulting Stream counts as re-keyed: `groupByKey` on it throws, because records with the
+   * same new key may be in different Tasks (Repartition Topics are not supported yet). To change
+   * only the values, use `mapValues`.
    */
   map<R>(mapper: (key: K, value: V) => SyncKeyValue<R>): Stream<KeyOf<R>, ValueOf<R>>
+  /**
+   * Turns each record's value into a new value, which may have another type; the key and the
+   * timestamp stay. The resulting Stream keeps the key Serde but has no value Serde, so `.to()`
+   * needs a value Serde. A Tombstone reaches `mapper` as a null value, and a null result forwards
+   * a Tombstone.
+   */
+  mapValues<VOut>(mapper: (key: K, value: V) => Sync<VOut>): Stream<K, VOut>
   /**
    * Calls `action` with each record (for logging, metrics, ...) and passes the record on unchanged.
    * Whatever `action` returns is ignored.
@@ -274,13 +285,17 @@ export interface Stream<K, V> {
   /**
    * Sends every record to a Processor and returns the Stream of records it forwards. Connecting
    * several Streams to one Processor merges them; each call returns that same output Stream. The
-   * output Stream has no Serdes, so `.to()` after it needs both.
+   * output Stream has no Serdes, so `.to()` after it needs both. A Processor may forward any key,
+   * so its output Stream counts as re-keyed (see `map`).
    */
   process<KOut, VOut>(processor: NamedProcessor<K, V, KOut, VOut>): Stream<KOut, VOut>
   /**
    * Groups the records by their current key, to aggregate them per key. Needs a key Serde for the
-   * aggregation's State Store: pass one if this Stream has none (e.g. after `map`). The value Serde
-   * is used by `reduce`. Aggregations skip tombstones, so the grouped values are never null.
+   * aggregation's State Store: pass one if this Stream has none. The value Serde is used by
+   * `reduce`. Aggregations skip tombstones, so the grouped values are never null.
+   *
+   * Throws on a re-keyed Stream (after `map` or `process`): Repartition Topics are not supported
+   * yet, so write the re-keyed records to a topic keyed by the new key and read it back.
    */
   groupByKey(serdes?: Partial<Serdes<K, NonNullable<V>>>): GroupedStream<K, NonNullable<V>>
 }
@@ -450,7 +465,8 @@ export function createStreamsApp(config: StreamsAppConfig): StreamsApp {
         throw new Error('A Processor needs a non-empty name')
       }
       const processor = { name: graph.addProcessor(supplier, [], name) }
-      registered.set(processor, { graph, output: new StreamNode(graph, name, {}) })
+      // A Processor can forward any key, so its output counts as re-keyed.
+      registered.set(processor, { graph, output: new StreamNode(graph, name, {}, true) })
       return processor
     },
     store(name, serdes, options = {}) {
@@ -827,11 +843,22 @@ class StreamNode<K, V> implements Stream<K, V> {
   readonly #node: string
   /** Serdes known to fit this Stream's records, inherited from its input topic or Table. */
   readonly #serdes: Partial<Serdes<K, NonNullable<V>>>
+  /**
+   * Whether the keys may differ from the keys the records were partitioned by (after `map` or a
+   * Processor), so records with the same key may be in different Tasks.
+   */
+  readonly #rekeyed: boolean
 
-  constructor(graph: ProcessorGraph, node: string, serdes: Partial<Serdes<K, NonNullable<V>>>) {
+  constructor(
+    graph: ProcessorGraph,
+    node: string,
+    serdes: Partial<Serdes<K, NonNullable<V>>>,
+    rekeyed = false,
+  ) {
     this.#graph = graph
     this.#node = node
     this.#serdes = serdes
+    this.#rekeyed = rekeyed
   }
 
   filter(predicate: (key: K, value: V) => boolean): Stream<K, V> {
@@ -861,6 +888,26 @@ class StreamNode<K, V> implements Stream<K, V> {
         },
       }),
       {},
+      true,
+    )
+  }
+
+  mapValues<VOut>(mapper: (key: K, value: V) => Sync<VOut>): Stream<K, VOut> {
+    // Once Promises are ruled out (at runtime by `synchronous`), the mapper returns a value.
+    const toValue = synchronous('mapValues', mapper) as (key: K, value: V) => VOut
+    // The key stays, and so does its Serde; the value type may differ.
+    const { key } = this.#serdes
+    return this.#then<K, VOut>(
+      ({ forward }) => ({
+        process(record) {
+          forward({
+            key: record.key,
+            value: toValue(record.key, record.value),
+            timestamp: record.timestamp,
+          })
+        },
+      }),
+      key === undefined ? {} : { key },
     )
   }
 
@@ -877,12 +924,17 @@ class StreamNode<K, V> implements Stream<K, V> {
     )
   }
 
-  /** Adds a Processor downstream of this Stream and returns the Stream of what it forwards. */
+  /**
+   * Adds a Processor downstream of this Stream and returns the Stream of what it forwards, which
+   * is re-keyed if this Stream is or if `rekeys` is true.
+   */
   #then<KOut, VOut>(
     supplier: ProcessorSupplier<K, V, KOut, VOut>,
     serdes: Partial<Serdes<KOut, NonNullable<VOut>>>,
+    rekeys = false,
   ): Stream<KOut, VOut> {
-    return new StreamNode(this.#graph, this.#graph.addProcessor(supplier, [this.#node]), serdes)
+    const node = this.#graph.addProcessor(supplier, [this.#node])
+    return new StreamNode(this.#graph, node, serdes, this.#rekeyed || rekeys)
   }
 
   to(topic: string, serdes: Partial<Serdes<K, NonNullable<V>>> = {}): void {
@@ -896,6 +948,13 @@ class StreamNode<K, V> implements Stream<K, V> {
   }
 
   groupByKey(serdes: Partial<Serdes<K, NonNullable<V>>> = {}): GroupedStream<K, NonNullable<V>> {
+    if (this.#rekeyed) {
+      // Without a Repartition Topic, records with the same new key could be aggregated separately
+      // in several Tasks.
+      throw new Error(
+        "groupByKey after map or a Processor: the keys may have changed, so records with the same key can be in different Tasks. Repartitioning isn't supported yet; write to a topic keyed by the new key and read it back (or use mapValues to change only the values)",
+      )
+    }
     const key = serdes.key ?? this.#serdes.key
     if (key === undefined) {
       throw new Error('No key Serde for groupByKey: pass one to .groupByKey({ key })')
