@@ -1,16 +1,16 @@
 # MVP status
 
-**State (2026-10-23): ready to publish 0.1.0 beta.** All 30 tickets are merged, the review loop is closed (release bar: no known P1 and all suites green) and `main` on GitHub (https://github.com/biogin/kstreams-ts) holds everything. The `mvp` branch is history; work goes on branches off `main`, merged by PR (CI runs integration on Kafka 3.9.1 and 4.4.0, plus the crash suite nightly).
+**State (2026-10-23): 0.1.0 beta released.** Published to npm as `kstreams-ts@0.1.0` (npm account `modernnn`; dist-tags `beta` and `latest` both 0.1.0, since npm makes the first version `latest`), verified by a clean install from the registry. Git tag `v0.1.0` on 9850cea; GitHub prerelease https://github.com/biogin/kstreams-ts/releases/tag/v0.1.0. Work goes on branches off `main`, merged by PR (CI runs integration on Kafka 3.9.1 and 4.4.0, plus the crash suite nightly). The `mvp` branch is history.
 
-## Next (user)
+## Releasing (for the next version)
 
-1. `cd ~/code/kstreams-ts && git pull --ff-only origin main` (the local `main` there is behind).
-2. `npm login`, then `npm publish --tag beta --access public`.
-3. `git tag v0.1.0 && git push origin v0.1.0`, then `gh release create v0.1.0 --prerelease --generate-notes`.
+- Bump `version` in package.json and CHANGELOG.md on a PR; merge once CI is green.
+- Publish from a real terminal, not through Claude Code (its shell isn't a TTY, so npm hides the 2FA approval link and fails with EOTP): `npm publish --access public` (add `--tag beta` for a prerelease). npm first shows a `0.0.0-stage` placeholder; the version appears after about 2 minutes.
+- Then `git tag -a vX.Y.Z <commit> -m ...`, push the tag, `gh release create vX.Y.Z --generate-notes` (add install notes on top).
+- The build runs from the `prepare` script, so `npm publish`, `npm pack` and git installs (`npm install github:biogin/kstreams-ts`) all build `dist/`.
+- The local `main` in `~/code/kstreams-ts` may be behind: `git pull --ff-only origin main` there.
 
-The build runs from the `prepare` script, so `npm publish`, `npm pack` and git installs (`npm install github:biogin/kstreams-ts`) all build `dist/`.
-
-## After 0.1
+## Next
 
 - Ticket 31 (split `src/worker.ts`) and ticket 32 (ultrareview finding 10).
 - Drop `src/read-committed.ts` once platformatic/kafka#470 ships in a release (see Upstream). Until then `@platformatic/kafka` stays pinned to an exact version (2.14.0): `ReadCommittedConsumer` hooks `kGetApi` and relies on the Fetch API's argument order (isolationLevel is argument 4); re-check on every upgrade.
