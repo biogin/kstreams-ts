@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { CHECKPOINT_FILE, readCheckpoint } from '../src/checkpoint.js'
+import { CHECKPOINT_FILE, CHECKPOINT_VERSION, readCheckpoint } from '../src/checkpoint.js'
 import {
   createStreamsApp,
   type ProcessorContext,
@@ -12,7 +12,9 @@ import {
 } from '../src/index.js'
 import type { ChangelogReader, ChangelogRecord } from '../src/restore.js'
 import { restoreStores } from '../src/restore.js'
+import { openSqliteStore } from '../src/sqlite-store.js'
 import { taskDirectory } from '../src/state-store.js'
+import { storeKey } from '../src/store-key.js'
 import { processorGraphOf } from '../src/streams-app.js'
 import { createTask, type Task } from '../src/task.js'
 
@@ -129,6 +131,47 @@ describe('Checkpoints of persistent State Stores', () => {
     expect(readCheckpoint(directory)).toEqual(new Map([['counts', 4n]]))
   })
 
+  it('fully restores a clean store written in the old key encoding (Checkpoint version 1)', async () => {
+    // Before Checkpoint version 2, a key the Serde changes (a Date through JSON) was stored as its
+    // Serde bytes; it is now stored as the key the Serde gives back (an ISO string).
+    const dateKey = serdes.json<Date>()
+    const day = new Date('2026-01-01T00:00:00.000Z')
+    const old = openSqliteStore(directory, 'counts')
+    old.put(storeKey(day, dateKey, context), serdes.number.serialize(5, context))
+    old.close()
+    const log = fakeChangelog()
+    log.records.push({
+      key: dateKey.serialize(day, context),
+      value: serdes.number.serialize(5, context),
+    })
+    // Clean: the store is exactly its Changelog up to the Checkpoint.
+    writeFileSync(
+      join(directory, CHECKPOINT_FILE),
+      JSON.stringify({ version: 1, offsets: { counts: '1' } }),
+    )
+
+    const app = createStreamsApp({ applicationId })
+    const counts = app.store('counts', { key: dateKey, value: serdes.number })
+    const counter = app.processor('counter', (ctx: ProcessorContext<never, never>) => ({
+      process({ key }: { key: string | null }) {
+        const store = ctx.store(counts)
+        const at = new Date(key ?? '')
+        store.put(at, (store.get(at) ?? 0) + 1)
+      },
+    }))
+    app.stream('input', { key: serdes.string, value: serdes.string }).process(counter)
+    const task = createTask(processorGraphOf(app), () => {}, Date.now, {
+      stateDir,
+      changelog: (_topic, { key, value }) => log.records.push({ key, value }),
+      restore: (opened) => restoreStores(opened, 0, log.reader),
+    })
+    open.push(task)
+    await pipe(task, day.toISOString())
+
+    expect(log.reads[0]).toBeUndefined() // a full Restore
+    expect(task.store('counts').all()).toEqual([[day.toISOString(), 6]])
+  })
+
   it('writes a Checkpoint once Restore is done, before any record is processed', async () => {
     const log = fakeChangelog()
     log.records.push({ key: text('a'), value: serdes.number.serialize(5, context) })
@@ -191,8 +234,11 @@ describe('Checkpoints of persistent State Stores', () => {
   it.each([
     ['unreadable', 'not json'],
     ['of another format version', JSON.stringify({ version: 999, offsets: { counts: '1' } })],
-    ['without the store', JSON.stringify({ version: 1, offsets: {} })],
-    ['with a bad offset', JSON.stringify({ version: 1, offsets: { counts: '-1' } })],
+    ['without the store', JSON.stringify({ version: CHECKPOINT_VERSION, offsets: {} })],
+    [
+      'with a bad offset',
+      JSON.stringify({ version: CHECKPOINT_VERSION, offsets: { counts: '-1' } }),
+    ],
   ])('wipes and fully restores when the Checkpoint is %s', async (_, content) => {
     const log = fakeChangelog()
     const first = counterTask(log)

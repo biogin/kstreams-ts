@@ -4,7 +4,7 @@
 //
 // A Task's Checkpoint is one file, `<stateDir>/<applicationId>/<task>/.checkpoint`:
 //
-//   {"version":1,"offsets":{"counts":"42"}}
+//   {"version":2,"offsets":{"counts":"42"}}
 //
 // `offsets` maps each persistent store's name to the offset of its Changelog partition that
 // Restore starts from: one past the last record the store has applied (a decimal string, since
@@ -47,8 +47,11 @@ import type { StateStore } from './state-store.js'
 
 /** The name of a Task's Checkpoint file in its state directory. */
 export const CHECKPOINT_FILE = '.checkpoint'
-/** The current on-disk format version (ADR-0015). */
-export const CHECKPOINT_VERSION = 1
+/**
+ * The current on-disk format version (ADR-0015). 2: keys are stored as their key Serde gives them
+ * back (a Date through JSON as its ISO string), not as given.
+ */
+export const CHECKPOINT_VERSION = 2
 
 /** Changelog offsets by store name. */
 export type CheckpointOffsets = ReadonlyMap<string, bigint>
