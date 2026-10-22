@@ -1,5 +1,5 @@
-import { IS_CONTROL, MessagesStreamModes, Producer, stringSerializers } from '@platformatic/kafka'
 import { inspect } from 'node:util'
+import { IS_CONTROL, MessagesStreamModes, Producer, stringSerializers } from '@platformatic/kafka'
 import { afterAll, beforeAll, expect, it } from 'vitest'
 import { ReadCommittedConsumer } from '../../src/read-committed.js'
 import { brokers, createKafka, describeWithKafka, uniqueName } from './kafka.js'
