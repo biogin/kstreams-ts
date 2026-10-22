@@ -3,6 +3,7 @@
 // broker rejects a write, outside any record's processing. Neither does `AsyncNotAllowedError`
 // (ADR-0012), nor an error raised by a timer, which has no record to skip.
 
+import { checkTimestamp } from './record.js'
 import { skipsErrorHandlers } from './sync-dsl.js'
 
 /** Which kind of error an error handler is given. */
@@ -174,7 +175,15 @@ export function handleError(
 ): void {
   const handler = handlers?.[kind]
   if (handler === undefined || skipsErrorHandlers(error)) throw error
-  const response: unknown = handler({ kind, error, record, produce })
+  const response: unknown = handler({
+    kind,
+    error,
+    record,
+    produce(topic, output) {
+      checkTimestamp(output.timestamp)
+      produce(topic, output)
+    },
+  })
   if (typeof (response as PromiseLike<unknown> | undefined)?.then === 'function') {
     // The app stops on the error below; don't also report the Promise's rejection.
     Promise.resolve(response).catch(() => {})

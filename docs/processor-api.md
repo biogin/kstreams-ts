@@ -48,7 +48,7 @@ app.stream('events', strings).process(dedupe).to('unique-events', strings)
 
 ## The context
 
-- `ctx.forward({ key, value, timestamp })` sends a record to every child. There is no need to await it. Always set a `timestamp` (usually the input record's, or in a timer the one the callback receives); forwarded records don't get one by themselves.
+- `ctx.forward({ key, value, timestamp })` sends a record to every child. There is no need to await it. Always set a `timestamp` (usually the input record's, or in a timer the one the callback receives); forwarded records don't get one by themselves. A timestamp must be an integer number of milliseconds (a Kafka record's timestamp is an int64): forwarding `1.5`, `NaN` or `Infinity` throws a `TypeError` from `ctx.forward`, which fails the record like any processing error, in the Test Driver as on Kafka. An error handler's `produce` throws on such a timestamp too, and the Test Driver's `pipe` rejects it as its `timestamp` option.
 - `ctx.store(store)` opens a State Store for this Task; pass the value `app.store` returned for typed access, or its name. See [State Stores](./state-stores.md).
 - `ctx.schedule(intervalMs, type, callback)` schedules a recurring timer and returns a `Timer` with `cancel()`.
 
