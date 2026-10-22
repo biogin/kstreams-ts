@@ -52,7 +52,8 @@ export interface StreamsAppErrorEvent {
 /**
  * A Worker took part in a completed rebalance round. A cooperative rebalance that moves Tasks has
  * two rounds: the Worker that gives Tasks up sees them revoked in the first, the one that takes
- * them sees them assigned in the second.
+ * them sees them assigned in the second. Each Worker's first one reports the partitions it joined
+ * the group with.
  */
 export interface RebalanceEvent {
   /** The Worker's number: 0 to the number of worker threads − 1 (0 with `workers: 0`). */

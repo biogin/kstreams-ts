@@ -188,7 +188,8 @@ describeWithKafka('Restore without blocking other Tasks (SQLite, workers: 0)', (
       await waitForCounts(output, 'a', 2 + i)
     }
     expect((await committedCounts(output)).get('b')).toEqual([1])
-    expect(app.state).toBe('running')
+    // A Task restores: the app reports it, though its other Task keeps processing.
+    expect(app.state).toBe('restoring')
 
     await open.commit()
     await waitForCounts(output, 'b', 31)

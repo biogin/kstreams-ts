@@ -2,7 +2,10 @@
 // app names this module in `workers: { count, module: import.meta.url }`, so each worker thread
 // imports it and rebuilds the same app. It counts `input` records per key with `count()` (SQLite
 // in `stateDir`) under exactly-once and writes each new count to `output`. The first Worker to see the
-// value `failOn` (if given) fails; any other processes it normally. With `noAppInWorkers`, worker threads find no app in it (to test that error).
+// value `failOn` (if given) fails, with a RangeError if `failWithRangeError`; any other processes it
+// normally. With `noAppInWorkers`, worker threads find no app in it (to test that error). With
+// `recordMetrics`, its metrics sink keeps every metric in `recordedMetrics` (in the main thread,
+// where the Workers' metrics arrive).
 //
 // The params come from the KSTREAMS_APP_PARAMS environment variable the App Process harness sets
 // (see harness/app-process.ts): worker threads see the same environment, so they build the same
@@ -11,7 +14,7 @@
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { isMainThread } from 'node:worker_threads'
-import { createStreamsApp, serdes } from '../../../src/index.js'
+import { createStreamsApp, type Metric, serdes } from '../../../src/index.js'
 
 export interface WorkersCountParams {
   applicationId: string
@@ -21,6 +24,8 @@ export interface WorkersCountParams {
   workers: number
   stateDir: string
   failOn?: string
+  failWithRangeError?: boolean
+  recordMetrics?: boolean
   /**
    * The failing Worker's thread also crashes right after, with an uncaught "Connection closed" (as
    * a Kafka client's unhandled 'error' event while closing would), before its Worker has closed.
@@ -37,9 +42,14 @@ const {
   workers,
   stateDir,
   failOn,
+  failWithRangeError,
+  recordMetrics,
   crashAfterFail,
   noAppInWorkers,
 } = JSON.parse(process.env.KSTREAMS_APP_PARAMS ?? '{}') as WorkersCountParams
+
+/** The metrics the app's metrics sink got, with `recordMetrics`. */
+export const recordedMetrics: Metric[] = []
 
 const app = createStreamsApp({
   applicationId,
@@ -50,6 +60,9 @@ const app = createStreamsApp({
   sessionTimeoutMs: 6_000,
   changelogReplicationFactor: 1,
   commitMaxRecords: 50,
+  ...(recordMetrics
+    ? { metrics: { record: (metric: Metric) => recordedMetrics.push(metric) } }
+    : {}),
 })
 app
   .stream(input, { key: serdes.string, value: serdes.string })
@@ -60,7 +73,7 @@ app
           throw new Error('Connection closed')
         })
       }
-      throw new Error('Processor failed on purpose')
+      throw new (failWithRangeError ? RangeError : Error)('Processor failed on purpose')
     }
   })
   .groupByKey()

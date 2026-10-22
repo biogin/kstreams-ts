@@ -100,7 +100,7 @@ describeWithKafka('worker threads on real Kafka (exactly-once, workers: 2)', () 
     if (app === undefined) throw new Error('The App Module exports no app')
     try {
       await app.start()
-      expect(app.state).toBe('running')
+      await eventually(() => app.state === 'running', { message: 'the running state' })
       kafka.deleteOnClose(`${applicationId}-counts-changelog`)
       expect(await kafka.groupMembers(applicationId)).toBe(2)
 

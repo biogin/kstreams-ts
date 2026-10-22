@@ -494,6 +494,11 @@ class CommitCycle {
     )
     clients.consumer.on('consumer:group:rebalance', this.#onRebalance)
     clients.consumer.on('consumer:group:join', this.#onJoin)
+    // The round the Worker joined the group in completed before the cycle could follow it.
+    this.#event({
+      name: 'rebalance',
+      payload: { worker: options.workerNumber, assigned: this.#ownership.owned(), revoked: [] },
+    })
     this.#committer = clients.createCommitter(
       (error) => this.#fail(error),
       (topic, partition) => this.#ownership.owns(topic, partition),
