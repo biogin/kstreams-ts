@@ -91,6 +91,14 @@ export interface StreamsAppConfig {
    */
   commitMaxRecords?: number
   /**
+   * The most bytes of records a Worker writes in one produce request: a batch's outputs and
+   * Changelog records are split over several requests, in order, to stay under it. Defaults to
+   * 900000, safely below the broker's default `message.max.bytes` (about 1 MB), which a single
+   * partition's records in one request must not exceed. Raise it only together with the broker's
+   * (or the topics') `max.message.bytes`.
+   */
+  maxProduceBytes?: number
+  /**
    * How long the consumer group waits for a member that stopped sending heartbeats before moving
    * its Tasks to other members, in milliseconds. Defaults to 45000.
    */
@@ -518,6 +526,7 @@ interface RuntimeSettings {
   brokers: string[] | undefined
   commitIntervalMs: number
   commitMaxRecords: number
+  maxProduceBytes: number
   sessionTimeoutMs: number
   shutdownTimeoutMs: number
   changelogReplicationFactor: number
@@ -545,6 +554,7 @@ function runtimeSettings(config: StreamsAppConfig): RuntimeSettings {
     brokers,
     commitIntervalMs: positive('commitIntervalMs', config.commitIntervalMs ?? 100),
     commitMaxRecords: positive('commitMaxRecords', config.commitMaxRecords ?? 1000, true),
+    maxProduceBytes: positive('maxProduceBytes', config.maxProduceBytes ?? 900_000, true),
     sessionTimeoutMs: positive('sessionTimeoutMs', config.sessionTimeoutMs ?? 45_000),
     shutdownTimeoutMs: positive('shutdownTimeoutMs', config.shutdownTimeoutMs ?? 30_000),
     changelogReplicationFactor: positive(

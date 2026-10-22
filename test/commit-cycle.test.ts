@@ -146,6 +146,7 @@ function setUp(stable: bigint, onTick: () => void = () => {}) {
     transactionalId: 'cycle-worker-0',
     commitIntervalMs: 20,
     commitMaxRecords: 100,
+    maxProduceBytes: 900_000,
     sessionTimeoutMs: 10_000,
     shutdownTimeoutMs: 1_000,
     changelogReplicationFactor: 1,

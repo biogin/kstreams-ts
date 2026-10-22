@@ -142,6 +142,8 @@ export interface WorkerOptions {
   transactionalId: string | undefined
   commitIntervalMs: number
   commitMaxRecords: number
+  /** The most bytes of records one produce request carries (see `splitBySize`). */
+  maxProduceBytes: number
   sessionTimeoutMs: number
   /** How long `stop()` may take to commit the current batch before it gives the batch up. */
   shutdownTimeoutMs: number
@@ -297,8 +299,8 @@ export async function startWorker(graph: ProcessorGraph, options: WorkerOptions)
     consumer,
     createCommitter: (fail, owns) =>
       transactionalId === undefined
-        ? new AtLeastOnceCommitter(consumer, producer)
-        : new TransactionalCommitter(consumer, producer, fail, owns),
+        ? new AtLeastOnceCommitter(consumer, producer, options.maxProduceBytes)
+        : new TransactionalCommitter(consumer, producer, options.maxProduceBytes, fail, owns),
     stream,
     // While a stream is open, opening another joins no group: it starts from the committed
     // offsets of the partitions the consumer has.
@@ -1313,14 +1315,17 @@ export interface BatchCommitter {
 class AtLeastOnceCommitter implements BatchCommitter {
   readonly #consumer: Consumer<Bytes, Bytes, Bytes, Bytes>
   readonly #producer: Producer<Bytes, Bytes, Bytes, Bytes>
+  readonly #maxBytes: number
   #outputs: Output[] = []
 
   constructor(
     consumer: Consumer<Bytes, Bytes, Bytes, Bytes>,
     producer: Producer<Bytes, Bytes, Bytes, Bytes>,
+    maxBytes: number,
   ) {
     this.#consumer = consumer
     this.#producer = producer
+    this.#maxBytes = maxBytes
   }
 
   produce(output: Output): void {
@@ -1331,10 +1336,11 @@ class AtLeastOnceCommitter implements BatchCommitter {
     const outputs = this.#outputs
     this.#outputs = []
     const empty = outputs.length === 0 && lastRead.length === 0
-    let produced: ProducedOffsets = new Map()
-    if (outputs.length > 0) {
-      const result = await this.#producer.send({ messages: outputs })
-      produced = producedOffsets(outputs, result.offsets ?? [])
+    const produced = new Map<number, Map<string, bigint>>()
+    // One request after the other, so that each partition's outputs keep their order.
+    for (const messages of splitBySize(outputs, this.#maxBytes)) {
+      const result = await this.#producer.send({ messages })
+      mergeProduced(produced, producedOffsets(messages, result.offsets ?? []))
     }
     if (lastRead.length > 0) {
       try {
@@ -1369,6 +1375,7 @@ class AtLeastOnceCommitter implements BatchCommitter {
 class TransactionalCommitter implements BatchCommitter {
   readonly #consumer: Consumer<Bytes, Bytes, Bytes, Bytes>
   readonly #producer: Producer<Bytes, Bytes, Bytes, Bytes>
+  readonly #maxBytes: number
   #transaction: Transaction | undefined
   /** Outputs waiting for the next send. */
   #pending: Output[] = []
@@ -1387,11 +1394,13 @@ class TransactionalCommitter implements BatchCommitter {
   constructor(
     consumer: Consumer<Bytes, Bytes, Bytes, Bytes>,
     producer: Producer<Bytes, Bytes, Bytes, Bytes>,
+    maxBytes: number,
     fail: (error: unknown) => void,
     owns: (topic: string, partition: number) => boolean,
   ) {
     this.#consumer = consumer
     this.#producer = producer
+    this.#maxBytes = maxBytes
     this.#fail = fail
     this.#owns = owns
   }
@@ -1411,8 +1420,11 @@ class TransactionalCommitter implements BatchCommitter {
     if (messages.length === 0 || this.#sendFailure !== undefined) return
     try {
       const transaction = await this.#begin()
-      const result = await transaction.send({ messages })
-      mergeProduced(this.#produced, producedOffsets(messages, result.offsets ?? []))
+      // One request after the other, so that each partition's outputs keep their order.
+      for (const chunk of splitBySize(messages, this.#maxBytes)) {
+        const result = await transaction.send({ messages: chunk })
+        mergeProduced(this.#produced, producedOffsets(chunk, result.offsets ?? []))
+      }
     } catch (error) {
       this.#sendFailure = { error }
       this.#fail(error)
@@ -1530,6 +1542,42 @@ function producedOffsets(
     byTopic.set(topic, next)
   }
   return produced
+}
+
+/** Roughly what a record adds to a produce request besides its key, value and headers. */
+const RECORD_OVERHEAD_BYTES = 70
+
+/** About how many bytes `output` takes in a produce request. */
+function sizeOf(output: Output): number {
+  let size = RECORD_OVERHEAD_BYTES + (output.key?.length ?? 0) + (output.value?.length ?? 0)
+  if (output.headers instanceof Map) {
+    for (const [name, value] of output.headers) size += name.length + value.length
+  }
+  return size
+}
+
+/**
+ * Exported for the unit tests (ADR-0016). Splits `outputs`, in order, into runs of at most
+ * `maxBytes` (a record larger than that alone): one produce request writes one record batch per
+ * partition, which the broker rejects above its `max.message.bytes`. Bounding the whole request
+ * bounds each partition's batch, whichever partition the partitioner picks.
+ */
+export function splitBySize(outputs: readonly Output[], maxBytes: number): Output[][] {
+  const runs: Output[][] = []
+  let run: Output[] = []
+  let bytes = 0
+  for (const output of outputs) {
+    const size = sizeOf(output)
+    if (run.length > 0 && bytes + size > maxBytes) {
+      runs.push(run)
+      run = []
+      bytes = 0
+    }
+    run.push(output)
+    bytes += size
+  }
+  if (run.length > 0) runs.push(run)
+  return runs
 }
 
 /** Adds `more` to `produced`, keeping the higher offset: later sends write later offsets. */
