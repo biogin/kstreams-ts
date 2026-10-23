@@ -2,7 +2,7 @@
 
 **Not there yet**
 
-- Reading a topic as a Table, joins (stream-table and stream-stream), `groupBy` with a new key and so Repartition Topics, hopping and session windows. Without them nothing is repartitioned, so `groupByKey()` on a re-keyed Stream (after `map` or `process`) throws when the app is built, rather than aggregating the same key separately in several Tasks. Write the re-keyed records to a topic keyed by the new key and read it back (see [the DSL](./dsl.md#aggregations)); use `mapValues` when only the value changes.
+- Reading a topic as a Table, joins (stream-table and stream-stream; a stream-table join and grouping by another key work by hand, see [joins and re-keying today](./joins.md)), `groupBy` with a new key and so Repartition Topics, hopping and session windows. Without them nothing is repartitioned, so `groupByKey()` on a re-keyed Stream (after `map` or `process`) throws when the app is built, rather than aggregating the same key separately in several Tasks. Write the re-keyed records to a topic keyed by the new key and read it back (see [the DSL](./dsl.md#aggregations)); use `mapValues` when only the value changes.
 - Input topics with different partition counts: in 0.1 **all input topics of an app must be Co-partitioned** (the same partition count, and keyed the same way), because a Task reads one partition number from each of them. The app refuses to start otherwise. This includes a topic you write re-keyed records to and read back.
 - Standby replicas and a state-aware partition assignor: a Task that moves to a Worker without its local stores does a full Restore.
 - Reading State Stores from outside the app (interactive queries). Use the Test Driver in tests, or write the Table's updates to a topic.

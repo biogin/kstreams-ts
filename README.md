@@ -68,7 +68,7 @@ Test it without Kafka, with the [Test Driver](./docs/test-driver.md).
 ## User guide
 
 1. [Streams App and configuration](./docs/streams-app.md)
-2. [The DSL](./docs/dsl.md) and [windows](./docs/windows.md)
+2. [The DSL](./docs/dsl.md), [windows](./docs/windows.md), and [joins and re-keying today](./docs/joins.md)
 3. [The Processor API](./docs/processor-api.md)
 4. [State Stores](./docs/state-stores.md)
 5. [The Test Driver](./docs/test-driver.md)

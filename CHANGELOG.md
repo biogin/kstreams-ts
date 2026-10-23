@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Docs
+
+- [Joins and re-keying today](./docs/joins.md): a stream-table join with the Processor API and a shared State Store (`examples/joins.ts`, tested with the Test Driver), and where to find the re-keying workaround.
+
 ## 0.1.0
 
 First release, a beta: the public API may still change before 1.0.

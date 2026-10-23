@@ -10,7 +10,16 @@
 - The build runs from the `prepare` script, so `npm publish`, `npm pack` and git installs (`npm install github:biogin/kstreams-ts`) all build `dist/`.
 - The local `main` in `~/code/kstreams-ts` may be behind: `git pull --ff-only origin main` there.
 
-## Next
+## Paused: waiting for user feedback (since 2026-10-23)
+
+Launch posts are drafted in `~/code/kstreams-launch/` (HN, r/node, r/apachekafka, Confluent forum, Platformatic, Habr; deslopped, with an AI-assisted disclosure); the user posts them. Added since 0.1.0 (docs only, no release needed): `docs/joins.md` with a stream-table join recipe (`examples/joins.ts`, unit-tested with the Test Driver, not yet against a broker) and the re-keying workaround.
+
+Build nothing bigger until feedback says which gap blocks people. Candidates, by value per effort:
+1. Repartition Topics (`groupBy` with a new key, automatic after `map`): the largest (~6–10 tickets), because a Task becomes "sub-topology + partition" (ownership, checkpoints, state dir layout, assignor, internal topics; crash-suite scenario).
+2. `table(topic)` + a stream-table join operator (~3–5 tickets together), replacing the recipe; consider timestamp-ordered input selection per Task (Kafka Streams' `max.task.idle.ms`).
+3. Table-table joins and aggregations over Tables (~3–4), stream-stream windowed joins (~3–5), GlobalKTable (~2–3): only on request.
+
+## Next (unprioritized, after feedback)
 
 - Ticket 31 (split `src/worker.ts`) and ticket 32 (ultrareview finding 10).
 - Drop `src/read-committed.ts` once platformatic/kafka#470 ships in a release (see Upstream). Until then `@platformatic/kafka` stays pinned to an exact version (2.14.0): `ReadCommittedConsumer` hooks `kGetApi` and relies on the Fetch API's argument order (isolationLevel is argument 4); re-check on every upgrade.
